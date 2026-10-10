@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+testdata/captured/*
+!testdata/captured/.gitkeep
+testdata/synthetic/*
+!testdata/synthetic/.gitkeep
+testdata/rt_vectors/
+*.sigmf-data
+*.npy
+*.ts
+rt/build/
+out/
+*.egg-info/
+
+rt/third_party/libiio/

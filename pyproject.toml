@@ -1,0 +1,29 @@
+[project]
+name = "isdbt-sdr"
+version = "0.0.1"
+description = "ISDB-T (Japanese terrestrial DTV) software demodulator for generic SDR boards"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+dependencies = ["numpy>=1.26", "scipy>=1.11"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-xdist", "ruff", "matplotlib"]
+hw = ["pylibiio", "SoapySDR"]
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["ref"]
+include = ["isdbt*"]
+
+[tool.pytest.ini_options]
+testpaths = ["ref/tests"]
+pythonpath = ["ref"]
+markers = ["slow: 数十秒以上かかるテスト"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"

@@ -1,0 +1,37 @@
+; BonDriver_PlutoSDR.ini — DLL と同じフォルダに DLL と同名（拡張子 .ini）で置く
+; （DLL を BonDriver_PlutoSDR_2.dll などに改名したら ini も同じ名前にする）
+;
+; この DLL が Pluto SDR を直接開いて DLL 内で復調する（スタンドアロンモード）。
+; 復調デーモン（isdbtd / demod_server.py）と TCP で話すデーモンモードの設定
+; （[SDR] Enable=0 + [Daemon] セクション）は rt/bondriver/README.md を参照。
+
+[SDR]
+; 1 = スタンドアロン（既定の使い方）。0 = デーモンモード（README 参照）
+Enable=1
+; libiio のデバイス URI。usb:（最初の 1 台）/ usb:1.4.5 / ip:192.168.2.1 など
+Uri=usb:
+; 取り込みレート Hz。空なら 7111111（公称 512/63 MHz の 7/8。USB 2.0 の帯域対策）。
+; GbE 機（Pluto+ / LibreSDR）なら 8126984 に上げてよい
+Fs=
+; RF 帯域 Hz。空なら 5600000
+Bw=
+; 手動ゲイン dB。空なら slow_attack AGC（推奨。手動は実測で大幅に悪化する）
+Gain=
+; 伝送モードと GI（日本の実運用は Mode 3 / GI 1/8 固定）
+Mode=3
+GI=1/8
+; ウィンドウ並列復調のパラメータ（isdbtd --win-frames / --ctx-frames / --workers と同じ）
+WinFrames=16
+CtxFrames=4
+Workers=2
+; libiio1.dll のあるフォルダ。相対パスは DLL のフォルダ基準（例: libiio）。
+; 空なら DLL と同じフォルダ → 通常の DLL 検索パス（ADI インストーラの PATH 等）の順で探す
+LibiioDir=
+
+[Tuner]
+Name=ISDB-T SDR
+
+[Debug]
+; 1 にすると DLL の隣に <DLL 名>.log を書き、10 秒ごとに復調統計も記録する
+; （rs_uncorrectable が伸びる = C/N 不足、underruns / frames_lost = 取り込み・処理落ち）
+Log=0
