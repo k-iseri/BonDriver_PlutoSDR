@@ -4,8 +4,8 @@ TVTest / EDCB から isdbt-sdr の復調器を使うための BonDriver（IBonDr
 動作モードは 2 つ（ini の `[SDR] Enable` で選ぶ）:
 
 ```
-スタンドアロン: TVTest ── BonDriver_PlutoSDR.dll（内蔵復調 + libiio）── Pluto SDR
-デーモン:       TVTest ── BonDriver_PlutoSDR.dll ── TCP ── isdbtd / demod_server.py ── SDR / 録画 TS / SigMF
+スタンドアロン: TVTest ── BonDriver_PlutoSDR_T.dll（内蔵復調 + libiio）── Pluto SDR
+デーモン:       TVTest ── BonDriver_PlutoSDR_T.dll ── TCP ── isdbtd / demod_server.py ── SDR / 録画 TS / SigMF
 ```
 
 - **スタンドアロン（`[SDR] Enable=1`）**: DLL が rt/ の復調コアと libiio で Pluto SDR を
@@ -28,10 +28,24 @@ Visual Studio 2022（Build Tools 可）の C++ ツールセットと CMake が�
 スタンドアロンモードが有効になる。無くてもビルドは通り、デーモンモードだけの DLL になる。
 libiio の配布 .lib が x64 のみなので、Win32 ビルドはデーモンモード専用。
 
+## リリース（配布 zip）
+
+`v` で始まるタグを push すると GitHub Actions（`.github/workflows/release.yml`）が
+x64 Release をビルドし、配布 zip（DLL + libiio 一式 + ini.sample + bontest.exe +
+INSTALL.txt）を GitHub Release に添付する。本文は `.github/release-notes.md`:
+
+```
+git tag v1.0.1
+git push origin v1.0.1
+```
+
+同じ zip をローカルで作るにはビルド後に `.\tools\package_release.ps1 -Version v1.0.1`
+（`dist\` に出力。dist/ は gitignore）。
+
 ## 配置（スタンドアロン = 通常の視聴）
 
-1. `BonDriver_PlutoSDR.dll` を TVTest（または EDCB）の BonDriver フォルダへ
-2. `BonDriver_PlutoSDR.ini.sample` を同じ場所に `BonDriver_PlutoSDR.ini` としてコピー
+1. `BonDriver_PlutoSDR_T.dll` を TVTest（または EDCB）の BonDriver フォルダへ
+2. `BonDriver_PlutoSDR.ini.sample` を同じ場所に `BonDriver_PlutoSDR_T.ini` としてコピー
    （サンプルは `[SDR] Enable=1` のスタンドアロン設定になっている）
 3. TVTest でチューナ「ISDB-T SDR」を選ぶ。チューニング空間は UHF、チャンネルは 13〜52ch
 
@@ -59,8 +73,8 @@ DLL がデーモンを起動し、CloseTuner で `quit` を送る。デーモン
 
 ```
 cd rt\build\bondriver-x64\Release
-copy ..\..\..\bondriver\BonDriver_PlutoSDR.ini.sample BonDriver_PlutoSDR.ini   # 編集する
-.\bontest.exe BonDriver_PlutoSDR.dll 27 5 out.ts
+copy ..\..\..\bondriver\BonDriver_PlutoSDR.ini.sample BonDriver_PlutoSDR_T.ini   # 編集する
+.\bontest.exe BonDriver_PlutoSDR_T.dll 27 5 out.ts
 ```
 1 秒ごとに受信レート・信号レベル・同期バイト不整合数を表示する。終了コード 0 が正常。
 
@@ -73,7 +87,7 @@ copy ..\..\..\bondriver\BonDriver_PlutoSDR.ini.sample BonDriver_PlutoSDR.ini   #
 - `GetSignalLevel` は `status.signal_db` を 500 ms キャッシュして返す。
 - 制御接続が切れたら次のコマンドで 1 回だけ張り直す。TS ストリームが切れたら受信が止まる
   （TVTest 上では無信号に見える）。チャンネルを切り替え直すか、チューナを開き直す。
-- `[Debug] Log=1` で DLL の隣に `BonDriver_PlutoSDR.log` を書く。`OutputDebugString` にも出る。
+- `[Debug] Log=1` で DLL の隣に `BonDriver_PlutoSDR_T.log` を書く。`OutputDebugString` にも出る。
 - デーモンモードの選局（`SetChannel`）は物理チャンネル番号をデーモンに渡すだけ。周波数換算はデーモン側。
 - スタンドアロンモードの実体は `rt/demod/live_demod.{h,cpp}`（isdbtd の `--sdr` と同じ
   `LiveDemod`）を DLL に静的リンクしたもの。ini の `WinFrames` / `CtxFrames` / `Workers` は

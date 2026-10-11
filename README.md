@@ -30,14 +30,19 @@ ref/ の復調は 6 フレーム単位のブロック処理で、速度は実時
 204 バイト放送 TS（BTS）が要る場合は `demod_sigmf.py --bts`。
 
 ## TVTest / EDCB で使う（BonDriver）
+
+ビルド済みの配布 zip は [GitHub Releases](https://github.com/k-iseri/BonDriver_PlutoSDR/releases) にある
+（`v*` タグの push で GitHub Actions が自動ビルド・添付する。手順は `rt/bondriver/README.md`）。
+インストール方法は `docs/setup-tvtest.md`（zip の中身を TVTest の BonDriver フォルダへコピーして
+ini.sample をリネームするだけ）。自分でビルドする場合:
 ```
 make bondriver                                   # または .\dev.ps1 bondriver（VS 2022 Build Tools が必要）
 make rt                                          # 復調デーモン isdbtd.exe と一致テスト rt_test.exe
 rt\build\rt-x64\Release\isdbtd.exe --sigmf <録音>.sigmf-meta --loop    # C++ 復調デーモン（MER を status に返す）
 python tools/demod_server.py --ts C:\rec\x.ts --loop                   # Python の偽デーモン（録画 TS / SigMF 再生）
-rt\build\bondriver-x64\Release\bontest.exe rt\build\bondriver-x64\Release\BonDriver_PlutoSDR.dll 27 5
+rt\build\bondriver-x64\Release\bontest.exe rt\build\bondriver-x64\Release\BonDriver_PlutoSDR_T.dll 27 5
 ```
-DLL と `BonDriver_PlutoSDR.ini`（`.ini.sample` を編集）を TVTest の BonDriver フォルダへ置く。
+DLL と `BonDriver_PlutoSDR_T.ini`（`.ini.sample` を編集）を TVTest の BonDriver フォルダへ置く。
 視聴までの一般ユーザー向け手順は `docs/setup-tvtest.md`。
 詳細は `rt/bondriver/README.md`、プロトコルは `docs/daemon-protocol.md`。
 SDR 実機ソースはボード到着後に isdbtd へ追加する（それまでは録音の復調再生）。

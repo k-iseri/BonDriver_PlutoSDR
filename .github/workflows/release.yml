@@ -1,0 +1,46 @@
+# v で始まるタグ（v1.0.0 など）を push すると BonDriver_PlutoSDR_T.dll をビルドして
+# GitHub Release に配布 zip を添付する。
+#   git tag v1.0.0 && git push origin v1.0.0
+# zip の中身は tools/package_release.ps1、リリース本文は .github/release-notes.md。
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch libiio (vendored, not in repo)
+        run: .\rt\third_party\fetch_libiio.ps1
+
+      - name: Build BonDriver DLL (x64 Release)
+        run: .\rt\bondriver\build.ps1
+
+      # SDR 実機なしでできる範囲の確認: DLL がロードでき CreateBonDriver を export しているか
+      # （libiio1.dll は /DELAYLOAD なのでロード自体は libiio 無しでも通るはず）
+      - name: Verify DLL loads
+        run: |
+          $sig = '[DllImport("kernel32", SetLastError=true)] public static extern IntPtr LoadLibrary(string f); [DllImport("kernel32")] public static extern IntPtr GetProcAddress(IntPtr m, string n);'
+          Add-Type -Name K -Namespace W -MemberDefinition $sig
+          $dll = "rt\build\bondriver-x64\Release\BonDriver_PlutoSDR_T.dll"
+          $m = [W.K]::LoadLibrary((Resolve-Path $dll))
+          if ($m -eq [IntPtr]::Zero) { throw "LoadLibrary failed: $dll" }
+          if ([W.K]::GetProcAddress($m, "CreateBonDriver") -eq [IntPtr]::Zero) { throw "CreateBonDriver not exported" }
+          Write-Host "ok: $dll"
+
+      - name: Package zip
+        run: .\tools\package_release.ps1 -Version "${{ github.ref_name }}"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $zip = (Get-Item dist\*.zip).FullName
+          gh release create "${{ github.ref_name }}" $zip --title "${{ github.ref_name }}" --notes-file .github\release-notes.md

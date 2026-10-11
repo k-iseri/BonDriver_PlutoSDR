@@ -12,6 +12,7 @@ testdata/rt_vectors/
 *.ts
 rt/build/
 out/
+dist/
 *.egg-info/
 
 rt/third_party/libiio/

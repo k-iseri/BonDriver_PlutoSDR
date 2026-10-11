@@ -14,7 +14,7 @@ Pluto SDR 互換機と本プロジェクトの BonDriver を使い、Windows 11 
 | F型 → SMA 変換アダプタ | Pluto の RX 端子は SMA。テレビの同軸ケーブル（F型）をつなぐのに必要 |
 | TVTest（x64 版） | 0.10 系を推奨。入手・ビルドは TVTest 側の配布に従う |
 | B-CAS カード + IC カードリーダー | スクランブル解除に必要（TVTest 側の設定。本プロジェクトの範囲外） |
-| BonDriver_PlutoSDR.dll 一式 | 配布 zip、または下記 1-b で自分でビルド |
+| BonDriver_PlutoSDR_T.dll 一式 | 配布 zip（[GitHub Releases](https://github.com/k-iseri/BonDriver_PlutoSDR/releases) からダウンロード）、または下記 1-b で自分でビルド |
 
 ### 1-b. BonDriver を自分でビルドする場合
 
@@ -26,7 +26,7 @@ CMake が必要。リポジトリのルートで:
 .\dev.ps1 bondriver                 # make があるなら make bondriver
 ```
 
-`rt\build\bondriver-x64\Release\` に `BonDriver_PlutoSDR.dll` と libiio の DLL 一式ができる。
+`rt\build\bondriver-x64\Release\` に `BonDriver_PlutoSDR_T.dll` と libiio の DLL 一式ができる。
 以降の手順ではこのフォルダの中身を使う。
 
 ## 2. Pluto SDR のドライバを入れる
@@ -45,10 +45,12 @@ F型 → SMA 変換アダプタで、アンテナ線を Pluto の **RX** 端子�
 
 ## 4. TVTest に BonDriver を配置する
 
-TVTest の `BonDriver` フォルダ（無ければ TVTest.exe と同じフォルダ）に以下を置く:
+**配布 zip の場合**: zip の中身を全部 TVTest の `BonDriver` フォルダ（無ければ TVTest.exe と
+同じフォルダ）へコピーし、`BonDriver_PlutoSDR_T.ini.sample` を `BonDriver_PlutoSDR_T.ini` に
+リネームすれば完了。以下は自分でビルドした場合などに個別に揃える内訳:
 
-1. `BonDriver_PlutoSDR.dll`
-2. `BonDriver_PlutoSDR.ini` — [BonDriver_PlutoSDR.ini.sample](../rt/bondriver/BonDriver_PlutoSDR.ini.sample)
+1. `BonDriver_PlutoSDR_T.dll`
+2. `BonDriver_PlutoSDR_T.ini` — [BonDriver_PlutoSDR.ini.sample](../rt/bondriver/BonDriver_PlutoSDR.ini.sample)
    をコピーしてこの名前に変更する。**そのままで動く**（`[SDR] Enable=1`、`Uri=usb:` が既定）
 3. libiio の DLL 一式（`libiio1.dll` など。ビルドした場合は
    `rt\build\bondriver-x64\Release\` に入っている）— DLL と同じフォルダに置く
@@ -58,7 +60,7 @@ TVTest の `BonDriver` フォルダ（無ければ TVTest.exe と同じフォル
 ## 5. TVTest の初期設定
 
 1. TVTest を起動すると初期設定ダイアログが出る。
-   - **ドライバ**: `BonDriver_PlutoSDR.dll` を選ぶ（チューナ名は「ISDB-T SDR」）
+   - **ドライバ**: `BonDriver_PlutoSDR_T.dll` を選ぶ（チューナ名は「ISDB-T SDR」）
    - **デコーダ / レンダラ**: 既定（自動）でよい
    - カードリーダー: B-CAS リーダーを選ぶ（TVTest 側のスクランブル解除設定に従う）
 2. **チャンネルスキャン**（設定 → チャンネルスキャン）を実行する。
@@ -86,10 +88,10 @@ TVTest の信号レベル表示は受信品質（MER、dB）を示す。目安:
 | ずっと無信号（15 秒以上） | まずアンテナ。信号レベル（MER）が 19 dB 未満ならアンテナの位置・種類を見直す。壁のアンテナ端子につなぐのが確実 |
 | 映像が出るがスクランブル表示 | B-CAS カードリーダーと TVTest のデコード設定（本プロジェクトの範囲外） |
 | 急に受信できなくなった | Pluto の USB を抜き差しして TVTest を再起動（SDR 側のセッションが残ることがある） |
-| 原因を調べたい | ini の `[Debug] Log=1` にすると DLL の隣に `BonDriver_PlutoSDR.log` が書かれる。`rs_uncorrectable` が増える = 電波品質不足、`underruns` / `frames_lost` = PC 側の取り込み・処理落ち |
+| 原因を調べたい | ini の `[Debug] Log=1` にすると DLL の隣に `BonDriver_PlutoSDR_T.log` が書かれる。`rs_uncorrectable` が増える = 電波品質不足、`underruns` / `frames_lost` = PC 側の取り込み・処理落ち |
 
 TVTest を使わずに受信だけ確認したい場合は、DLL と同じフォルダで
-`bontest.exe BonDriver_PlutoSDR.dll 27 5 out.ts`（物理 27ch を 5 秒受信して TS 保存）が使える。
+`bontest.exe BonDriver_PlutoSDR_T.dll 27 5 out.ts`（物理 27ch を 5 秒受信して TS 保存）が使える。
 
 ## 補足
 
