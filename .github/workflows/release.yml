@@ -1,12 +1,19 @@
 # v で始まるタグ（v1.0.0 など）を push すると BonDriver_PlutoSDR_T.dll をビルドして
 # GitHub Release に配布 zip を添付する。
 #   git tag v1.0.0 && git push origin v1.0.0
+# タグ push で走らなかった場合（Actions を後から有効にした等）は、Actions タブの
+# release → Run workflow から既存タグ名を入れて手動実行もできる。
 # zip の中身は tools/package_release.ps1、リリース本文は .github/release-notes.md。
 name: release
 
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "リリースする既存タグ（例 v1.0.0）"
+        required: true
 
 permissions:
   contents: write
@@ -14,8 +21,12 @@ permissions:
 jobs:
   release:
     runs-on: windows-latest
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Fetch libiio (vendored, not in repo)
         run: .\rt\third_party\fetch_libiio.ps1
@@ -36,11 +47,11 @@ jobs:
           Write-Host "ok: $dll"
 
       - name: Package zip
-        run: .\tools\package_release.ps1 -Version "${{ github.ref_name }}"
+        run: .\tools\package_release.ps1 -Version "$env:TAG"
 
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           $zip = (Get-Item dist\*.zip).FullName
-          gh release create "${{ github.ref_name }}" $zip --title "${{ github.ref_name }}" --notes-file .github\release-notes.md
+          gh release create "$env:TAG" $zip --title "$env:TAG" --notes-file .github\release-notes.md
