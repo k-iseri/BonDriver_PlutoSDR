@@ -16,7 +16,7 @@ typedef IBonDriver *(*CreateBonDriverFn)();
 
 int wmain(int argc, wchar_t **argv)
 {
-	const wchar_t *dll = argc > 1 ? argv[1] : L"BonDriver_PlutoSDR.dll";
+	const wchar_t *dll = argc > 1 ? argv[1] : L"BonDriver_PlutoSDR_T.dll";
 	unsigned phys = argc > 2 ? (unsigned)_wtoi(argv[2]) : 27;
 	int seconds = argc > 3 ? _wtoi(argv[3]) : 5;
 	FILE *out = nullptr;
@@ -45,7 +45,7 @@ int wmain(int argc, wchar_t **argv)
 	}
 
 	if (!bon2->OpenTuner()) {
-		fwprintf(stderr, L"OpenTuner failed (ini / daemon を確認。Debug Log=1 で BonDriver_PlutoSDR.log)\n");
+		fwprintf(stderr, L"OpenTuner failed (ini / daemon を確認。Debug Log=1 で BonDriver_PlutoSDR_T.log)\n");
 		bon2->Release();
 		return 2;
 	}

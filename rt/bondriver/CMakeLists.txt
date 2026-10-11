@@ -45,7 +45,9 @@ add_library(BonDriver_PlutoSDR SHARED
   ${RT_DIR}/demod/sdr_source.cpp
 )
 target_link_libraries(BonDriver_PlutoSDR PRIVATE isdbt_core ws2_32)
-set_target_properties(BonDriver_PlutoSDR PROPERTIES PREFIX "" OUTPUT_NAME "BonDriver_PlutoSDR")
+# 出力 DLL 名は地デジ(T)を示す _T 付き。ini / log は DLL 名から実行時に導出されるので
+# BonDriver_PlutoSDR_T.ini / .log になる（BonDriver_PlutoSDR.cpp の LoadConfig 参照）。
+set_target_properties(BonDriver_PlutoSDR PROPERTIES PREFIX "" OUTPUT_NAME "BonDriver_PlutoSDR_T")
 
 # SDR スタンドアロンモード: rt/third_party/libiio があれば有効化（x64 のみ。配布 .lib が x64 のため）。
 # 無ければ [SDR] Enable=1 が実行時エラーになるだけで、ビルドとデーモンモードは通る。
@@ -77,5 +79,5 @@ add_executable(bontest bontest.cpp IBonDriver.h IBonDriver2.h)
 add_custom_command(TARGET BonDriver_PlutoSDR POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
           ${CMAKE_CURRENT_SOURCE_DIR}/BonDriver_PlutoSDR.ini.sample
-          $<TARGET_FILE_DIR:BonDriver_PlutoSDR>/BonDriver_PlutoSDR.ini.sample
+          $<TARGET_FILE_DIR:BonDriver_PlutoSDR>/BonDriver_PlutoSDR_T.ini.sample
 )

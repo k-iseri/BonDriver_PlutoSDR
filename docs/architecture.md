@@ -65,8 +65,8 @@ I/Q (任意 fs)
 ## TVTest / EDCB 連携（BonDriver、2026-10-02 実装）
 ```
 TVTest / EDCB
-  └─ rt/bondriver/BonDriver_PlutoSDR.dll ── TCP(制御 JSON Lines) ──┐
-                                           ── TCP(生 TS)          ──┤── 復調デーモン ── SDR / 録画 TS / SigMF
+  └─ rt/bondriver/BonDriver_PlutoSDR_T.dll ── TCP(制御 JSON Lines) ──┐
+                                             ── TCP(生 TS)          ──┤── 復調デーモン ── SDR / 録画 TS / SigMF
 ```
 - BonDriver はアプリのプロセス内で動く薄い DLL（IBonDriver2）。復調はしない。選局と TS 受信を
   `docs/daemon-protocol.md` のプロトコルでデーモンに頼むだけ。デーモンのクラッシュや

@@ -1,5 +1,5 @@
-; BonDriver_PlutoSDR.ini — DLL と同じフォルダに DLL と同名（拡張子 .ini）で置く
-; （DLL を BonDriver_PlutoSDR_2.dll などに改名したら ini も同じ名前にする）
+; BonDriver_PlutoSDR_T.ini — DLL と同じフォルダに DLL と同名（拡張子 .ini）で置く
+; （DLL を BonDriver_PlutoSDR_T2.dll などに改名したら ini も同じ名前にする）
 ;
 ; この DLL が Pluto SDR を直接開いて DLL 内で復調する（スタンドアロンモード）。
 ; 復調デーモン（isdbtd / demod_server.py）と TCP で話すデーモンモードの設定

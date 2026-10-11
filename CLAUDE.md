@@ -80,7 +80,7 @@ make test-fast   # 高速テストのみ
 make test        # 全テスト
 make lint
 make synth       # testdata/synthetic/ に試験信号を再生成
-make bondriver   # rt/build/bondriver-x64/Release/ に BonDriver_PlutoSDR.dll と bontest.exe
+make bondriver   # rt/build/bondriver-x64/Release/ に BonDriver_PlutoSDR_T.dll と bontest.exe
 make rt          # rt/build/rt-x64/Release/ に rt_test.exe（ref 一致テスト）と isdbtd.exe（復調デーモン）
 make rt-vectors  # testdata/rt_vectors/ に rt 検証用ベクタを ref/ から生成
 make rt-test     # rt_test.exe をベクタに対して実行（pytest からは test_rt.py 経由でも走る）

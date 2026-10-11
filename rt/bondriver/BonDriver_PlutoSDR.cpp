@@ -10,7 +10,7 @@
 //    BonDriver フォルダに置くだけで受信できる（libiio は遅延ロード。ADI のインストーラで
 //    入っているか、DLL の隣 / LibiioDir に libiio の DLL 一式があればよい）。
 //
-// 設定は DLL と同じ場所の同名 .ini（BonDriver_PlutoSDR.ini）から読む。
+// 設定は DLL と同じ場所の同名 .ini（BonDriver_PlutoSDR_T.ini）から読む。
 #define BONDRIVER_EXPORTS
 #define WIN32_LEAN_AND_MEAN
 #ifndef NOMINMAX            // CMake 側でも定義している

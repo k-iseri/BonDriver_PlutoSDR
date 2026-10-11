@@ -9,7 +9,7 @@ BonDriver（TVTest / EDCB 内で動く DLL）と復調プロセスを分離す�
 
 ```
 TVTest / EDCB
-  └─ BonDriver_PlutoSDR.dll ── TCP(制御) ──┐
+  └─ BonDriver_PlutoSDR_T.dll ── TCP(制御) ──┐
                               ── TCP(TS)  ──┤── 復調デーモン ── SDR / ファイル
 ```
 

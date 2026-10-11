@@ -61,7 +61,7 @@ make rt
 # ライブ受信デーモン（アンテナ → 復調 → BonDriver/TVTest）
 rt\build\rt-x64\Release\isdbtd.exe --sdr usb: --ch 24 --no-quit
 ```
-- デーモンを手動で常駐させる場合は **--no-quit を付け、BonDriver_PlutoSDR.ini は Spawn=0** にする。
+- デーモンを手動で常駐させる場合は **--no-quit を付け、BonDriver_PlutoSDR_T.ini は Spawn=0** にする。
   Spawn=1 のままだと TVTest 終了時に BonDriver が quit を送ってデーモンごと落とす
   （Spawn=1 は録画 TS 再生デーモンを DLL に起動させる開発用の設定）。
 - 取り込みは既定 7,111,111 Hz（公称の 7/8）。16bit×公称レートは USB 2.0 の実効上限
