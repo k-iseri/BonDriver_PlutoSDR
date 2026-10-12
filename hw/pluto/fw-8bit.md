@@ -1,5 +1,13 @@
 # 8 bit パッキング（README の対策 2）— tezuka_fw の採用
 
+> **2026-10-12 更新: この判断は上書きされた。** MIT で配布できる自前ファームウェアを
+> 作る方針になり、別リポジトリ [pluto-fw-isdbt](https://github.com/k-iseri/pluto-fw-isdbt)
+> （v1 = RX 専用 + 8bit + ドロップ検出カウンタ）で開発する。方式も tezuka 式
+> （voltage1 無効化 + 16bit 枠詰め、非自己記述）ではなく **scan-element 申告を 8bit に
+> する自己記述方式**を採る（ホストは申告ベースで自動適応）。tezuka_fw は GPL-3.0 で
+> コード複製不可のため、参照時は pluto-fw-isdbt/docs/design-v1.md の記録規約に従う。
+> 以下は当時の判断の記録として残す。
+
 状態: **未検証**（ボード未着。実機での確認項目は末尾）。
 
 ## 課題

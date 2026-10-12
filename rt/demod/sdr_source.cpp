@@ -52,6 +52,16 @@ void WriteAttr(const iio_channel* ch, const char* name, const std::string& value
 
 std::string FormatLL(double v) { return std::to_string(static_cast<long long>(v)); }
 
+// axi_ad9361 コア（cf-ad9361-lpc）の overflow 監視。
+// cf_axi_adc の debugfs_reg_access はアドレスにこのマジックを立てると AXI コアレジスタを
+// 直接読み書きする（純正ファームで動作確認 2026-10-12）。UI_STATUS の UI_OVF（RW1C）は
+// DMA が受けきれずサンプルが落ちると立つ。取り込み停止中は常時立つのが正常なので、
+// DMA が流れ始めてからクリアし、取り込み中に立ったものだけをドロップとして数える。
+constexpr uint32_t kPcoreRegMagic = 0x80000000;
+constexpr uint32_t kRegUiStatus = 0x0088;   // adi_regmap_adc: UI_STATUS
+constexpr uint32_t kUiOvf = 1u << 2;        // bit2 = UI_OVF (RW1C)
+constexpr long long kOvfCheckBlocks = 8;    // 約 1 秒周期（1 ブロック ≈ 129〜147 ms）
+
 }  // namespace
 
 struct SdrSource::Impl {
@@ -60,7 +70,7 @@ struct SdrSource::Impl {
     iio_stream* stream = nullptr;
     iio_channel* phy_rx = nullptr;      // ad9361-phy voltage0 (input): rate/bw/gain
     iio_channel* phy_lo = nullptr;      // ad9361-phy altvoltage0 (output): RX LO
-    const iio_device* rxdev = nullptr;
+    iio_device* rxdev = nullptr;        // 非 const（iio_device_reg_read/write が要求）
     size_t block_samples = 0;
 };
 
@@ -186,6 +196,9 @@ void SdrSource::Run() {
     std::vector<std::complex<float>> out(impl_->block_samples);
     constexpr float kScale = 1.0f / 2048.0f;    // AD936x は 12bit（int16 の下位 12bit）
     int backoff_ms = 500;
+    bool ovf_usable = true;         // reg アクセス不能なコア（将来の別ボード等）では監視を止める
+    bool ovf_armed = false;         // 最初のブロック到着（= DMA 稼働）後にクリアしてから監視を始める
+    long long ovf_countdown = kOvfCheckBlocks;
     while (!stop_) {
         const iio_block* blk = iio_stream_get_next_block(impl_->stream);
         if (iio_err(blk)) {
@@ -213,6 +226,8 @@ void SdrSource::Run() {
                 }
                 ++reconnects_;
                 backoff_ms = 500;
+                ovf_usable = true;
+                ovf_armed = false;
                 std::fprintf(stderr, "sdr: reconnected (#%lld)\n",
                              static_cast<long long>(reconnects_));
                 if (on_event_) on_event_(true);
@@ -229,6 +244,28 @@ void SdrSource::Run() {
         }
         ++blocks_;
         if (on_block_) on_block_(out.data(), n);
+        // UI_OVF 監視（約 1 秒周期。reg アクセスは制御転送 1 回で、ストリームへの影響は無視できる）
+        if (ovf_usable) {
+            if (!ovf_armed) {
+                // 取り込み停止中は常時立つのが正常なので、DMA が流れ始めてからクリアする
+                ovf_armed = true;
+                ovf_countdown = kOvfCheckBlocks;
+                if (iio_device_reg_write(impl_->rxdev, kPcoreRegMagic | kRegUiStatus, kUiOvf) < 0) {
+                    ovf_usable = false;
+                }
+            } else if (--ovf_countdown <= 0) {
+                ovf_countdown = kOvfCheckBlocks;
+                uint32_t v = 0;
+                if (iio_device_reg_read(impl_->rxdev, kPcoreRegMagic | kRegUiStatus, &v) < 0) {
+                    ovf_usable = false;
+                } else if (v & kUiOvf) {
+                    ++hw_ovf_;
+                    (void)iio_device_reg_write(impl_->rxdev, kPcoreRegMagic | kRegUiStatus, kUiOvf);
+                    std::fprintf(stderr, "sdr: hardware overflow (sample drop) #%lld\n",
+                                 static_cast<long long>(hw_ovf_));
+                }
+            }
+        }
     }
 }
 

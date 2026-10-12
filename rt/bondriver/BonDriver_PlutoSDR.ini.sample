@@ -36,6 +36,7 @@ Name=ISDB-T SDR
 [Debug]
 ; 1 にすると DLL の隣に <DLL 名>.log を書き、10 秒ごとに復調統計も記録する
 ; （rs_uncorrectable が伸びる = C/N 不足、underruns / frames_lost = 取り込み・処理落ち、
-;   rx_rate が Fs の 99% 未満 / rx_slow が伸びる = USB 帯域不足、
+;   hw_ovf が伸びる = FPGA が報告したサンプル落ち（USB 帯域不足の確定検出）、
+;   rx_rate が Fs の 99% 未満 / rx_slow = 実測レートからの補助検出、
 ;   sdr_reconnects = USB 瞬断からの自動再接続回数）
 Log=0

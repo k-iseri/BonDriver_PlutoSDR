@@ -63,6 +63,9 @@ public:
     long long blocks() const { return blocks_; }
     bool connected() const { return connected_; }
     long long reconnects() const { return reconnects_; }
+    // FPGA が報告したハード確定ドロップ（axi_ad9361 UI_STATUS の UI_OVF を約 1 秒周期で
+    // 監視した検出回数）。純正ファームで動く。実機検証 2026-10-12（健全時 0、USB 飽和で検出）。
+    long long hw_ovf() const { return hw_ovf_; }
 
 private:
     void Run();
@@ -80,6 +83,7 @@ private:
     std::atomic<bool> stop_{false};
     std::atomic<bool> connected_{false};
     std::atomic<long long> reconnects_{0};
+    std::atomic<long long> hw_ovf_{0};
     volatile long long blocks_ = 0;
     std::string desc_;
 };

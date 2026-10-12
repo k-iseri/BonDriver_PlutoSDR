@@ -98,6 +98,7 @@ std::string LiveDemod::StatusJson() {
     s += ", \"sdr_blocks\": " + std::to_string(sdr_.blocks());
     s += ", \"sdr_connected\": " + std::string(sdr_.connected() ? "true" : "false");
     s += ", \"sdr_reconnects\": " + std::to_string(sdr_.reconnects());
+    s += ", \"hw_ovf\": " + std::to_string(sdr_.hw_ovf());
     s += ", \"rx_rate\": " + FormatDouble(rx_rate_.load());
     s += ", \"rx_slow\": " + std::to_string(rx_slow_.load());
     s += ", \"windows\": " + std::to_string(windows_done_);
