@@ -87,6 +87,11 @@ copy ..\..\..\bondriver\BonDriver_PlutoSDR.ini.sample BonDriver_PlutoSDR_T.ini  
 - `GetSignalLevel` は `status.signal_db` を 500 ms キャッシュして返す。
 - 制御接続が切れたら次のコマンドで 1 回だけ張り直す。TS ストリームが切れたら受信が止まる
   （TVTest 上では無信号に見える）。チャンネルを切り替え直すか、チューナを開き直す。
+- スタンドアロンモードは USB 瞬断などで SDR のストリームが切れても自動で再接続する
+  （`[SDR] Reconnect=1` 既定。バックオフ 0.5→5 秒、選局中の周波数は再接続時に再適用）。
+  切断中は信号レベルが 0 になり、復帰後 10〜15 秒でパイプラインが再同期する。
+  実機検証済み（2026-10-12、TVTest 視聴中の USB 抜き差しで自動復帰を確認）。
+  ログには `sdr: reconnected (#1)` が出る（`[Debug] Log=1` で `sdr_reconnects` も伸びる）。
 - `[Debug] Log=1` で DLL の隣に `BonDriver_PlutoSDR_T.log` を書く。`OutputDebugString` にも出る。
 - デーモンモードの選局（`SetChannel`）は物理チャンネル番号をデーモンに渡すだけ。周波数換算はデーモン側。
 - スタンドアロンモードの実体は `rt/demod/live_demod.{h,cpp}`（isdbtd の `--sdr` と同じ

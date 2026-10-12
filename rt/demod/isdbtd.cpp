@@ -593,6 +593,7 @@ void Usage() {
         "  --ch N | --freq F   初期チャンネル/周波数（省略時は tune 待ち）\n"
         "  --fs F              取り込みレート Hz (default 7111111 = 公称の 7/8。USB 2.0 の帯域対策)\n"
         "  --gain F            手動ゲイン dB（省略時 slow_attack AGC）\n"
+        "  --no-reconnect      ストリームエラー時に自動再接続しない（既定は再接続）\n"
         "  --win-frames N      ウィンドウの新規フレーム数 (default 16)\n"
         "  --ctx-frames N      ウィンドウの文脈フレーム数 (default 4)\n"
         "  --workers N         並列復調ワーカー数 (default 2)\n");
@@ -623,6 +624,7 @@ int main(int argc, char** argv) {
         else if (a == "--freq") sdr_cfg.freq_hz = std::atof(next().c_str());
         else if (a == "--fs") sdr_cfg.fs = std::atof(next().c_str());
         else if (a == "--gain") { sdr_cfg.agc = false; sdr_cfg.gain_db = std::atof(next().c_str()); }
+        else if (a == "--no-reconnect") sdr_cfg.reconnect = false;
         else if (a == "--dump-iq") dump_iq = next();
         else if (a == "--win-frames") win_frames = std::atoi(next().c_str());
         else if (a == "--ctx-frames") ctx_frames = std::atoi(next().c_str());

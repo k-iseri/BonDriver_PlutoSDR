@@ -1,14 +1,20 @@
 // Pluto SDR（AD936x + cf-ad9361-lpc）からの I/Q キャプチャ（libiio v1 API）。
 // 受信スレッドを 1 本持ち、ブロックが埋まるたびにコールバックへ cfloat（/2048 正規化済み）を渡す。
+// ストリームエラー（USB 瞬断・デバイスリセット等）時は既定で自動再接続する
+// （バックオフ 0.5→5 s。cfg.reconnect=false で従来どおり停止）。
 //
 // libiio が無い環境でもビルドできるよう、ISDBT_WITH_LIBIIO が無いときは Start() が例外を投げる
 // スタブになる（rt/third_party/fetch_libiio.ps1 で取得すると CMake が自動で有効化する）。
 //
 // 実機検証: 2026-10-10 Pluto SDR nano (Z7010-AD9363A, fw v0.39) で動作確認。
+// 自動再接続は 2026-10-12 に TVTest 視聴中の USB 抜き差しで復帰を実機確認済み。
 #pragma once
+#include <atomic>
 #include <complex>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <thread>
 
@@ -33,30 +39,47 @@ struct SdrConfig {
     // Python 側 (tools/iq_record.py) と同じ 4 MiB ブロックにすると持続する。
     size_t block_samples = 1 << 20; // 1 ブロックの複素サンプル数（≈129 ms, 4 MiB）
     size_t nb_blocks = 4;           // デバイス側のブロック数（≈516 ms 分のバッファ）
+    bool reconnect = true;          // ストリームエラー時に自動再接続する（USB 瞬断対策）
 };
 
 class SdrSource {
 public:
     using BlockFn = std::function<void(const std::complex<float>*, size_t)>;
+    // up=false: ストリームが切れた（以降のサンプルは不連続。呼び出し側は継ぎ目を仕切り直す）。
+    // up=true: 再接続して受信を再開した。どちらも受信スレッドから呼ばれる（on_block と同じスレッド）。
+    using EventFn = std::function<void(bool up)>;
 
     ~SdrSource();
 
-    // 接続・設定して受信スレッドを開始する。失敗は std::runtime_error。
-    void Start(const SdrConfig& cfg, BlockFn on_block);
-    void Retune(double freq_hz);    // LO だけ変更（ストリームは止めない）
+    // 接続・設定して受信スレッドを開始する。初回接続の失敗は std::runtime_error
+    //（設定ミスを呼び出し元へ即座に伝える。再接続するのはいったん開けた後のエラーだけ）。
+    void Start(const SdrConfig& cfg, BlockFn on_block, EventFn on_event = {});
+    // LO だけ変更（ストリームは止めない）。例外を投げない:
+    // 切断中は周波数を記録するだけで、再接続時に適用される。
+    void Retune(double freq_hz);
     void Stop();
 
     const std::string& desc() const { return desc_; }
     long long blocks() const { return blocks_; }
+    bool connected() const { return connected_; }
+    long long reconnects() const { return reconnects_; }
 
 private:
     void Run();
+    void Connect();                 // cfg_（freq は現在値）で接続・設定。失敗は throw
+    void Teardown();                // ハンドル破棄（mu_ を取って呼ぶ）
 
     struct Impl;                    // libiio ハンドル類（.cpp 内定義）
     Impl* impl_ = nullptr;
+    SdrConfig cfg_;                 // freq_hz は Retune で更新される現在値
     BlockFn on_block_;
+    EventFn on_event_;
     std::thread thread_;
-    volatile bool stop_ = false;
+    std::mutex mu_;                 // impl_ のハンドルと cfg_.freq_hz を守る（Retune ↔ 再接続）
+    std::condition_variable cv_;    // 再接続バックオフ待ちを Stop() で即中断するため
+    std::atomic<bool> stop_{false};
+    std::atomic<bool> connected_{false};
+    std::atomic<long long> reconnects_{0};
     volatile long long blocks_ = 0;
     std::string desc_;
 };

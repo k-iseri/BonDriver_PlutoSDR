@@ -74,6 +74,7 @@ struct Config {
 		double bw = 0.0;            // 0 = SdrConfig の既定（5.6 MHz）
 		bool agc = true;
 		double gainDb = 0.0;
+		bool reconnect = true;      // USB 瞬断などストリームエラー時の自動再接続
 		int mode = 3;
 		std::string gi = "1/8";
 		int winFrames = 16;
@@ -141,6 +142,7 @@ Config LoadConfig()
 		c.sdr.agc = false;
 		c.sdr.gainDb = ReadIniDouble(L"SDR", L"Gain", 0.0, c.iniPath);
 	}
+	c.sdr.reconnect = GetPrivateProfileIntW(L"SDR", L"Reconnect", 1, c.iniPath.c_str()) != 0;
 	c.sdr.mode = (int)GetPrivateProfileIntW(L"SDR", L"Mode", 3, c.iniPath.c_str());
 	c.sdr.gi = Narrow(ReadIniString(L"SDR", L"GI", L"1/8", c.iniPath));
 	c.sdr.winFrames = (int)GetPrivateProfileIntW(L"SDR", L"WinFrames", 16, c.iniPath.c_str());
@@ -548,6 +550,7 @@ BOOL CBonDriverPlutoSDR::OpenTunerSdr()
 		if (m_cfg.sdr.bw > 0) sc.bw = m_cfg.sdr.bw;
 		sc.agc = m_cfg.sdr.agc;
 		sc.gain_db = m_cfg.sdr.gainDb;
+		sc.reconnect = m_cfg.sdr.reconnect;
 		sc.freq_hz = isdbt::ChannelToHz(27);    // SetChannel までの仮周波数（isdbtd --sdr と同じ）
 		isdbt::Gi gi{8};
 		if (!isdbt::ParseGi(m_cfg.sdr.gi, &gi)) {

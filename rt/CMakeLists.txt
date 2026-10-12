@@ -41,7 +41,7 @@ target_link_libraries(rt_test PRIVATE isdbt_core)
 
 # 実時間復調デーモン
 add_executable(isdbtd demod/isdbtd.cpp demod/sdr_source.h demod/sdr_source.cpp
-  demod/live_demod.h demod/live_demod.cpp)
+  demod/live_demod.h demod/live_demod.cpp demod/rate_monitor.h)
 target_link_libraries(isdbtd PRIVATE isdbt_core ws2_32)
 
 # SDR ライブ受信（--sdr）: rt/third_party/libiio があれば有効化する

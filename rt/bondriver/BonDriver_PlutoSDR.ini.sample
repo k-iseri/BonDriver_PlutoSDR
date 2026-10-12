@@ -17,6 +17,8 @@ Fs=
 Bw=
 ; 手動ゲイン dB。空なら slow_attack AGC（推奨。手動は実測で大幅に悪化する）
 Gain=
+; 1 = USB 瞬断などでストリームが切れたら自動で再接続する（既定）。0 = 切れたら停止
+Reconnect=1
 ; 伝送モードと GI（日本の実運用は Mode 3 / GI 1/8 固定）
 Mode=3
 GI=1/8
@@ -33,5 +35,7 @@ Name=ISDB-T SDR
 
 [Debug]
 ; 1 にすると DLL の隣に <DLL 名>.log を書き、10 秒ごとに復調統計も記録する
-; （rs_uncorrectable が伸びる = C/N 不足、underruns / frames_lost = 取り込み・処理落ち）
+; （rs_uncorrectable が伸びる = C/N 不足、underruns / frames_lost = 取り込み・処理落ち、
+;   rx_rate が Fs の 99% 未満 / rx_slow が伸びる = USB 帯域不足、
+;   sdr_reconnects = USB 瞬断からの自動再接続回数）
 Log=0

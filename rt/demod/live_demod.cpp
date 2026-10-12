@@ -14,12 +14,13 @@ LiveDemod::LiveDemod(SdrConfig cfg, Mode mode, Gi gi, int new_frames, int ctx_fr
       in_per_nominal_(cfg_.fs / kSampleRateHz),     // 入力サンプル数 / 公称サンプル数
       frame_samples_(static_cast<double>(SymbolSamples(mode, gi)) * kSymbolsPerFrame *
                      (cfg_.fs / kSampleRateHz)),    // 1 フレームの入力サンプル数
-      desc_("sdr:" + cfg_.uri), verbose_(verbose) {
+      desc_("sdr:" + cfg_.uri), rate_mon_(cfg_.fs), verbose_(verbose) {
     if (!dump_iq_path.empty()) dump_ = std::fopen(dump_iq_path.c_str(), "wb");
 }
 
 void LiveDemod::Start() {
-    sdr_.Start(cfg_, [this](const cfloat* p, size_t n) { OnBlock(p, n); });
+    sdr_.Start(cfg_, [this](const cfloat* p, size_t n) { OnBlock(p, n); },
+               [this](bool up) { OnSdrEvent(up); });
     sched_ = std::thread(&LiveDemod::SchedLoop, this);
     pacer_ = std::thread(&LiveDemod::PaceLoop, this);
 }
@@ -95,6 +96,10 @@ std::string LiveDemod::StatusJson() {
     s += ", \"underruns\": " + std::to_string(underruns_);
     s += ", \"frames_lost\": " + std::to_string(frames_lost_);
     s += ", \"sdr_blocks\": " + std::to_string(sdr_.blocks());
+    s += ", \"sdr_connected\": " + std::string(sdr_.connected() ? "true" : "false");
+    s += ", \"sdr_reconnects\": " + std::to_string(sdr_.reconnects());
+    s += ", \"rx_rate\": " + FormatDouble(rx_rate_.load());
+    s += ", \"rx_slow\": " + std::to_string(rx_slow_.load());
     s += ", \"windows\": " + std::to_string(windows_done_);
     s += ", \"windows_failed\": " + std::to_string(windows_failed_);
     s += ", \"stream_clients\": " + std::to_string(clients_.size());
@@ -114,6 +119,17 @@ double LiveDemod::signal_db() {
 }
 
 void LiveDemod::OnBlock(const cfloat* p, size_t n) {
+    // 実測レート監視（このコールバックは SDR 受信スレッド 1 本からだけ呼ばれる）
+    const double t = std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (rate_mon_.Feed(static_cast<long long>(n), t)) {
+        rx_rate_ = rate_mon_.rate();
+        rx_slow_ = rate_mon_.slow();
+        if (rate_mon_.last_slow()) {
+            std::fprintf(stderr, "sdr: rx rate %.0f Hz < %.0f Hz: USB 帯域不足かサンプル落ち\n",
+                         rate_mon_.rate(), rate_mon_.fs());
+        }
+    }
     if (dump_ && dump_written_ < kDumpMaxSamples) {
         const size_t w = std::min(n, static_cast<size_t>(kDumpMaxSamples - dump_written_));
         std::fwrite(p, sizeof(cfloat), w, dump_);
@@ -133,6 +149,27 @@ void LiveDemod::OnBlock(const cfloat* p, size_t n) {
     iq_q_.emplace_back(p, p + n);
     iq_total_ += static_cast<long long>(n);
     iq_cv_.notify_one();
+}
+
+// SDR の切断/再接続（sdr_source の自動再接続）。受信スレッドから呼ばれる。
+// 切断をまたいだサンプルは不連続なので、オーバーフロー時と同じ経路で
+// パイプラインを仕切り直す（SchedLoop が ResetSplice する。underruns にも数えられるが、
+// 切断起因かどうかは status の sdr_reconnects で区別できる）。
+void LiveDemod::OnSdrEvent(bool up) {
+    if (up) {
+        rate_mon_.Reset();      // 無受信期間をレート不足と誤計上しない
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(iq_mu_);
+        iq_q_.clear();
+        iq_total_ = 0;
+        overflowed_ = true;
+    }
+    iq_cv_.notify_all();
+    std::lock_guard<std::mutex> lock(mu_);
+    locked_ = false;
+    mer_db_ = 0.0;              // GetSignalLevel が切断を 0 dB で示せるように
 }
 
 void LiveDemod::SchedLoop() {

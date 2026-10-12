@@ -43,6 +43,7 @@ add_library(BonDriver_PlutoSDR SHARED
   ${RT_DIR}/demod/live_demod.cpp
   ${RT_DIR}/demod/sdr_source.h
   ${RT_DIR}/demod/sdr_source.cpp
+  ${RT_DIR}/demod/rate_monitor.h
 )
 target_link_libraries(BonDriver_PlutoSDR PRIVATE isdbt_core ws2_32)
 # 出力 DLL 名は地デジ(T)を示す _T 付き。ini / log は DLL 名から実行時に導出されるので

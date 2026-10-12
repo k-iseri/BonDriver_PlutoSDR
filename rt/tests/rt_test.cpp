@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 
+#include "../demod/rate_monitor.h"
 #include "../isdbt/deinterleave.h"
 #include "../isdbt/demod.h"
 #include "../isdbt/equalize.h"
@@ -338,6 +339,36 @@ void TestTrackedDropout() {
 }
 
 // 7.0 MSPS 入力（リサンプル経路）: 期待 TS の後半が出力に連続して現れること
+// RateMonitor（rt/demod/rate_monitor.h）: 時刻を明示的に渡せるので実時間なしで検証できる
+void TestRateMonitor() {
+    // 公称どおり: fs=1000 Hz、0.1 s ごとに 100 サンプル → 窓 1 s で 1000 Hz、不足なし
+    {
+        RateMonitor m(1000.0, 1.0, 0.99);
+        bool closed = false;
+        for (int i = 0; i <= 10; ++i) closed |= m.Feed(100, i * 0.1);
+        Report(closed && std::abs(m.rate() - 1000.0) < 1e-6 && m.slow() == 0,
+               "rate_monitor_nominal",
+               "rate=" + std::to_string(m.rate()) + " slow=" + std::to_string(m.slow()));
+    }
+    // 2% 落ち: 0.1 s ごとに 98 サンプル → 980 Hz < 990 Hz で不足 1 回
+    {
+        RateMonitor m(1000.0, 1.0, 0.99);
+        for (int i = 0; i <= 10; ++i) m.Feed(98, i * 0.1);
+        Report(m.slow() == 1 && m.last_slow(), "rate_monitor_slow",
+               "rate=" + std::to_string(m.rate()) + " slow=" + std::to_string(m.slow()));
+    }
+    // Reset 後は窓を仕切り直す: 長い無受信（再接続）をまたいでも不足と誤計上しない
+    {
+        RateMonitor m(1000.0, 1.0, 0.99);
+        for (int i = 0; i <= 10; ++i) m.Feed(100, i * 0.1);     // 1 窓目: 正常
+        m.Reset();
+        // 100 s 後に受信再開。Reset していなければ (次の窓が) 大幅な不足になるところ
+        for (int i = 0; i <= 10; ++i) m.Feed(100, 100.0 + i * 0.1);
+        Report(m.slow() == 0 && std::abs(m.rate() - 1000.0) < 1e-6, "rate_monitor_reset",
+               "rate=" + std::to_string(m.rate()) + " slow=" + std::to_string(m.slow()));
+    }
+}
+
 void TestPipeline7() {
     SigmfMeta meta;
     std::vector<cfloat> iq = ReadSigmf(Path("pipe7_iq.sigmf-meta"), &meta);
@@ -375,6 +406,7 @@ int main(int argc, char** argv) {
         return 2;
     }
     try {
+        TestRateMonitor();
         TestPrbs();
         TestRs();
         TestViterbi();

@@ -24,6 +24,7 @@
 
 #include "../isdbt/demod.h"
 #include "../isdbt/params.h"
+#include "rate_monitor.h"
 #include "sdr_source.h"
 
 namespace isdbt {
@@ -89,6 +90,7 @@ private:
     };
 
     void OnBlock(const cfloat* p, size_t n);
+    void OnSdrEvent(bool up);       // SDR の切断/再接続（受信スレッドから呼ばれる）
     void SchedLoop();
     void ResetSplice(long long* cur_gen);
     void Emit(const DemodResult& res, long long abs0);
@@ -108,6 +110,12 @@ private:
     SdrSource sdr_;
     std::thread sched_, pacer_;
     std::atomic<bool> stop_{false};
+
+    // 受信レートの実測（USB 帯域不足・サンプル落ちの可視化）。rate_mon_ は
+    // SDR 受信スレッドだけが触り、窓が閉じるたびに atomic へ反映して status が読む
+    RateMonitor rate_mon_;
+    std::atomic<double> rx_rate_{0.0};
+    std::atomic<long long> rx_slow_{0};
 
     std::mutex pace_mu_;
     std::condition_variable pace_cv_;
