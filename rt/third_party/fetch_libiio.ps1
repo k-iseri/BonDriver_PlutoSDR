@@ -1,4 +1,4 @@
-# libiio v1.0.0 (Windows VS2022 x64) を rt/third_party/libiio に取得する。
+﻿# libiio v1.0.0 (Windows VS2022 x64) を rt/third_party/libiio に取得する。
 # third_party/ は gitignore。クリーン環境では最初にこれを実行する:
 #   .\rt\third_party\fetch_libiio.ps1
 # ライセンス: libiio は LGPL-2.1+（動的リンク）。docs/decisions.md 参照。

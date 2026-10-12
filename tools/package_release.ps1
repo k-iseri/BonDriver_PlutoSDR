@@ -1,4 +1,4 @@
-# BonDriver_PlutoSDR_T の配布 zip を dist/ に作る（GitHub Actions のリリースとローカル確認の両方で使う）。
+﻿# BonDriver_PlutoSDR_T の配布 zip を dist/ に作る（GitHub Actions のリリースとローカル確認の両方で使う）。
 # 使い方: .\tools\package_release.ps1 [-Version v1.0.0] [-Config Release] [-Arch x64]
 # 前提: .\rt\bondriver\build.ps1 でビルド済み（libiio ありの x64 ビルドを想定。
 #       rt\third_party\fetch_libiio.ps1 を先に実行していないとスタンドアロンモードが無効の DLL になる）

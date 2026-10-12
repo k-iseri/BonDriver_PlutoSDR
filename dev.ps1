@@ -1,4 +1,4 @@
-# make が無い Windows 環境向けの代替。
+﻿# make が無い Windows 環境向けの代替。
 # 使い方: .\dev.ps1 setup / test-fast / test / lint / synth / bondriver / rt / rt-vectors / rt-test
 param([Parameter(Mandatory=$true)][string]$Task)
 $ErrorActionPreference = "Stop"

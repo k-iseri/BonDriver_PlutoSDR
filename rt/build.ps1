@@ -1,4 +1,4 @@
-# rt/（復調コア + rt_test.exe + isdbtd.exe）をビルドする。
+﻿# rt/（復調コア + rt_test.exe + isdbtd.exe）をビルドする。
 # 使い方: .\rt\build.ps1 [-Config Release|Debug]
 # 出力: rt\build\rt-x64\<Config>\{rt_test.exe, isdbtd.exe}
 # 必要: Visual Studio 2022（Build Tools 可）の C++ ツールセットと CMake（VS 同梱で可）

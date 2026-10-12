@@ -1,4 +1,4 @@
-# BonDriver_PlutoSDR_T.dll と bontest.exe をビルドする。
+﻿# BonDriver_PlutoSDR_T.dll と bontest.exe をビルドする。
 # 使い方: .\rt\bondriver\build.ps1 [-Config Release|Debug] [-Arch x64|Win32]
 #   x64   … 64 bit の TVTest / EDCB 用（既定）
 #   Win32 … 32 bit の TVTest / EDCB 用
@@ -13,7 +13,8 @@ $src = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repo = (Resolve-Path (Join-Path $src "..\..")).Path
 $build = Join-Path $repo "rt\build\bondriver-$Arch"
 
-$cmake = (Get-Command cmake -ErrorAction SilentlyContinue)?.Source
+# ?. は PowerShell 7 専用。Makefile は powershell 5.1 で呼ぶので 5.1 互換の書き方にする
+$cmake = (Get-Command cmake -ErrorAction SilentlyContinue | Select-Object -First 1).Source
 if (-not $cmake) {
   $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
   if (-not (Test-Path $vswhere)) { throw "cmake が PATH に無く vswhere も見つからない。Visual Studio 2022 Build Tools を入れること" }
