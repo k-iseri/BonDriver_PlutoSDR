@@ -127,6 +127,8 @@ private:
     std::mutex pace_mu_;
     std::condition_variable pace_cv_;
     std::deque<std::vector<uint8_t>> pace_q_;
+    std::atomic<bool> pace_reset_{false};   // 選局でペーサーの再開待ち状態を初期化する
+    std::atomic<long long> pace_starved_{0};   // 定常中に送出キューが空になった回数（復調の遅れの指標）
 
     std::mutex iq_mu_;
     std::condition_variable iq_cv_;

@@ -32,10 +32,13 @@ Reconnect=1
 ; 伝送モードと GI（日本の実運用は Mode 3 / GI 1/8 固定）
 Mode=3
 GI=1/8
-; ウィンドウ並列復調のパラメータ（isdbtd --win-frames / --ctx-frames / --workers と同じ。地デジのみ）
-WinFrames=16
+; ウィンドウ並列復調のパラメータ（isdbtd --win-frames / --ctx-frames / --workers と同じ。地デジのみ）。
+; WinFrames は 1 ウィンドウの新規フレーム数。小さいほど選局後の映像が早く安定する（8: 約 9 秒で安定、
+; CPU は約 1.5 コア、Workers=3 が必要）。CPU が足りずログに pace_starved / underruns が増える PC では
+; WinFrames=16 / Workers=2 に戻す（約 1.2 コア、安定まで約 13 秒）
+WinFrames=8
 CtxFrames=4
-Workers=2
+Workers=3
 ; libiio1.dll のあるフォルダ。相対パスは DLL のフォルダ基準（例: libiio）。
 ; 空なら DLL と同じフォルダ → 通常の DLL 検索パス（ADI インストーラの PATH 等）の順で探す
 LibiioDir=

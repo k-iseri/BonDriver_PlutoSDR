@@ -667,9 +667,9 @@ void Usage() {
         "  --agc-target F      ソフト AGC の目標帯域内レベル dBFS (default -24)\n"
         "  --bw F              RF 帯域幅 Hz を固定（省略時は方式ごとの既定: 地デジ 5.6 MHz / ISDB-C 6 MHz）\n"
         "  --no-reconnect      ストリームエラー時に自動再接続しない（既定は再接続）\n"
-        "  --win-frames N      ウィンドウの新規フレーム数 (default 16)\n"
+        "  --win-frames N      ウィンドウの新規フレーム数 (default 8。選局後の遅延 vs CPU 効率)\n"
         "  --ctx-frames N      ウィンドウの文脈フレーム数 (default 4)\n"
-        "  --workers N         並列復調ワーカー数 (default 2)\n");
+        "  --workers N         並列復調ワーカー数 (default 3)\n");
 }
 
 }  // namespace
@@ -683,7 +683,7 @@ int main(int argc, char** argv) {
     SdrConfig sdr_cfg;
     std::string dump_iq, system_str;
     int init_ch = 0;
-    int win_frames = 16, ctx_frames = 4, workers = 2;
+    int win_frames = 8, ctx_frames = 4, workers = 3;
     bool bw_fixed = false;
     isdbc::TsmfDemux::Select ts_sel;
     for (int i = 1; i < argc; ++i) {

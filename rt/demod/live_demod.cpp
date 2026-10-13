@@ -73,6 +73,7 @@ void LiveDemod::Tune(bool has_ch, int ch, double freq) {
     {
         std::lock_guard<std::mutex> pl(pace_mu_);
         pace_q_.clear();
+        pace_reset_ = true;
     }
     std::lock_guard<std::mutex> iql(iq_mu_);
     std::lock_guard<std::mutex> lock(mu_);
@@ -121,6 +122,7 @@ std::string LiveDemod::StatusJson() {
     s += ", \"rx_level_dbfs\": " + FormatDouble(sdr_->level_dbfs());
     s += ", \"rx_rate\": " + FormatDouble(rx_rate_.load());
     s += ", \"rx_slow\": " + std::to_string(rx_slow_.load());
+    s += ", \"pace_starved\": " + std::to_string(pace_starved_.load());
     s += ", \"windows\": " + std::to_string(windows_done_);
     s += ", \"windows_failed\": " + std::to_string(windows_failed_);
     s += ", \"stream_clients\": " + std::to_string(clients_.size());
@@ -445,20 +447,55 @@ void LiveDemod::PaceLoop() {
     const auto frame_dt = std::chrono::microseconds(
         static_cast<long long>(frame_samples_ / cfg_.fs * 1e6));
     auto t_next = std::chrono::steady_clock::now();
+    // 再開の余裕: 選局直後は最初の短いウィンドウの数フレームを出した後、次のウィンドウまで数秒空く。
+    // 空になるたびに次の 1 本だけで再開すると、以降も毎回ウィンドウの到着ぎりぎりで追いかけて
+    // かくつくので、一度出した後に空になったら kResumeBacklog フレーム以上溜まる（か上限時間が
+    // 過ぎる）まで待ってから再開する（最初の 1 本は TVTest のスキャン検出のため即座に出す）。
+    // 選局後最初の空き（最初の短いウィンドウの直後）は 2 ウィンドウ分、それ以降の空き（復調が遅れた）は
+    // 数フレーム分だけ溜め直す
+    const size_t kResumeBacklogFirst = static_cast<size_t>(new_frames_ + 4);
+    const size_t kResumeBacklogLater = 4;
+    constexpr auto kResumeMaxWait = std::chrono::seconds(6);
+    bool emitted = false, starved = false, holding = false, first_hold_done = false;
+    std::chrono::steady_clock::time_point hold_since{};
     while (!stop_) {
         std::vector<uint8_t> chunk;
         size_t backlog = 0;
         {
             std::unique_lock<std::mutex> lock(pace_mu_);
+            if (pace_reset_.exchange(false)) {
+                emitted = starved = holding = first_hold_done = false;
+            }
             if (!pace_cv_.wait_for(lock, std::chrono::milliseconds(200),
                                    [&] { return !pace_q_.empty() || stop_; })) {
                 t_next = std::chrono::steady_clock::now();      // 空走中は基準を進めない
+                if (emitted && !starved) {
+                    starved = true;
+                    if (first_hold_done) ++pace_starved_;        // 定常中に空になった回数（status の pace_starved）
+                }
                 continue;
             }
             if (stop_) break;
+            if (starved) {
+                const auto now = std::chrono::steady_clock::now();
+                if (!holding) {
+                    holding = true;
+                    hold_since = now;
+                }
+                const size_t need = first_hold_done ? kResumeBacklogLater : kResumeBacklogFirst;
+                if (pace_q_.size() < need && now - hold_since < kResumeMaxWait) {
+                    lock.unlock();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    continue;
+                }
+                starved = holding = false;
+                first_hold_done = true;
+                t_next = now;
+            }
             chunk = std::move(pace_q_.front());
             pace_q_.pop_front();
             backlog = pace_q_.size();
+            emitted = true;
         }
         std::vector<std::shared_ptr<ClientQueue>> clients;
         {

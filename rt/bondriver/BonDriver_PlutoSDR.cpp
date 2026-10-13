@@ -95,9 +95,9 @@ struct Config {
 		bool reconnect = true;      // USB 瞬断などストリームエラー時の自動再接続
 		int mode = 3;
 		std::string gi = "1/8";
-		int winFrames = 16;
+		int winFrames = 8;
 		int ctxFrames = 4;
-		int workers = 2;
+		int workers = 3;
 		std::wstring libiioDir;     // libiio1.dll のあるフォルダ（空なら DLL の隣 → PATH）
 	} sdr;
 };
@@ -170,9 +170,9 @@ Config LoadConfig()
 	c.sdr.reconnect = GetPrivateProfileIntW(L"SDR", L"Reconnect", 1, c.iniPath.c_str()) != 0;
 	c.sdr.mode = (int)GetPrivateProfileIntW(L"SDR", L"Mode", 3, c.iniPath.c_str());
 	c.sdr.gi = Narrow(ReadIniString(L"SDR", L"GI", L"1/8", c.iniPath));
-	c.sdr.winFrames = (int)GetPrivateProfileIntW(L"SDR", L"WinFrames", 16, c.iniPath.c_str());
+	c.sdr.winFrames = (int)GetPrivateProfileIntW(L"SDR", L"WinFrames", 8, c.iniPath.c_str());
 	c.sdr.ctxFrames = (int)GetPrivateProfileIntW(L"SDR", L"CtxFrames", 4, c.iniPath.c_str());
-	c.sdr.workers = (int)GetPrivateProfileIntW(L"SDR", L"Workers", 2, c.iniPath.c_str());
+	c.sdr.workers = (int)GetPrivateProfileIntW(L"SDR", L"Workers", 3, c.iniPath.c_str());
 	c.sdr.libiioDir = ReadIniString(L"SDR", L"LibiioDir", L"", c.iniPath);
 	return c;
 }

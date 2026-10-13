@@ -36,7 +36,7 @@ struct LiveParams {
     // ISDB-T
     Mode mode = Mode::M3;
     Gi gi{8};
-    int win_frames = 16, ctx_frames = 4, workers = 2;
+    int win_frames = 8, ctx_frames = 4, workers = 3;
     std::string dump_iq;
     // ISDB-C
     isdbc::TsmfDemux::Select select;
