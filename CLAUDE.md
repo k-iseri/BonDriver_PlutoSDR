@@ -4,12 +4,17 @@
 日本の地上デジタル放送（ISDB-T、ARIB STD-B31）のフルセグ（13セグメント）を
 汎用SDRボードで受信し、PC上のソフトウェアで復調して MPEG-2 TS を取り出す。
 ワンセグ（部分受信、セグメント0のみ）は副次目標であり、フルセグより先に動く想定。
+2026-10-13 から、ケーブルテレビの BS/CS トランスモジュレーション（ISDB-C = ITU-T J.83 Annex C 64QAM
+5.274 Mbaud + J.183 TSMF）も対象（`ref/isdbc/`、`rt/isdbc/`、仕様ノート `docs/isdbc-spec-notes.md`）。
+BonDriver は同じソースから `_T`（地デジのみ）と `_TC`（地デジ + CATV 空間）の 2 DLL を出す。
+CATV 空間のチャンネル番号は BonDriver_BDA の TransModulation と同じ通し番号 0..112 を崩さない。
 
 ## ハードウェアの状況
-- 対象ボード: Pluto SDR 互換機（Zynq-7010 + AD9363、USB 2.0）。**まだ手元に無い。**
-- `hw/` 以下のコードはボード到着まで実機検証できない。「未検証」とコメントに明記すること。
+- 対象ボード: Pluto SDR 互換機（Zynq-7010 + AD9363、USB 2.0）。手元にあり実機検証済み（2026-10-10〜）。
 - 後に Gigabit Ethernet 付きの Pluto+ / LibreSDR（Zynq-7020）へ移行する可能性があるため、
   デバイス接続は `ip:` と `usb:` の両方を同じインターフェースで扱えるよう抽象化する。
+- 受信ゲインは AD936x 内蔵 AGC を使わず、帯域内 −24 dBFS 目標のソフトウェア AGC が既定
+  （強い全帯域入力でフロントエンドが圧縮するため。`docs/hw-setup.md`「受信ゲイン」）。
 
 ## 開発方針（重要）
 1. **まず `ref/` の Python 参照実装で正しさを確立する。** numpy/scipy のみ。
@@ -33,13 +38,13 @@
   録音したファイルを内部でリサンプルして処理できること。
 
 ## TVTest / EDCB 連携（BonDriver）
-- `rt/bondriver/` の BonDriver は 2 モード。既定のデーモンモードは復調を持たず、復調デーモンと
-  TCP で話す（プロトコルは `docs/daemon-protocol.md`、変更時は版番号を上げ、
-  `tools/demod_server.py` と DLL の両方を更新する）。ini の `[SDR] Enable=1` で
-  スタンドアロンモードになり、`rt/demod/live_demod.{h,cpp}`（isdbtd --sdr と共用）を
-  静的リンクして DLL 内で直接 SDR 取り込み + 復調する（libiio は遅延ロード）。
-- 今のデーモンは `tools/demod_server.py`（録画 TS / SigMF の再生）。`rt/` の実時間復調は
-  同じプロトコルを実装してこれを置き換える。
+- `rt/bondriver/` の BonDriver は 2 モード。デーモンモードは復調を持たず、復調デーモンと
+  TCP で話す（プロトコルは `docs/daemon-protocol.md` v2、変更時は版番号を上げ、
+  `tools/demod_server.py` と `rt/demod/isdbtd.cpp` と DLL をすべて更新する）。ini の `[SDR] Enable=1`
+  （ini.sample の既定）でスタンドアロンモードになり、`rt/demod/live_switch.{h,cpp}`（isdbtd --sdr と共用。
+  地デジ LiveDemod / ISDB-C LiveIsdbc を選局先の空間で差し替える）を静的リンクして DLL 内で直接
+  SDR 取り込み + 復調する（libiio は遅延ロード）。
+- デーモンは `rt/demod/isdbtd.exe`（SDR ライブ / 録画 TS / SigMF）と開発用の `tools/demod_server.py`。
 - `rt/bondriver/IBonDriver*.h` は TVTest の宣言を転記したもので、宣言順を変えてはいけない。
 - DLL のビルドは `make bondriver`（または `.\dev.ps1 bondriver`）。TVTest 無しの確認は `bontest.exe`。
 

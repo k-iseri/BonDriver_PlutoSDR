@@ -1,8 +1,8 @@
-﻿# BonDriver_PlutoSDR_T.dll と bontest.exe をビルドする。
+﻿# BonDriver_PlutoSDR_T.dll（地デジ）/ BonDriver_PlutoSDR_TC.dll（地デジ + CATV トラモジ）と bontest.exe をビルドする。
 # 使い方: .\rt\bondriver\build.ps1 [-Config Release|Debug] [-Arch x64|Win32]
 #   x64   … 64 bit の TVTest / EDCB 用（既定）
 #   Win32 … 32 bit の TVTest / EDCB 用
-# 出力: rt\build\bondriver-<Arch>\<Config>\BonDriver_PlutoSDR_T.dll
+# 出力: rt\build\bondriver-<Arch>\<Config>\BonDriver_PlutoSDR_T.dll と BonDriver_PlutoSDR_TC.dll
 # 必要: Visual Studio 2022（Build Tools 可）の C++ ツールセットと CMake（VS 同梱で可）
 param(
   [string]$Config = "Release",
@@ -29,4 +29,5 @@ if ($LASTEXITCODE) { throw "cmake configure failed" }
 if ($LASTEXITCODE) { throw "cmake build failed" }
 Write-Host ""
 Write-Host "built: $build\$Config\BonDriver_PlutoSDR_T.dll"
+Write-Host "       $build\$Config\BonDriver_PlutoSDR_TC.dll"
 Write-Host "       $build\$Config\bontest.exe"

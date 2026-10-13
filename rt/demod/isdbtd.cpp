@@ -28,10 +28,12 @@
 #include <thread>
 #include <vector>
 
+#include "../isdbc/demod.h"
 #include "../isdbt/demod.h"
 #include "../isdbt/io.h"
 #include "../isdbt/params.h"
 #include "live_demod.h"
+#include "live_switch.h"
 #include "sdr_source.h"
 
 #pragma comment(lib, "ws2_32.lib")
@@ -40,7 +42,7 @@ using namespace isdbt;
 
 namespace {
 
-constexpr int kProtocolVersion = 1;
+constexpr int kProtocolVersion = 2;     // v2: tune/status に system（isdbt|isdbc）。docs/daemon-protocol.md
 constexpr int kDefaultPort = 47188;
 constexpr double kDefaultBitrate = 16'851'000.0;    // Mode 3 / GI 1/8 / 64QAM 3/4 × 13 セグの概算 TS レート
 constexpr size_t kChunkPackets = 64;
@@ -293,6 +295,47 @@ Source LoadSigmf(const std::string& path, Mode mode, Gi gi, double max_seconds, 
     return s;
 }
 
+// ISDB-C（ケーブル TV トラモジ）の SigMF をオフラインで復調して再生ソースにする（--system isdbc）
+Source LoadSigmfIsdbc(const std::string& path, double max_seconds, double bitrate_opt,
+                      isdbc::TsmfDemux::Select sel) {
+    SigmfMeta meta;
+    std::vector<cfloat> iq = ReadSigmf(path, &meta);
+    if (max_seconds > 0) {
+        const size_t n = static_cast<size_t>(max_seconds * meta.sample_rate);
+        if (iq.size() > n) iq.resize(n);
+    }
+    std::fprintf(stderr, "demodulating %s as ISDB-C (%.1f s of I/Q) ...\n", path.c_str(),
+                 iq.size() / meta.sample_rate);
+    const auto t0 = std::chrono::steady_clock::now();
+    isdbc::IsdbcConfig cfg;
+    cfg.fs = meta.sample_rate;
+    cfg.select = sel;
+    Source s;
+    isdbc::IsdbcDemod demod(cfg, [&](const uint8_t* pk, size_t n) {
+        s.packets.insert(s.packets.end(), pk, pk + n * kTsPacket);
+    });
+    const size_t blk = 1 << 18;
+    for (size_t i = 0; i < iq.size(); i += blk) demod.Feed(iq.data() + i, std::min(blk, iq.size() - i));
+    const isdbc::IsdbcStatus st = demod.status();
+    const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    std::fprintf(stderr, "done in %.1f s: locked %d, MER %.1f dB, CFO %.0f Hz, clock %.1f ppm, "
+                 "RS uncorrectable %lld/%lld, TSMF streams %zu (selected %d)\n",
+                 sec, st.locked ? 1 : 0, st.mer_db, st.cfo_hz, st.clock_ppm, st.rs_uncorrectable,
+                 st.rs_packets, st.tsmf_streams.size(), st.tsmf_selected);
+    for (const auto& t : st.tsmf_streams) {
+        std::fprintf(stderr, "  relative TS %d: TS_id %d, original_network_id %d\n", t.rel, t.tsid, t.onid);
+    }
+    if (s.packets.empty()) throw std::runtime_error("ISDB-C 復調で TS が得られない");
+    s.locked = st.locked;
+    s.mer_db = st.mer_db;
+    s.rs_uncorrectable = st.rs_uncorrectable;
+    s.mode = 0;
+    s.gi = "-";
+    s.bitrate = bitrate_opt > 0 ? bitrate_opt : EstimateBitrateFromPcr(s.packets, isdbc::kTsBitrateBps);
+    s.source_desc = "sigmf-isdbc:" + path;
+    return s;
+}
+
 // ---------------------------------------------------------------------------
 // 再生器
 // ---------------------------------------------------------------------------
@@ -313,6 +356,10 @@ public:
         std::lock_guard<std::mutex> lock(mu_);
         clients_.push_back(q);
         return q;
+    }
+    void AttachClient(const std::shared_ptr<ClientQueue>& q) {
+        std::lock_guard<std::mutex> lock(mu_);
+        clients_.push_back(q);
     }
     void RemoveClient(const std::shared_ptr<ClientQueue>& q) {
         std::lock_guard<std::mutex> lock(mu_);
@@ -426,8 +473,9 @@ private:
 // ---------------------------------------------------------------------------
 class Server {
 public:
-    Server(IFeed* rp, const std::string& host, int port, bool allow_quit, bool verbose)
-        : rp_(rp), allow_quit_(allow_quit), verbose_(verbose) {
+    // live が非 null なら tune の system でパイプラインを切り替える（SDR ソースのとき）
+    Server(IFeed* rp, LiveSwitch* live, const std::string& host, int port, bool allow_quit, bool verbose)
+        : rp_(rp), live_(live), allow_quit_(allow_quit), verbose_(verbose) {
         listen_ = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
@@ -509,22 +557,42 @@ private:
                 double freq = 0.0, chd = 0.0;
                 const bool has_freq = JsonNumber(line, "freq_hz", &freq);
                 const bool has_ch = JsonNumber(line, "channel", &chd);
+                System sys;
+                if (!ParseSystem(JsonStringValue(line, "system"), &sys)) {
+                    SendLine(c, "{\"ok\": false, \"error\": \"system must be isdbt or isdbc\"}");
+                    continue;
+                }
                 if (!has_freq && !has_ch) {
                     SendLine(c, "{\"ok\": false, \"error\": \"channel or freq_hz required\"}");
                     continue;
                 }
                 int ch = static_cast<int>(chd);
                 if (!has_freq) {
-                    if (ch < 13 || ch > 62) {
-                        SendLine(c, "{\"ok\": false, \"error\": \"channel out of range 13..62\"}");
-                        continue;
+                    if (sys == System::kIsdbc) {
+                        // ケーブル TV のチャンネル番号（BonDriver_BDA 互換の通し番号 0..112）
+                        if (!isdbc::CatvChannel(ch, &freq, nullptr)) {
+                            SendLine(c, "{\"ok\": false, \"error\": \"channel out of range 0..112\"}");
+                            continue;
+                        }
+                    } else {
+                        if (ch < 13 || ch > 62) {
+                            SendLine(c, "{\"ok\": false, \"error\": \"channel out of range 13..62\"}");
+                            continue;
+                        }
+                        freq = ChannelToHz(ch);
                     }
-                    freq = ChannelToHz(ch);
                 }
-                rp_->Tune(has_ch, ch, freq);
-                Log("tune channel=%d freq=%.0f", has_ch ? ch : -1, freq);
-                SendLine(c, std::string("{\"ok\": true, \"channel\": ") +
-                             (has_ch ? std::to_string(ch) : "null") +
+                double ts_sel = 0.0;
+                if (live_ && JsonNumber(line, "ts", &ts_sel)) {
+                    isdbc::TsmfDemux::Select s;
+                    s.rel = static_cast<int>(ts_sel);
+                    live_->SetSelect(s);
+                }
+                if (live_) live_->TuneSystem(sys, has_ch, ch, freq);
+                else rp_->Tune(has_ch, ch, freq);
+                Log("tune system=%s channel=%d freq=%.0f", SystemName(sys), has_ch ? ch : -1, freq);
+                SendLine(c, std::string("{\"ok\": true, \"system\": \"") + SystemName(sys) +
+                             "\", \"channel\": " + (has_ch ? std::to_string(ch) : "null") +
                              ", \"freq_hz\": " + FormatDouble(freq) + "}");
             } else if (cmd == "status") {
                 SendLine(c, rp_->StatusJson());
@@ -570,6 +638,7 @@ private:
     }
 
     IFeed* rp_;
+    LiveSwitch* live_;
     bool allow_quit_;
     bool verbose_;
     SOCKET listen_;
@@ -579,6 +648,7 @@ private:
 void Usage() {
     std::fprintf(stderr,
         "usage: isdbtd (--ts <file> | --sigmf <file> | --sdr [uri]) [options]\n"
+        "  --system isdbt|isdbc  方式 (default isdbt)。isdbc = ケーブル TV の 64QAM トラモジ\n"
         "  --mode 1|2|3        (default 3)\n"
         "  --gi 1/4|1/8|1/16|1/32  (default 1/8)\n"
         "  --max-seconds F     --sigmf の先頭から処理する秒数\n"
@@ -586,13 +656,16 @@ void Usage() {
         "  --loop              末尾まで来たら先頭に戻る\n"
         "  --track             追従復調（長時間・ドリフト・瞬断のある録音向け）\n"
         "  --signal-db F       status.signal_db に返す固定値 (default 30)\n"
+        "  --tsmf N | all      ISDB-C: TSMF の相対 TS 番号（既定は自動、all = 全スロット通過）\n"
         "  --host H --port N   (default 127.0.0.1:47188)\n"
         "  --no-quit           quit コマンドを受け付けない\n"
         "  --quiet\n"
         "SDR ライブ受信（--sdr。uri 省略時 usb:）:\n"
-        "  --ch N | --freq F   初期チャンネル/周波数（省略時は tune 待ち）\n"
+        "  --ch N | --freq F   初期チャンネル/周波数（省略時は tune 待ち。isdbc の N は 0..112 の通し番号）\n"
         "  --fs F              取り込みレート Hz (default 7111111 = 公称の 7/8。USB 2.0 の帯域対策)\n"
-        "  --gain F            手動ゲイン dB（省略時 slow_attack AGC）\n"
+        "  --gain F | hw       手動ゲイン dB / AD936x の slow_attack AGC。省略時はソフト AGC\n"
+        "  --agc-target F      ソフト AGC の目標帯域内レベル dBFS (default -24)\n"
+        "  --bw F              RF 帯域幅 Hz を固定（省略時は方式ごとの既定: 地デジ 5.6 MHz / ISDB-C 6 MHz）\n"
         "  --no-reconnect      ストリームエラー時に自動再接続しない（既定は再接続）\n"
         "  --win-frames N      ウィンドウの新規フレーム数 (default 16)\n"
         "  --ctx-frames N      ウィンドウの文脈フレーム数 (default 4)\n"
@@ -608,9 +681,11 @@ int main(int argc, char** argv) {
     bool loop = false, no_quit = false, quiet = false, track = false;
     bool sdr = false;
     SdrConfig sdr_cfg;
-    std::string dump_iq;
+    std::string dump_iq, system_str;
     int init_ch = 0;
     int win_frames = 16, ctx_frames = 4, workers = 2;
+    bool bw_fixed = false;
+    isdbc::TsmfDemux::Select ts_sel;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
@@ -620,10 +695,17 @@ int main(int argc, char** argv) {
             sdr = true;
             if (i + 1 < argc && argv[i + 1][0] != '-') sdr_cfg.uri = next();
         }
+        else if (a == "--system") system_str = next();
         else if (a == "--ch") init_ch = std::atoi(next().c_str());
         else if (a == "--freq") sdr_cfg.freq_hz = std::atof(next().c_str());
         else if (a == "--fs") sdr_cfg.fs = std::atof(next().c_str());
-        else if (a == "--gain") { sdr_cfg.agc = false; sdr_cfg.gain_db = std::atof(next().c_str()); }
+        else if (a == "--bw") { sdr_cfg.bw = std::atof(next().c_str()); bw_fixed = true; }
+        else if (a == "--gain") {
+            const std::string g = next();
+            if (g == "hw") sdr_cfg.hw_agc = true;
+            else { sdr_cfg.agc = false; sdr_cfg.gain_db = std::atof(g.c_str()); }
+        }
+        else if (a == "--agc-target") sdr_cfg.agc_target_dbfs = std::atof(next().c_str());
         else if (a == "--no-reconnect") sdr_cfg.reconnect = false;
         else if (a == "--dump-iq") dump_iq = next();
         else if (a == "--win-frames") win_frames = std::atoi(next().c_str());
@@ -636,6 +718,11 @@ int main(int argc, char** argv) {
         else if (a == "--loop") loop = true;
         else if (a == "--track") track = true;
         else if (a == "--signal-db") signal_db = std::atof(next().c_str());
+        else if (a == "--tsmf" || a == "--rel-ts") {
+            const std::string v = next();
+            if (v == "all") ts_sel.pass_all = true;
+            else ts_sel.rel = std::atoi(v.c_str());
+        }
         else if (a == "--host") host = next();
         else if (a == "--port") port = std::atoi(next().c_str());
         else if (a == "--no-quit") no_quit = true;
@@ -653,28 +740,50 @@ int main(int argc, char** argv) {
     try {
         Gi gi{8};
         if (!ParseGi(gi_str, &gi)) throw std::runtime_error("bad --gi: " + gi_str);
+        System system;
+        if (!ParseSystem(system_str, &system)) throw std::runtime_error("bad --system: " + system_str);
         if (sdr) {
-            if (init_ch) sdr_cfg.freq_hz = ChannelToHz(init_ch);
+            double init_freq = 0.0;
+            if (init_ch) {
+                if (system == System::kIsdbc) {
+                    if (!isdbc::CatvChannel(init_ch, &init_freq, nullptr)) throw std::runtime_error("bad --ch for isdbc");
+                } else {
+                    init_freq = ChannelToHz(init_ch);
+                }
+                sdr_cfg.freq_hz = init_freq;
+            }
             if (sdr_cfg.freq_hz <= 0) sdr_cfg.freq_hz = ChannelToHz(27);   // tune 待ちの仮周波数
-            LiveDemod live(sdr_cfg, static_cast<Mode>(mode_i), gi, win_frames, ctx_frames, workers,
-                           !quiet, dump_iq);
-            live.Start();
-            if (init_ch) live.Tune(true, init_ch, ChannelToHz(init_ch));
-            std::fprintf(stderr, "live demod (%s, win=%d+%d frames, %d workers) on %s:%d\n",
-                         sdr_cfg.uri.c_str(), ctx_frames, win_frames, workers, host.c_str(), port);
-            Server server(&live, host, port, !no_quit, !quiet);
+            LiveParams lp;
+            lp.sdr = sdr_cfg;
+            lp.bw_fixed = bw_fixed;
+            lp.mode = static_cast<Mode>(mode_i);
+            lp.gi = gi;
+            lp.win_frames = win_frames;
+            lp.ctx_frames = ctx_frames;
+            lp.workers = workers;
+            lp.dump_iq = dump_iq;
+            lp.select = ts_sel;
+            lp.verbose = !quiet;
+            LiveSwitch live(lp);
+            live.Start(system);
+            if (init_ch) live.TuneSystem(system, true, init_ch, init_freq);
+            std::fprintf(stderr, "live demod (%s, %s, win=%d+%d frames, %d workers) on %s:%d\n",
+                         sdr_cfg.uri.c_str(), SystemName(system), ctx_frames, win_frames, workers,
+                         host.c_str(), port);
+            Server server(&live, &live, host, port, !no_quit, !quiet);
             server.Serve();
             live.Stop();
         } else {
-            Source src = ts_path.empty()
-                ? LoadSigmf(sigmf_path, static_cast<Mode>(mode_i), gi, max_seconds, bitrate, track)
-                : LoadTsFile(ts_path, bitrate);
+            Source src = !ts_path.empty() ? LoadTsFile(ts_path, bitrate)
+                         : (system == System::kIsdbc
+                                ? LoadSigmfIsdbc(sigmf_path, max_seconds, bitrate, ts_sel)
+                                : LoadSigmf(sigmf_path, static_cast<Mode>(mode_i), gi, max_seconds, bitrate, track));
             const size_t n_tsp = src.packets.size() / kTsPacket;
             std::fprintf(stderr, "serving %zu TSP (%.1f s at %.3f Mbps, loop=%d) on %s:%d  source=%s\n",
                          n_tsp, n_tsp * kTsPacket * 8 / src.bitrate, src.bitrate / 1e6, loop ? 1 : 0,
                          host.c_str(), port, src.source_desc.c_str());
             Replayer rp(std::move(src), loop, signal_db);
-            Server server(&rp, host, port, !no_quit, !quiet);
+            Server server(&rp, nullptr, host, port, !no_quit, !quiet);
             rp.Start();
             server.Serve();
             rp.Stop();

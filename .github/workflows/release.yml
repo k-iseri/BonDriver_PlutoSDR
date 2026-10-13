@@ -40,11 +40,12 @@ jobs:
         run: |
           $sig = '[DllImport("kernel32", SetLastError=true)] public static extern IntPtr LoadLibrary(string f); [DllImport("kernel32")] public static extern IntPtr GetProcAddress(IntPtr m, string n);'
           Add-Type -Name K -Namespace W -MemberDefinition $sig
-          $dll = "rt\build\bondriver-x64\Release\BonDriver_PlutoSDR_T.dll"
-          $m = [W.K]::LoadLibrary((Resolve-Path $dll))
-          if ($m -eq [IntPtr]::Zero) { throw "LoadLibrary failed: $dll" }
-          if ([W.K]::GetProcAddress($m, "CreateBonDriver") -eq [IntPtr]::Zero) { throw "CreateBonDriver not exported" }
-          Write-Host "ok: $dll"
+          foreach ($dll in @("rt\build\bondriver-x64\Release\BonDriver_PlutoSDR_T.dll", "rt\build\bondriver-x64\Release\BonDriver_PlutoSDR_TC.dll")) {
+            $m = [W.K]::LoadLibrary((Resolve-Path $dll))
+            if ($m -eq [IntPtr]::Zero) { throw "LoadLibrary failed: $dll" }
+            if ([W.K]::GetProcAddress($m, "CreateBonDriver") -eq [IntPtr]::Zero) { throw "CreateBonDriver not exported: $dll" }
+            Write-Host "ok: $dll"
+          }
 
       - name: Package zip
         run: .\tools\package_release.ps1 -Version "$env:TAG"

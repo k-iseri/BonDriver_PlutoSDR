@@ -1,5 +1,7 @@
 #include "sdr_source.h"
 
+#include <cmath>
+
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -21,6 +23,7 @@ void SdrSource::Start(const SdrConfig&, BlockFn, EventFn) {
         "libiio 無しでビルドされている。rt\\third_party\\fetch_libiio.ps1 を実行してから make rt し直す");
 }
 void SdrSource::Retune(double) {}
+void SdrSource::SetBandwidth(double) {}
 void SdrSource::Stop() {}
 void SdrSource::Run() {}
 void SdrSource::Connect() {}
@@ -106,11 +109,13 @@ void SdrSource::Connect() {
         if (!im.phy_rx || !im.phy_lo) throw std::runtime_error("ad9361-phy のチャンネルが見つからない");
         WriteAttr(im.phy_rx, "sampling_frequency", FormatLL(cfg_.fs));
         WriteAttr(im.phy_rx, "rf_bandwidth", FormatLL(cfg_.bw));
-        if (cfg_.agc) {
+        if (cfg_.agc && cfg_.hw_agc) {
             WriteAttr(im.phy_rx, "gain_control_mode", "slow_attack");
         } else {
+            // 手動 / ソフト AGC（再接続時は直前のゲインを引き継ぐ）
+            if (gain_db_ == 0.0 && cfg_.gain_db != 0.0) gain_db_ = cfg_.gain_db;
             WriteAttr(im.phy_rx, "gain_control_mode", "manual");
-            WriteAttr(im.phy_rx, "hardwaregain", std::to_string(cfg_.gain_db));
+            WriteAttr(im.phy_rx, "hardwaregain", std::to_string(static_cast<int>(std::lround(gain_db_))));
         }
         double freq;
         {
@@ -177,6 +182,19 @@ void SdrSource::Retune(double freq_hz) {
     }
 }
 
+void SdrSource::SetBandwidth(double bw_hz) {
+    if (!impl_) return;
+    std::lock_guard<std::mutex> lk(mu_);
+    cfg_.bw = bw_hz;
+    if (!connected_ || !impl_->phy_rx) return;
+    try {
+        WriteAttr(impl_->phy_rx, "rf_bandwidth", FormatLL(bw_hz));
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "sdr: set bandwidth failed (%s); will apply after reconnect", e.what());
+        std::fprintf(stderr, "%c", 10);
+    }
+}
+
 void SdrSource::Stop() {
     if (!impl_) return;
     {
@@ -199,6 +217,9 @@ void SdrSource::Run() {
     bool ovf_usable = true;         // reg アクセス不能なコア（将来の別ボード等）では監視を止める
     bool ovf_armed = false;         // 最初のブロック到着（= DMA 稼働）後にクリアしてから監視を始める
     long long ovf_countdown = kOvfCheckBlocks;
+    constexpr int kAgcBlocks = 4;   // 約 0.5 秒
+    double agc_acc = 0.0, agc_cnt = 0.0;
+    int agc_blocks = 0;
     while (!stop_) {
         const iio_block* blk = iio_stream_get_next_block(impl_->stream);
         if (iio_err(blk)) {
@@ -244,6 +265,43 @@ void SdrSource::Run() {
         }
         ++blocks_;
         if (on_block_) on_block_(out.data(), n);
+        // ソフトウェア AGC: 帯域内平均電力（間引き）を測り、約 0.5 秒ごとに hardwaregain を目標へ寄せる
+        {
+            double acc = 0.0;
+            size_t cnt = 0;
+            for (size_t i = 0; i < n; i += 64) {
+                acc += std::norm(out[i]);
+                ++cnt;
+            }
+            agc_acc += acc;
+            agc_cnt += static_cast<double>(cnt);
+            if (++agc_blocks >= kAgcBlocks) {
+                const double level = 10.0 * std::log10(agc_acc / std::max(agc_cnt, 1.0) + 1e-30);
+                level_dbfs_ = level;
+                agc_acc = 0.0;
+                agc_cnt = 0.0;
+                agc_blocks = 0;
+                if (cfg_.agc && !cfg_.hw_agc) {
+                    const double diff = cfg_.agc_target_dbfs - level;
+                    if (std::fabs(diff) >= 1.0) {
+                        const double step = std::max(-12.0, std::min(12.0, diff));
+                        const double g = std::max(0.0, std::min(73.0, std::round(gain_db_ + step)));
+                        if (g != gain_db_) {
+                            std::lock_guard<std::mutex> lk(mu_);
+                            if (connected_ && impl_->phy_rx) {
+                                try {
+                                    WriteAttr(impl_->phy_rx, "hardwaregain",
+                                              std::to_string(static_cast<int>(g)));
+                                    gain_db_ = g;
+                                } catch (const std::exception& e) {
+                                    std::fprintf(stderr, "sdr: agc gain write failed: %s\n", e.what());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // UI_OVF 監視（約 1 秒周期。reg アクセスは制御転送 1 回で、ストリームへの影響は無視できる）
         if (ovf_usable) {
             if (!ovf_armed) {

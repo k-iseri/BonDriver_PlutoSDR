@@ -57,6 +57,8 @@ class IFeed {
 public:
     virtual ~IFeed() = default;
     virtual std::shared_ptr<ClientQueue> AddClient() = 0;
+    // 既存のキューを登録する（LiveSwitch がパイプラインを差し替えるときにクライアントを引き継ぐ）
+    virtual void AttachClient(const std::shared_ptr<ClientQueue>& q) = 0;
     virtual void RemoveClient(const std::shared_ptr<ClientQueue>& q) = 0;
     virtual void Tune(bool has_ch, int ch, double freq) = 0;
     virtual std::string StatusJson() = 0;
@@ -65,14 +67,16 @@ public:
 
 class LiveDemod : public IFeed {
 public:
+    // external_sdr が非 null なら SDR を自分で開かず、所有者（LiveSwitch）が OnBlock / OnSdrEvent を呼ぶ
     LiveDemod(SdrConfig cfg, Mode mode, Gi gi, int new_frames, int ctx_frames, int workers,
-              bool verbose, std::string dump_iq_path = {});
+              bool verbose, std::string dump_iq_path = {}, SdrSource* external_sdr = nullptr);
 
     // SDR を開いて復調スレッドを開始する。失敗は std::runtime_error（libiio 無しビルドを含む）
     void Start();
     void Stop();
 
     std::shared_ptr<ClientQueue> AddClient() override;
+    void AttachClient(const std::shared_ptr<ClientQueue>& q) override;
     void RemoveClient(const std::shared_ptr<ClientQueue>& q) override;
     void Tune(bool has_ch, int ch, double freq) override;
     std::string StatusJson() override;
@@ -81,6 +85,9 @@ public:
     // BonDriver スタンドアロンモード向けの軽量アクセサ（StatusJson の JSON を解さずに済む）
     bool locked();
     double signal_db();         // 最悪階層の MER [dB]（未ロック時 0）
+    // 外部 SDR 所有者から呼ぶ入力（SDR 受信スレッドから）
+    void OnBlock(const cfloat* p, size_t n);
+    void OnSdrEvent(bool up);
 
 private:
     struct WindowJob {
@@ -89,8 +96,6 @@ private:
         std::future<std::shared_ptr<DemodResult>> fut;   // 失敗は nullptr
     };
 
-    void OnBlock(const cfloat* p, size_t n);
-    void OnSdrEvent(bool up);       // SDR の切断/再接続（受信スレッドから呼ばれる）
     void SchedLoop();
     void ResetSplice(long long* cur_gen);
     void Emit(const DemodResult& res, long long abs0);
@@ -107,7 +112,9 @@ private:
     double in_per_nominal_;
     double frame_samples_;          // 入力サンプル単位
     std::string desc_;
-    SdrSource sdr_;
+    SdrSource own_sdr_;
+    SdrSource* sdr_;                // 自前（own_sdr_）か LiveSwitch の共有 SDR
+    bool external_;
     std::thread sched_, pacer_;
     std::atomic<bool> stop_{false};
 
@@ -126,6 +133,9 @@ private:
     std::deque<std::vector<cfloat>> iq_q_;
     long long iq_total_ = 0;
     bool overflowed_ = false;
+    // 選局直後に捨てる入力サンプル数。SDR 側に積まれている約 0.6 秒分（nb_blocks × block）は
+    // LO 変更前の信号なので、混ぜると最初のウィンドウが必ず同期失敗して TS が 1 ウィンドウ分遅れる
+    std::atomic<long long> skip_samples_{0};
 
     std::mutex mu_;
     std::vector<std::shared_ptr<ClientQueue>> clients_;

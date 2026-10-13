@@ -33,7 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ref"))
 from isdbt import params as P
 from isdbt.io import TS_PACKET, TS_SYNC, read_sigmf, read_ts
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2       # v2: tune/status に system（isdbt|isdbc）。未知キー無視なので v1 クライアントとも互換
 DEFAULT_PORT = 47188
 DEFAULT_BITRATE = 16_851_000.0      # Mode 3 / GI 1/8 / 64QAM 3/4 × 13 セグメントの TS レート（概算）
 CHUNK_PACKETS = 64                   # 1 回の送信単位
@@ -174,6 +174,7 @@ class Replayer:
     info: dict = field(default_factory=dict)
     channel: int | None = None
     freq_hz: float | None = None
+    system: str = "isdbt"
     ts_packets: int = 0
     dropped: int = 0
     _pos: int = 0
@@ -203,10 +204,11 @@ class Replayer:
             if q in self._clients:
                 self._clients.remove(q)
 
-    def tune(self, channel: int | None, freq_hz: float | None) -> dict:
+    def tune(self, channel: int | None, freq_hz: float | None, system: str = "isdbt") -> dict:
         with self._lock:
             self.channel = channel
             self.freq_hz = freq_hz
+            self.system = system
             self._pos = 0
             self._ended = False
             for q in self._clients:          # 送信待ちを捨てる（選局後のデータだけ流す）
@@ -215,7 +217,7 @@ class Replayer:
                         q.get_nowait()
                     except queue.Empty:
                         break
-        return {"channel": channel, "freq_hz": freq_hz}
+        return {"channel": channel, "freq_hz": freq_hz, "system": system}
 
     def status(self) -> dict:
         with self._lock:
@@ -223,6 +225,7 @@ class Replayer:
         d = {
             "locked": bool(self.info.get("locked", True)) and not self._ended,
             "signal_db": float(self.signal_db) if not self._ended else 0.0,
+            "system": self.system,
             "channel": self.channel,
             "freq_hz": self.freq_hz,
             "mode": self.info.get("mode", 3),
@@ -293,18 +296,30 @@ class _Handler(socketserver.StreamRequestHandler):
                 if freq is None and ch is None:
                     self._send({"ok": False, "error": "channel or freq_hz required"})
                     continue
+                system = str(req.get("system", "isdbt"))
+                if system not in ("isdbt", "isdbc"):
+                    self._send({"ok": False, "error": "system must be isdbt or isdbc"})
+                    continue
                 if freq is None:
                     try:
                         ch = int(ch)
                     except (TypeError, ValueError):
                         self._send({"ok": False, "error": "channel must be int"})
                         continue
-                    if not 13 <= ch <= 62:
-                        self._send({"ok": False, "error": "channel out of range 13..62"})
-                        continue
-                    freq = channel_to_hz(ch)
-                r = rp.tune(ch, float(freq))
-                self.server.log(f"tune channel={ch} freq={freq}")
+                    if system == "isdbc":
+                        # ケーブル TV のチャンネル番号（BonDriver_BDA 互換 0..112）
+                        from isdbc import params as CP
+                        if not 0 <= ch < len(CP.CATV_CHANNELS):
+                            self._send({"ok": False, "error": "channel out of range 0..112"})
+                            continue
+                        freq = CP.catv_channel(ch).freq_hz
+                    else:
+                        if not 13 <= ch <= 62:
+                            self._send({"ok": False, "error": "channel out of range 13..62"})
+                            continue
+                        freq = channel_to_hz(ch)
+                r = rp.tune(ch, float(freq), system)
+                self.server.log(f"tune system={system} channel={ch} freq={freq}")
                 self._send({"ok": True, **r})
             elif cmd == "status":
                 self._send({"ok": True, **rp.status()})

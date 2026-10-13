@@ -32,8 +32,14 @@ struct SdrConfig {
     // 5.6 MHz（信号帯域ちょうど）。7.111 MSPS ではナイキスト余裕が薄く、6 MHz だと
     // フィルタ裾のエイリアシングで帯域端の MER が落ちる（tools/iq_record.py の既定と同じ値）
     double bw = 5'600'000.0;
-    double gain_db = 0.0;           // agc=false のときの手動ゲイン
-    bool agc = true;                // slow_attack AGC
+    // ゲイン。既定はソフトウェア AGC: 帯域内レベルを agc_target_dbfs に保つよう hardwaregain を
+    // 約 0.5 秒ごとに調整する（manual モード）。AD9363 の slow_attack AGC（約 −11 dBFS）は
+    // ケーブル TV 端子のように全帯域が強い入力でフロントエンドが圧縮され MER が 20 dB に張り付く
+    // （2026-10-13 実測。docs/isdbc-spec-notes.md 6 章。地デジも AGC 19.8 → 手動 30 dB で 27 dB）。
+    bool agc = true;                // false なら gain_db 固定
+    bool hw_agc = false;            // agc=true のとき true なら AD936x の slow_attack を使う（旧動作）
+    double gain_db = 30.0;          // 手動ゲイン / ソフト AGC の初期値 [dB]
+    double agc_target_dbfs = -24.0; // ソフト AGC の目標帯域内レベル（圧縮の崖 −21 dBFS に 3 dB 余裕）
     // 1 MiB ブロック（262144 サンプル）では USB 2.0 の実効スループットが足りず、
     // 初期バッファ枯渇後（~2.4 s）からブロック境界でサンプル落ちが続発した（実機で確認）。
     // Python 側 (tools/iq_record.py) と同じ 4 MiB ブロックにすると持続する。
@@ -57,6 +63,8 @@ public:
     // LO だけ変更（ストリームは止めない）。例外を投げない:
     // 切断中は周波数を記録するだけで、再接続時に適用される。
     void Retune(double freq_hz);
+    // RF 帯域幅だけ変更（ストリームは止めない。方式切替用。例外を投げない）
+    void SetBandwidth(double bw_hz);
     void Stop();
 
     const std::string& desc() const { return desc_; }
@@ -66,6 +74,8 @@ public:
     // FPGA が報告したハード確定ドロップ（axi_ad9361 UI_STATUS の UI_OVF を約 1 秒周期で
     // 監視した検出回数）。純正ファームで動く。実機検証 2026-10-12（健全時 0、USB 飽和で検出）。
     long long hw_ovf() const { return hw_ovf_; }
+    double gain_db() const { return gain_db_; }             // 現在の hardwaregain（AGC モードでも）
+    double level_dbfs() const { return level_dbfs_; }       // 直近の帯域内平均電力
 
 private:
     void Run();
@@ -84,6 +94,8 @@ private:
     std::atomic<bool> connected_{false};
     std::atomic<long long> reconnects_{0};
     std::atomic<long long> hw_ovf_{0};
+    std::atomic<double> gain_db_{0.0};
+    std::atomic<double> level_dbfs_{-100.0};
     volatile long long blocks_ = 0;
     std::string desc_;
 };

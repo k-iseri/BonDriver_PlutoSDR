@@ -7,20 +7,30 @@
 
 namespace isdbt {
 
+namespace {
+constexpr double kRetuneSkipSeconds = 0.65;    // SDR のブロックキュー（4 × 147 ms = 0.59 s）+ 余裕
+constexpr int kFirstWindowNewFrames = 4;        // 選局直後の最初のウィンドウの新規フレーム数（TS まで約 4〜5 秒）
+constexpr int kFirstWindowCtxFrames = 2;        // 同・文脈フレーム数（定常は ctx_frames_ = 4）
+}
+
 LiveDemod::LiveDemod(SdrConfig cfg, Mode mode, Gi gi, int new_frames, int ctx_frames, int workers,
-                     bool verbose, std::string dump_iq_path)
+                     bool verbose, std::string dump_iq_path, SdrSource* external_sdr)
     : cfg_(std::move(cfg)), mode_(mode), gi_(gi),
       new_frames_(new_frames), ctx_frames_(ctx_frames), workers_(workers),
       in_per_nominal_(cfg_.fs / kSampleRateHz),     // 入力サンプル数 / 公称サンプル数
       frame_samples_(static_cast<double>(SymbolSamples(mode, gi)) * kSymbolsPerFrame *
                      (cfg_.fs / kSampleRateHz)),    // 1 フレームの入力サンプル数
-      desc_("sdr:" + cfg_.uri), rate_mon_(cfg_.fs), verbose_(verbose) {
+      desc_("sdr:" + cfg_.uri), sdr_(external_sdr ? external_sdr : &own_sdr_),
+      external_(external_sdr != nullptr), rate_mon_(cfg_.fs), verbose_(verbose) {
     if (!dump_iq_path.empty()) dump_ = std::fopen(dump_iq_path.c_str(), "wb");
 }
 
 void LiveDemod::Start() {
-    sdr_.Start(cfg_, [this](const cfloat* p, size_t n) { OnBlock(p, n); },
-               [this](bool up) { OnSdrEvent(up); });
+    if (!external_) {
+        sdr_->Start(cfg_, [this](const cfloat* p, size_t n) { OnBlock(p, n); },
+                    [this](bool up) { OnSdrEvent(up); });
+    }
+    skip_samples_ = static_cast<long long>(kRetuneSkipSeconds * cfg_.fs);
     sched_ = std::thread(&LiveDemod::SchedLoop, this);
     pacer_ = std::thread(&LiveDemod::PaceLoop, this);
 }
@@ -29,7 +39,7 @@ void LiveDemod::Stop() {
     stop_ = true;
     iq_cv_.notify_all();
     pace_cv_.notify_all();
-    sdr_.Stop();
+    if (!external_) sdr_->Stop();
     if (sched_.joinable()) sched_.join();
     if (pacer_.joinable()) pacer_.join();
 }
@@ -39,6 +49,11 @@ std::shared_ptr<ClientQueue> LiveDemod::AddClient() {
     std::lock_guard<std::mutex> lock(mu_);
     clients_.push_back(q);
     return q;
+}
+
+void LiveDemod::AttachClient(const std::shared_ptr<ClientQueue>& q) {
+    std::lock_guard<std::mutex> lock(mu_);
+    clients_.push_back(q);
 }
 
 void LiveDemod::RemoveClient(const std::shared_ptr<ClientQueue>& q) {
@@ -53,7 +68,8 @@ void LiveDemod::Tune(bool has_ch, int ch, double freq) {
         std::lock_guard<std::mutex> lock(mu_);
         if (has_freq_ && freq == freq_hz_) return;
     }
-    sdr_.Retune(freq);
+    if (!external_) sdr_->Retune(freq);
+    skip_samples_ = static_cast<long long>(kRetuneSkipSeconds * cfg_.fs);
     {
         std::lock_guard<std::mutex> pl(pace_mu_);
         pace_q_.clear();
@@ -67,6 +83,8 @@ void LiveDemod::Tune(bool has_ch, int ch, double freq) {
     freq_hz_ = freq;
     has_freq_ = true;
     locked_ = false;
+    mer_db_ = 0.0;              // 前チャンネルの MER を信号レベルとして返し続けない
+    layers_.clear();
     for (auto& q : clients_) {
         std::lock_guard<std::mutex> ql(q->mu);
         q->chunks.clear();
@@ -95,10 +113,12 @@ std::string LiveDemod::StatusJson() {
     s += ", \"dropped\": " + std::to_string(dropped_);
     s += ", \"underruns\": " + std::to_string(underruns_);
     s += ", \"frames_lost\": " + std::to_string(frames_lost_);
-    s += ", \"sdr_blocks\": " + std::to_string(sdr_.blocks());
-    s += ", \"sdr_connected\": " + std::string(sdr_.connected() ? "true" : "false");
-    s += ", \"sdr_reconnects\": " + std::to_string(sdr_.reconnects());
-    s += ", \"hw_ovf\": " + std::to_string(sdr_.hw_ovf());
+    s += ", \"sdr_blocks\": " + std::to_string(sdr_->blocks());
+    s += ", \"sdr_connected\": " + std::string(sdr_->connected() ? "true" : "false");
+    s += ", \"sdr_reconnects\": " + std::to_string(sdr_->reconnects());
+    s += ", \"hw_ovf\": " + std::to_string(sdr_->hw_ovf());
+    s += ", \"gain_db\": " + FormatDouble(sdr_->gain_db());
+    s += ", \"rx_level_dbfs\": " + FormatDouble(sdr_->level_dbfs());
     s += ", \"rx_rate\": " + FormatDouble(rx_rate_.load());
     s += ", \"rx_slow\": " + std::to_string(rx_slow_.load());
     s += ", \"windows\": " + std::to_string(windows_done_);
@@ -120,6 +140,10 @@ double LiveDemod::signal_db() {
 }
 
 void LiveDemod::OnBlock(const cfloat* p, size_t n) {
+    if (skip_samples_ > 0) {        // 選局前に SDR 側で取り込まれていた分は捨てる
+        skip_samples_ -= static_cast<long long>(n);
+        return;
+    }
     // 実測レート監視（このコールバックは SDR 受信スレッド 1 本からだけ呼ばれる）
     const double t = std::chrono::duration<double>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -174,17 +198,33 @@ void LiveDemod::OnSdrEvent(bool up) {
 }
 
 void LiveDemod::SchedLoop() {
-    const long long win_syms = static_cast<long long>(ctx_frames_ + new_frames_ + 1) * kSymbolsPerFrame;
-    const long long win_samples = static_cast<long long>(
-        std::llround(static_cast<double>(win_syms) * SymbolSamples(mode_, gi_) * in_per_nominal_)) +
-        (1 << 16);
-    const long long adv_samples = static_cast<long long>(std::llround(
-        static_cast<double>(new_frames_) * kSymbolsPerFrame * SymbolSamples(mode_, gi_) *
-        in_per_nominal_));
+    // 選局直後の最初のウィンドウだけ新規フレーム数を小さくして初回ロックを早める
+    // （16 フレームだと I/Q 待ち 4.8 s + 復調で TS まで 13 s。TVTest のチャンネルスキャンは
+    // 1 チャンネル約 9 秒で次へ進むので間に合わなかった。6 フレームなら 6 秒前後）。
+    // 定常のウィンドウは new_frames_ のまま（CPU 効率はそちらで決まる）。
+    const int first_new = std::min(kFirstWindowNewFrames, new_frames_);
+    const int first_ctx = std::min(kFirstWindowCtxFrames, ctx_frames_);
+    auto win_samples_for = [&](int nf, int ctx) {
+        const long long syms = static_cast<long long>(ctx + nf + 1) * kSymbolsPerFrame;
+        return static_cast<long long>(std::llround(static_cast<double>(syms) * SymbolSamples(mode_, gi_) *
+                                                   in_per_nominal_)) + (1 << 16);
+    };
+    auto adv_samples_for = [&](int nf) {
+        return static_cast<long long>(std::llround(static_cast<double>(nf) * kSymbolsPerFrame *
+                                                   SymbolSamples(mode_, gi_) * in_per_nominal_));
+    };
+    int cur_new = first_new;
     std::vector<cfloat> acc;
     long long acc_abs0 = 0, abs_in = 0;
     long long cur_gen = 0;
     std::deque<WindowJob> jobs;
+    // 仕掛かり数は現世代のジョブだけ数える。選局前のジョブ（1 本 4〜5 秒）を待っていると
+    // 次のチャンネルの最初のウィンドウが遅れ、信号のあるチャンネルが続くとスキャンが交互に落ちる
+    auto active_jobs = [&]() {
+        int n = 0;
+        for (const WindowJob& j : jobs) n += (j.gen == cur_gen);
+        return n;
+    };
 
     while (!stop_) {
         // I/Q の取り込み（溢れフラグが立っていたらパイプラインを仕切り直す）
@@ -195,6 +235,7 @@ void LiveDemod::SchedLoop() {
             if (overflowed_) {
                 overflowed_ = false;
                 acc.clear();
+                cur_new = first_new;
                 lock.unlock();
                 ResetSplice(&cur_gen);
                 lock.lock();
@@ -213,6 +254,7 @@ void LiveDemod::SchedLoop() {
             if (gen_ != cur_gen) {          // tune された
                 cur_gen = gen_;
                 acc.clear();
+                cur_new = first_new;
                 anchored_ = false;
                 last_emitted_ = -1;
             }
@@ -220,11 +262,20 @@ void LiveDemod::SchedLoop() {
         if (static_cast<long long>(acc.size()) > kIqBoundSamples) {
             // 復調が恒常的に追いつかない: 組み立てバッファごと仕切り直す
             acc.clear();
+            cur_new = first_new;
             ResetSplice(&cur_gen);
         }
         // ウィンドウの投入（仕掛かりは workers_ まで）
-        while (static_cast<long long>(acc.size()) >= win_samples &&
-               static_cast<int>(jobs.size()) < workers_) {
+        while (static_cast<long long>(acc.size()) >=
+                   win_samples_for(cur_new, cur_new == first_new ? first_ctx : ctx_frames_) &&
+               active_jobs() < workers_) {
+            const bool first = (cur_new == first_new);
+            const long long win_samples = win_samples_for(cur_new, first ? first_ctx : ctx_frames_);
+            // 最初のウィンドウは文脈が短いぶん進みを控えめにし、次のウィンドウ（文脈 ctx_frames_）が
+            // 最初のウィンドウの排出フレームに続くようにする
+            const long long adv_samples =
+                adv_samples_for(first ? std::max(1, cur_new - (ctx_frames_ - first_ctx)) : cur_new);
+            cur_new = new_frames_;
             WindowJob job;
             job.gen = cur_gen;
             job.abs0 = acc_abs0;
@@ -243,13 +294,23 @@ void LiveDemod::SchedLoop() {
             acc.erase(acc.begin(), acc.begin() + adv_samples);
             acc_abs0 += adv_samples;
         }
-        // 結果の回収（先頭から順に。未完ならブロックせず次のループへ）
-        while (!jobs.empty() &&
-               jobs.front().fut.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
-            WindowJob job = std::move(jobs.front());
-            jobs.pop_front();
+        // 結果の回収（現世代は先頭から順に。未完ならブロックせず次のループへ。
+        // 選局前の世代のジョブは終わったものから捨て、未完でも後ろの現世代を妨げない）
+        for (auto it = jobs.begin(); it != jobs.end();) {
+            const bool ready = it->fut.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready;
+            if (it->gen != cur_gen) {
+                if (ready) {
+                    it->fut.get();
+                    it = jobs.erase(it);
+                } else {
+                    ++it;
+                }
+                continue;
+            }
+            if (!ready) break;
+            WindowJob job = std::move(*it);
+            it = jobs.erase(it);
             std::shared_ptr<DemodResult> res = job.fut.get();
-            if (job.gen != cur_gen) continue;
             ++windows_done_;
             if (!res) {
                 ++windows_failed_;

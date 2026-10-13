@@ -218,6 +218,74 @@ def tracked_vectors(out: Path, expected: dict) -> None:
     expected["track_present"] = True
 
 
+def isdbc_vectors(out: Path, expected: dict) -> None:
+    """ISDB-C（rt/isdbc）の検証ベクタ: 配置表・差動符号・フレーム処理・TSMF ヘッダ・ループバック I/Q。"""
+    from isdbc import demod as cdemod
+    from isdbc import framing as cframing
+    from isdbc import mapping as cmapping
+    from isdbc import modulator as cmod
+    from isdbc import tsmf as ctsmf
+
+    rng = np.random.default_rng(123)
+    np.save(out / "isdbc_constellation.npy", cmapping.CONSTELLATION.astype(np.complex64))
+    words = rng.integers(0, 64, size=4096, dtype=np.uint8)
+    np.save(out / "isdbc_words.npy", words)
+    np.save(out / "isdbc_diffenc.npy", cmapping.diff_encode(words))
+    data = rng.integers(0, 256, size=3 * 1000, dtype=np.uint8)
+    np.save(out / "isdbc_bytes.npy", data)
+    np.save(out / "isdbc_mtuples.npy", cmapping.bytes_to_mtuples(data))
+
+    # フレーム処理: 伝送バイト列（先頭に 57 バイトのゴミ、各 TSP の同じ 5 バイト位置に誤り）→ TS
+    pk = cframing.null_packets(160)
+    pk[:, 1] = 0x01
+    pk[:, 2] = 0x00
+    pk[:, 3] = 0x10 | (np.arange(160) % 16)
+    pk[:, 4:] = rng.integers(0, 256, size=(160, 184), dtype=np.uint8)
+    stream = cframing.encode_ts(pk).reshape(-1, 204)
+    cols = rng.choice(np.arange(1, 204), size=5, replace=False)
+    stream[:, cols] ^= rng.integers(1, 256, size=(stream.shape[0], 5)).astype(np.uint8)
+    junk = rng.integers(0, 256, size=57, dtype=np.uint8)
+    np.save(out / "isdbc_stream.npy", np.concatenate([junk, stream.ravel()]))
+    np.save(out / "isdbc_packets.npy", pk)
+    expected["isdbc_stream_junk"] = 57
+
+    # TSMF ヘッダ
+    slot = np.array([1] * 30 + [3] * 20 + [0] * 2)
+    hdr = ctsmf.build_header(slot, {1: (16625, 4), 3: (16592, 4)}, continuity_counter=9,
+                             sync_inverted=True, version=5, emergency=1)
+    np.save(out / "isdbc_tsmf_header.npy", hdr)
+    np.save(out / "isdbc_tsmf_slots.npy", slot)
+    expected["isdbc_tsmf"] = {"cc": 9, "inverted": True, "version": 5, "emergency": 1,
+                              "streams": [[1, 16625, 4], [3, 16592, 4]]}
+
+    # ループバック: 2 TS を TSMF 多重 → 変調（7.111111 MSPS）→ CFO/クロック/雑音 → SigMF
+    s1 = cframing.null_packets(2400)
+    s1[:, 1] = 0x01
+    s1[:, 2] = 0x01
+    s1[:, 3] = 0x10 | (np.arange(2400) % 16)
+    s1[:, 4:] = rng.integers(0, 256, size=(2400, 184), dtype=np.uint8)
+    s2 = cframing.null_packets(600)
+    s2[:, 1] = 0x01
+    s2[:, 2] = 0x02
+    s2[:, 3] = 0x10 | (np.arange(600) % 16)
+    s2[:, 4:] = rng.integers(0, 256, size=(600, 184), dtype=np.uint8)
+    mux = ctsmf.multiplex({1: s1, 2: s2}, {1: (16625, 4), 2: (16592, 4)})
+    fs_c = 7_111_111.0
+    iq = cmod.modulate(mux, fs_c)
+    ch = ChannelConfig(sample_rate_hz=fs_c, cn_db=30.0, freq_offset_hz=-12_000.0, clock_ppm=16.0,
+                       phase_rad=1.1, seed=5)
+    rx = apply_channel(iq, ch)
+    write_sigmf(out / "isdbc_iq", rx, fs_c, datatype="cf32_le")
+    np.save(out / "isdbc_ts1.npy", s1)
+    np.save(out / "isdbc_ts2.npy", s2)
+    expected["isdbc_fs"] = fs_c
+    expected["isdbc_cfo_hz"] = -12_000.0
+    expected["isdbc_clock_ppm"] = 16.0
+    res = cdemod.demodulate(rx, fs_c, select=2)
+    expected["isdbc_ref_rs_uncorrectable"] = int(res["rs_uncorrectable"])
+    expected["isdbc_ref_mer_db"] = float(res["mer_db"])
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="testdata/rt_vectors")
@@ -228,6 +296,7 @@ def main() -> None:
     unit_vectors(out, expected)
     pipeline_vectors(out, expected)
     tracked_vectors(out, expected)
+    isdbc_vectors(out, expected)
     (out / "expected.json").write_text(json.dumps(expected, indent=2))
     print(f"wrote vectors to {out}")
 

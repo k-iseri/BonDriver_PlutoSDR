@@ -10,7 +10,13 @@
 //    BonDriver フォルダに置くだけで受信できる（libiio は遅延ロード。ADI のインストーラで
 //    入っているか、DLL の隣 / LibiioDir に libiio の DLL 一式があればよい）。
 //
-// 設定は DLL と同じ場所の同名 .ini（BonDriver_PlutoSDR_T.ini）から読む。
+// 設定は DLL と同じ場所の同名 .ini（BonDriver_PlutoSDR_T.ini / BonDriver_PlutoSDR_TC.ini）から読む。
+//
+// 同じソースから 2 つの DLL を作る（rt/bondriver/CMakeLists.txt）:
+//   BonDriver_PlutoSDR_T.dll  … 地デジ（ISDB-T）のみ。チューニング空間 0 = UHF
+//   BonDriver_PlutoSDR_TC.dll … 地デジ + ケーブル TV の BS/CS トランスモジュレーション（ISDB-C、
+//                               BONDRIVER_CATV 定義）。空間 0 = UHF、空間 1 = CATV（BonDriver_BDA の
+//                               TransModulation と同じ通し番号 0..112 なので .ch2 を流用できる）
 #define BONDRIVER_EXPORTS
 #define WIN32_LEAN_AND_MEAN
 #ifndef NOMINMAX            // CMake 側でも定義している
@@ -33,7 +39,7 @@
 #include <thread>
 #include <vector>
 
-#include "../demod/live_demod.h"
+#include "../demod/live_switch.h"
 #include "IBonDriver2.h"
 
 #pragma comment(lib, "ws2_32.lib")
@@ -47,6 +53,12 @@ constexpr size_t kMaxQueueBytes = 16u << 20;             // 受信キュー上�
 constexpr DWORD kFirstChannel = 13;                      // 地デジ物理チャンネル
 constexpr DWORD kLastChannel = 52;
 constexpr DWORD kNumChannels = kLastChannel - kFirstChannel + 1;
+#ifdef BONDRIVER_CATV
+constexpr DWORD kNumCatvChannels = isdbc::kCatvChannels;  // 空間 1: VHF 1-12ch, UHF 13-62ch, C13-C63（113 ch）
+constexpr const wchar_t *kDefaultTunerName = L"ISDB-T/C SDR";
+#else
+constexpr const wchar_t *kDefaultTunerName = L"ISDB-T SDR";
+#endif
 constexpr DWORD kControlTimeoutMs = 2000;                // 制御コマンドの応答待ち
 constexpr ULONGLONG kSignalCacheMs = 500;                // GetSignalLevel の status 問い合わせ間隔
 
@@ -61,19 +73,25 @@ struct Config {
 	DWORD connectTimeoutMs = 15000;
 	bool quitOnClose = true;
 	bool log = false;
-	std::wstring tunerName = L"ISDB-T SDR";
+	std::wstring tunerName = kDefaultTunerName;
 	std::wstring iniPath;
 	std::wstring logPath;
 	std::wstring dllDir;
+
+	// [CATV] ケーブル TV（TC 版のみ意味を持つ）
+	int catvTs = 0;                 // TSMF の相対 TS 番号（0 = 自動: 有効 TS のうち最小番号）
+	bool catvAll = false;           // TSMF ヘッダ含め全スロットを通す（BonDriver_BDA の相対 TS 未指定と同じ）
 
 	// [SDR] スタンドアロンモード（デーモン無しで DLL が直接 Pluto SDR を開く）
 	struct {
 		bool enable = false;
 		std::string uri = "usb:";
 		double fs = 0.0;            // 0 = SdrConfig の既定（7,111,111 Hz = 公称の 7/8）
-		double bw = 0.0;            // 0 = SdrConfig の既定（5.6 MHz）
-		bool agc = true;
-		double gainDb = 0.0;
+		double bw = 0.0;            // 0 = 方式ごとの既定（地デジ 5.6 MHz / ISDB-C 6 MHz）
+		bool agc = true;            // Gain= 空 → ソフト AGC（帯域内 −24 dBFS 目標）
+		bool hwAgc = false;         // Gain=hw → AD936x の slow_attack（旧動作。強い CATV 入力では圧縮して MER 20 dB に張り付く）
+		double gainDb = 30.0;       // Gain=数値 → 手動固定 / ソフト AGC の初期値
+		double agcTargetDbfs = -24.0;
 		bool reconnect = true;      // USB 瞬断などストリームエラー時の自動再接続
 		int mode = 3;
 		std::string gi = "1/8";
@@ -130,18 +148,25 @@ Config LoadConfig()
 	c.connectTimeoutMs = (DWORD)GetPrivateProfileIntW(L"Daemon", L"ConnectTimeoutMs", 15000, c.iniPath.c_str());
 	c.quitOnClose = GetPrivateProfileIntW(L"Daemon", L"QuitOnClose", 1, c.iniPath.c_str()) != 0;
 	c.log = GetPrivateProfileIntW(L"Debug", L"Log", 0, c.iniPath.c_str()) != 0;
-	c.tunerName = ReadIniString(L"Tuner", L"Name", L"ISDB-T SDR", c.iniPath);
+	c.tunerName = ReadIniString(L"Tuner", L"Name", kDefaultTunerName, c.iniPath);
 	c.dllDir = dir;
+
+	std::wstring ts = ReadIniString(L"CATV", L"Ts", L"", c.iniPath);
+	if (ts == L"all" || ts == L"ALL") c.catvAll = true;
+	else if (!ts.empty() && ts != L"auto") c.catvTs = _wtoi(ts.c_str());
 
 	c.sdr.enable = GetPrivateProfileIntW(L"SDR", L"Enable", 0, c.iniPath.c_str()) != 0;
 	c.sdr.uri = Narrow(ReadIniString(L"SDR", L"Uri", L"usb:", c.iniPath));
 	c.sdr.fs = ReadIniDouble(L"SDR", L"Fs", 0.0, c.iniPath);
 	c.sdr.bw = ReadIniDouble(L"SDR", L"Bw", 0.0, c.iniPath);
 	std::wstring gain = ReadIniString(L"SDR", L"Gain", L"", c.iniPath);
-	if (!gain.empty()) {            // 空なら slow_attack AGC
+	if (gain == L"hw" || gain == L"HW") {
+		c.sdr.hwAgc = true;         // AD936x の slow_attack AGC
+	} else if (!gain.empty()) {     // 空ならソフト AGC
 		c.sdr.agc = false;
-		c.sdr.gainDb = ReadIniDouble(L"SDR", L"Gain", 0.0, c.iniPath);
+		c.sdr.gainDb = ReadIniDouble(L"SDR", L"Gain", 30.0, c.iniPath);
 	}
+	c.sdr.agcTargetDbfs = ReadIniDouble(L"SDR", L"AgcTargetDbfs", -24.0, c.iniPath);
 	c.sdr.reconnect = GetPrivateProfileIntW(L"SDR", L"Reconnect", 1, c.iniPath.c_str()) != 0;
 	c.sdr.mode = (int)GetPrivateProfileIntW(L"SDR", L"Mode", 3, c.iniPath.c_str());
 	c.sdr.gi = Narrow(ReadIniString(L"SDR", L"GI", L"1/8", c.iniPath));
@@ -345,8 +370,9 @@ private:
 	PROCESS_INFORMATION m_proc = {};
 	bool m_spawned = false;
 
-	// スタンドアロンモード（[SDR] Enable=1）。非 null なら m_ctrl / m_stream は使わない
-	isdbt::LiveDemod *m_live = nullptr;
+	// スタンドアロンモード（[SDR] Enable=1）。非 null なら m_ctrl / m_stream は使わない。
+	// LiveSwitch が地デジ（LiveDemod）と ISDB-C（LiveIsdbc）を選局先の空間に応じて差し替える
+	isdbt::LiveSwitch *m_live = nullptr;
 	std::shared_ptr<isdbt::ClientQueue> m_liveQ;
 
 	DWORD m_curSpace = 0xFFFFFFFF;
@@ -544,23 +570,31 @@ BOOL CBonDriverPlutoSDR::OpenTunerSdr()
 	Log("libiio loaded from %s", where.c_str());
 #endif
 	try {
-		isdbt::SdrConfig sc;            // fs / bw の既定値（USB 2.0 向け 7/8 レート等）はここから
-		sc.uri = m_cfg.sdr.uri;
-		if (m_cfg.sdr.fs > 0) sc.fs = m_cfg.sdr.fs;
-		if (m_cfg.sdr.bw > 0) sc.bw = m_cfg.sdr.bw;
-		sc.agc = m_cfg.sdr.agc;
-		sc.gain_db = m_cfg.sdr.gainDb;
-		sc.reconnect = m_cfg.sdr.reconnect;
-		sc.freq_hz = isdbt::ChannelToHz(27);    // SetChannel までの仮周波数（isdbtd --sdr と同じ）
-		isdbt::Gi gi{8};
-		if (!isdbt::ParseGi(m_cfg.sdr.gi, &gi)) {
+		isdbt::LiveParams lp;           // sdr の fs / bw の既定値（USB 2.0 向け 7/8 レート等）は SdrConfig から
+		lp.sdr.uri = m_cfg.sdr.uri;
+		if (m_cfg.sdr.fs > 0) lp.sdr.fs = m_cfg.sdr.fs;
+		if (m_cfg.sdr.bw > 0) {
+			lp.sdr.bw = m_cfg.sdr.bw;
+			lp.bw_fixed = true;
+		}
+		lp.sdr.agc = m_cfg.sdr.agc;
+		lp.sdr.hw_agc = m_cfg.sdr.hwAgc;
+		lp.sdr.gain_db = m_cfg.sdr.gainDb;
+		lp.sdr.agc_target_dbfs = m_cfg.sdr.agcTargetDbfs;
+		lp.sdr.reconnect = m_cfg.sdr.reconnect;
+		lp.sdr.freq_hz = isdbt::ChannelToHz(27);    // SetChannel までの仮周波数（isdbtd --sdr と同じ）
+		lp.mode = (isdbt::Mode)m_cfg.sdr.mode;
+		if (!isdbt::ParseGi(m_cfg.sdr.gi, &lp.gi)) {
 			Log("bad [SDR] GI: %s", m_cfg.sdr.gi.c_str());
 			return FALSE;
 		}
-		m_live = new isdbt::LiveDemod(sc, (isdbt::Mode)m_cfg.sdr.mode, gi,
-		                              m_cfg.sdr.winFrames, m_cfg.sdr.ctxFrames, m_cfg.sdr.workers,
-		                              false);
-		m_live->Start();
+		lp.win_frames = m_cfg.sdr.winFrames;
+		lp.ctx_frames = m_cfg.sdr.ctxFrames;
+		lp.workers = m_cfg.sdr.workers;
+		lp.select.rel = m_cfg.catvTs;
+		lp.select.pass_all = m_cfg.catvAll;
+		m_live = new isdbt::LiveSwitch(lp);
+		m_live->Start(isdbt::System::kIsdbt);
 	} catch (const std::exception &e) {
 		Log("SDR open failed: %s", e.what());
 		if (m_live) {
@@ -795,37 +829,70 @@ const BOOL CBonDriverPlutoSDR::IsTunerOpening(void)
 
 LPCTSTR CBonDriverPlutoSDR::EnumTuningSpace(const DWORD dwSpace)
 {
-	return dwSpace == 0 ? L"UHF" : nullptr;
+	if (dwSpace == 0) return L"UHF";
+#ifdef BONDRIVER_CATV
+	if (dwSpace == 1) return L"CATV";
+#endif
+	return nullptr;
 }
 
 LPCTSTR CBonDriverPlutoSDR::EnumChannelName(const DWORD dwSpace, const DWORD dwChannel)
 {
-	if (dwSpace != 0 || dwChannel >= kNumChannels) return nullptr;
-	swprintf_s(m_chName, L"%uch", (unsigned)(kFirstChannel + dwChannel));
-	return m_chName;
+	if (dwSpace == 0) {
+		if (dwChannel >= kNumChannels) return nullptr;
+		swprintf_s(m_chName, L"%uch", (unsigned)(kFirstChannel + dwChannel));
+		return m_chName;
+	}
+#ifdef BONDRIVER_CATV
+	if (dwSpace == 1) {
+		std::string name;
+		if (!isdbc::CatvChannel((int)dwChannel, nullptr, &name)) return nullptr;
+		swprintf_s(m_chName, L"%hs", name.c_str());
+		return m_chName;
+	}
+#endif
+	return nullptr;
 }
 
 const BOOL CBonDriverPlutoSDR::SetChannel(const DWORD dwSpace, const DWORD dwChannel)
 {
 	if (!m_open) return FALSE;
-	if (dwSpace != 0 || dwChannel >= kNumChannels) return FALSE;
-	DWORD phys = kFirstChannel + dwChannel;
+	isdbt::System sys = isdbt::System::kIsdbt;
+	int chArg = 0;
+	double freq = 0.0;
+	std::string name;
+	if (dwSpace == 0 && dwChannel < kNumChannels) {
+		chArg = (int)(kFirstChannel + dwChannel);
+		freq = isdbt::ChannelToHz(chArg);
+		name = std::to_string(chArg) + "ch";
+	}
+#ifdef BONDRIVER_CATV
+	else if (dwSpace == 1 && dwChannel < kNumCatvChannels) {
+		sys = isdbt::System::kIsdbc;
+		chArg = (int)dwChannel;
+		isdbc::CatvChannel(chArg, &freq, &name);
+	}
+#endif
+	else {
+		return FALSE;
+	}
 	if (m_live) {
-		m_live->Tune(true, (int)phys, isdbt::ChannelToHz((int)phys));
-		Log("tune %luch (standalone)", phys);
+		m_live->TuneSystem(sys, true, chArg, freq);     // 方式が変わればパイプラインごと差し替える（約 1 秒）
+		Log("tune %s %s %.3f MHz (standalone)", isdbt::SystemName(sys), name.c_str(), freq / 1e6);
 		m_curSpace = dwSpace;
 		m_curChannel = dwChannel;
 		PurgeTsStream();
 		m_levelTick = 0;
 		return TRUE;
 	}
-	std::string req = "{\"cmd\":\"tune\",\"channel\":" + std::to_string(phys) + "}";
+	std::string req = "{\"cmd\":\"tune\",\"system\":\"" + std::string(isdbt::SystemName(sys)) +
+	                  "\",\"channel\":" + std::to_string(chArg) + "}";
 	std::string resp;
 	if (!Control(req, resp) || !JsonBool(resp, "ok")) {
-		Log("tune %luch failed: %s", phys, resp.c_str());
+		Log("tune %s %s failed: %s", isdbt::SystemName(sys), name.c_str(), resp.c_str());
 		return FALSE;
 	}
-	Log("tune %luch: %s", phys, resp.c_str());
+	Log("tune %s %s: %s", isdbt::SystemName(sys), name.c_str(), resp.c_str());
 	m_curSpace = dwSpace;
 	m_curChannel = dwChannel;
 	PurgeTsStream();

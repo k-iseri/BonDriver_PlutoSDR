@@ -1,12 +1,14 @@
 # isdbt-sdr
 
-汎用 SDR ボード（Pluto SDR 互換機など）で日本の地上デジタル放送（ISDB-T）を受信し、
+汎用 SDR ボード（Pluto SDR 互換機など）で日本の地上デジタル放送（ISDB-T）と、ケーブルテレビの
+BS/CS トランスモジュレーション（ISDB-C、J.83 Annex C 64QAM + TSMF）を受信し、
 PC 上のソフトウェアで復調して MPEG-2 TS を取り出すプロジェクト。
 
 ## 構成
-- `ref/` — Python 参照実装（正しさ優先）とテスト
-- `rt/` — C++ 実装。`rt/isdbt/` 復調コア、`rt/demod/` 復調デーモン isdbtd、
-  `rt/bondriver/` は TVTest / EDCB 用 BonDriver、`rt/tests/` は ref/ との一致テスト
+- `ref/` — Python 参照実装（正しさ優先）とテスト。`ref/isdbt/` 地デジ、`ref/isdbc/` ケーブル TV トラモジ
+- `rt/` — C++ 実装。`rt/isdbt/` / `rt/isdbc/` 復調コア、`rt/demod/` 復調デーモン isdbtd と
+  ライブ受信（LiveDemod / LiveIsdbc / LiveSwitch）、`rt/bondriver/` は TVTest / EDCB 用 BonDriver
+  （`_T` = 地デジのみ、`_TC` = 地デジ + CATV）、`rt/tests/` は ref/ との一致テスト
 - `hw/` — ボード固有の設定・録音スクリプト・将来の HDL 改変
 - `tools/` — 録音、I/Q 解析、受信品質レポート、TS 検査
 - `docs/` — 仕様ノート、設計、判断記録
@@ -42,10 +44,22 @@ rt\build\rt-x64\Release\isdbtd.exe --sigmf <録音>.sigmf-meta --loop    # C++ �
 python tools/demod_server.py --ts C:\rec\x.ts --loop                   # Python の偽デーモン（録画 TS / SigMF 再生）
 rt\build\bondriver-x64\Release\bontest.exe rt\build\bondriver-x64\Release\BonDriver_PlutoSDR_T.dll 27 5
 ```
-DLL と `BonDriver_PlutoSDR_T.ini`（`.ini.sample` を編集）を TVTest の BonDriver フォルダへ置く。
+DLL と同名の ini（`.ini.sample` を編集）を TVTest の BonDriver フォルダへ置く。
 視聴までの一般ユーザー向け手順は `docs/setup-tvtest.md`。
 詳細は `rt/bondriver/README.md`、プロトコルは `docs/daemon-protocol.md`。
-SDR 実機ソースはボード到着後に isdbtd へ追加する（それまでは録音の復調再生）。
+
+## ケーブルテレビの BS/CS（トランスモジュレーション、ISDB-C）
+ケーブル TV の宅内端子に来ている BS/CS 再送信（64QAM、5.274 Mbaud、TSMF 多重）は
+`BonDriver_PlutoSDR_TC.dll` のチューニング空間 CATV で受信する（チャンネル番号は BonDriver_BDA の
+TransModulation と同じ通し番号なので `.ch2` を流用できる）。仕様ノートは `docs/isdbc-spec-notes.md`。
+```
+python tools/iq_record.py --freq 731e6 --fs 7111111 --bw 6e6 --gain 30 --sec 5 --out testdata/captured/catv_56ch   # 録音
+python tools/isdbc_demod_sigmf.py testdata/captured/catv_56ch.sigmf-meta --out out/                                # 復調 → TS
+rt\build\rt-x64\Release\isdbtd.exe --sdr usb: --system isdbc --ch 55                                               # ライブ（56ch）
+rt\build\bondriver-x64\Release\bontest.exe rt\build\bondriver-x64\Release\BonDriver_PlutoSDR_TC.dll 1/55 10 out.ts
+```
+受信ゲインに注意: ケーブル端子は全チャンネルが強く、AD936x 内蔵 AGC ではフロントエンドが圧縮して
+MER が 20 dB に張り付く。既定のソフトウェア AGC（帯域内 −24 dBFS）はこれを避ける（`docs/hw-setup.md`）。
 
 ## 実機（Pluto SDR）での受信
 セットアップ（ドライバ・libiio DLL 配置・pylibiio パッチ）は `docs/hw-setup.md`。

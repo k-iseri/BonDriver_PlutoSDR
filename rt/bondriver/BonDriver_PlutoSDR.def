@@ -1,3 +1,2 @@
-LIBRARY BonDriver_PlutoSDR_T
 EXPORTS
     CreateBonDriver

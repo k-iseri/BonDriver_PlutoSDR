@@ -32,8 +32,14 @@ add_library(isdbt_core STATIC
   isdbt/equalize.h isdbt/equalize.cpp
   isdbt/sync.h isdbt/sync.cpp
   isdbt/demod.h isdbt/demod.cpp
+  # ISDB-C（ケーブル TV トラモジ）: J.83 Annex C + TSMF
+  isdbc/params.h
+  isdbc/mapping.h isdbc/mapping.cpp
+  isdbc/framing.h isdbc/framing.cpp
+  isdbc/tsmf.h isdbc/tsmf.cpp
+  isdbc/demod.h isdbc/demod.cpp
 )
-target_include_directories(isdbt_core PUBLIC isdbt)
+target_include_directories(isdbt_core PUBLIC isdbt isdbc)
 
 # ref/ とのビット一致テスト
 add_executable(rt_test tests/rt_test.cpp)
@@ -41,7 +47,8 @@ target_link_libraries(rt_test PRIVATE isdbt_core)
 
 # 実時間復調デーモン
 add_executable(isdbtd demod/isdbtd.cpp demod/sdr_source.h demod/sdr_source.cpp
-  demod/live_demod.h demod/live_demod.cpp demod/rate_monitor.h)
+  demod/live_demod.h demod/live_demod.cpp demod/live_isdbc.h demod/live_isdbc.cpp
+  demod/live_switch.h demod/live_switch.cpp demod/rate_monitor.h)
 target_link_libraries(isdbtd PRIVATE isdbt_core ws2_32)
 
 # SDR ライブ受信（--sdr）: rt/third_party/libiio があれば有効化する

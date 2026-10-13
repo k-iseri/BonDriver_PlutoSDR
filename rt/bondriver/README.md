@@ -1,11 +1,18 @@
 # BonDriver_PlutoSDR
 
 TVTest / EDCB から isdbt-sdr の復調器を使うための BonDriver（IBonDriver2 実装）。
+同じソース（`BonDriver_PlutoSDR.cpp`）から 2 つの DLL を作る。ユーザーはどちらか片方を入れる:
+
+| DLL | 空間 0 | 空間 1 | 備考 |
+|---|---|---|---|
+| `BonDriver_PlutoSDR_T.dll` | UHF（地デジ 13〜52ch） | — | 従来どおり |
+| `BonDriver_PlutoSDR_TC.dll` | UHF | CATV（ケーブル TV の BS/CS トラモジ、ISDB-C 64QAM） | `BONDRIVER_CATV` 定義でビルド。CATV のチャンネル番号は BonDriver_BDA の TransModulation 自動生成と同じ通し番号 0..112（VHF 1〜12、UHF 13〜62、C13〜C63）。既存の `.ch2` は空間番号を 0 → 1 にすれば流用できる |
+
 動作モードは 2 つ（ini の `[SDR] Enable` で選ぶ）:
 
 ```
-スタンドアロン: TVTest ── BonDriver_PlutoSDR_T.dll（内蔵復調 + libiio）── Pluto SDR
-デーモン:       TVTest ── BonDriver_PlutoSDR_T.dll ── TCP ── isdbtd / demod_server.py ── SDR / 録画 TS / SigMF
+スタンドアロン: TVTest ── BonDriver_PlutoSDR_T(C).dll（内蔵復調 + libiio）── Pluto SDR
+デーモン:       TVTest ── BonDriver_PlutoSDR_T(C).dll ── TCP ── isdbtd / demod_server.py ── SDR / 録画 TS / SigMF
 ```
 
 - **スタンドアロン（`[SDR] Enable=1`）**: DLL が rt/ の復調コアと libiio で Pluto SDR を
@@ -49,8 +56,11 @@ git push origin v1.0.1
    （サンプルは `[SDR] Enable=1` のスタンドアロン設定になっている）
 3. TVTest でチューナ「ISDB-T SDR」を選ぶ。チューニング空間は UHF、チャンネルは 13〜52ch
 
-選局からウィンドウ並列復調パイプラインが立ち上がるまで **10〜15 秒** かかる
-（isdbtd の `--sdr` と同じ。その間 TVTest は無信号表示）。信号レベル表示は最悪階層の MER [dB]。
+選局からウィンドウ並列復調パイプラインが立ち上がるまで **5〜8 秒** かかる
+（isdbtd の `--sdr` と同じ。その間 TVTest は無信号表示。選局直後の最初のウィンドウだけ文脈 2 + 新規 4 フレームに
+縮めて初回ロックを早め、以降は `WinFrames` のウィンドウで回る）。信号レベル表示は最悪階層の MER [dB]。
+TVTest のチャンネルスキャンは 1 チャンネル約 9 秒で次へ進むので、これより遅いと局が見つからない
+（2026-10-14 に実際に起きた。docs/setup-tvtest.md 7 章）。
 
 ### libiio の解決
 
@@ -97,7 +107,14 @@ copy ..\..\..\bondriver\BonDriver_PlutoSDR.ini.sample BonDriver_PlutoSDR_T.ini  
   ログには `sdr: reconnected (#1)` が出る（`[Debug] Log=1` で `sdr_reconnects` も伸びる）。
 - `[Debug] Log=1` で DLL の隣に `BonDriver_PlutoSDR_T.log` を書く。`OutputDebugString` にも出る。
 - デーモンモードの選局（`SetChannel`）は物理チャンネル番号をデーモンに渡すだけ。周波数換算はデーモン側。
-- スタンドアロンモードの実体は `rt/demod/live_demod.{h,cpp}`（isdbtd の `--sdr` と同じ
-  `LiveDemod`）を DLL に静的リンクしたもの。ini の `WinFrames` / `CtxFrames` / `Workers` は
+- スタンドアロンモードの実体は `rt/demod/live_switch.{h,cpp}`（isdbtd の `--sdr` と同じ `LiveSwitch`。
+  地デジは `LiveDemod`、ISDB-C は `LiveIsdbc` を選局先の空間に応じて差し替える）を DLL に
+  静的リンクしたもの。ini の `WinFrames` / `CtxFrames` / `Workers` は
   isdbtd の `--win-frames` / `--ctx-frames` / `--workers` に対応する。
+  方式が変わる選局（UHF ↔ CATV）は SDR を開き直すので 1〜2 秒余計にかかる。
+- 受信ゲインの既定はソフトウェア AGC（帯域内 −24 dBFS 目標、`[SDR] AgcTargetDbfs`）。AD936x 内蔵の
+  slow_attack（`Gain=hw`）はケーブル端子のような強い全帯域入力で圧縮し MER が 20 dB に張り付く
+  （docs/hw-setup.md「受信ゲイン」）。
+- `_TC` 版の `[CATV] Ts=` で TSMF の相対 TS 番号を固定できる（既定は自動 = 有効 TS の最小番号、
+  `all` で BonDriver_BDA 互換の全スロット通過）。
 - 32/64 bit は TVTest 本体に合わせる（違うと LoadLibrary で失敗する）。

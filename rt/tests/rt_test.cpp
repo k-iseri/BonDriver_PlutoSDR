@@ -2,6 +2,7 @@
 // 使い方: rt_test <vectors_dir>
 // 整数段（RS、PRBS、バイトデインターリーブ、TMCC、Viterbi 判定）はビット一致、
 // 浮動小数段（FFT、リサンプル、等化）は相対 RMS 誤差で判定する。
+#include <chrono>
 #include <cmath>
 #include <complex>
 #include <cstdio>
@@ -10,6 +11,10 @@
 #include <vector>
 
 #include "../demod/rate_monitor.h"
+#include "../isdbc/demod.h"
+#include "../isdbc/framing.h"
+#include "../isdbc/mapping.h"
+#include "../isdbc/tsmf.h"
 #include "../isdbt/deinterleave.h"
 #include "../isdbt/demod.h"
 #include "../isdbt/equalize.h"
@@ -390,6 +395,173 @@ void TestPipeline7() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ISDB-C（rt/isdbc）: ref/isdbc のベクタと照合
+// ---------------------------------------------------------------------------
+void TestIsdbcMapping() {
+    NpyArray c = NpyRead(Path("isdbc_constellation.npy"));
+    const cfloat* want = c.as<cfloat>();
+    const cfloat* got = isdbc::Constellation();
+    bool ok = c.elements() == 64;
+    for (int i = 0; ok && i < 64; ++i) ok = std::abs(got[i] - want[i]) < 1e-6f;
+    for (int i = 0; ok && i < 64; ++i) ok = isdbc::DemapHard(got[i]) == i;
+    Report(ok, "isdbc_constellation");
+
+    NpyArray words = NpyRead(Path("isdbc_words.npy"));
+    NpyArray enc = NpyRead(Path("isdbc_diffenc.npy"));
+    std::vector<uint8_t> e(words.elements());
+    isdbc::DiffEncode(words.as<uint8_t>(), words.elements(), e.data());
+    ok = std::memcmp(e.data(), enc.data.data(), e.size()) == 0;
+    isdbc::DiffDecoder dec;
+    for (size_t i = 0; ok && i < e.size(); ++i) ok = dec.Decode(e[i]) == words.as<uint8_t>()[i];
+    Report(ok, "isdbc_diff_encode_decode");
+
+    NpyArray bytes = NpyRead(Path("isdbc_bytes.npy"));
+    NpyArray mt = NpyRead(Path("isdbc_mtuples.npy"));
+    std::vector<uint8_t> w(mt.elements());
+    isdbc::BytesToMtuples(bytes.as<uint8_t>(), bytes.elements(), w.data());
+    Report(std::memcmp(w.data(), mt.data.data(), w.size()) == 0, "isdbc_bytes_to_mtuples");
+}
+
+void TestIsdbcFraming() {
+    NpyArray stream = NpyRead(Path("isdbc_stream.npy"));
+    NpyArray want = NpyRead(Path("isdbc_packets.npy"));
+    int off = 0;
+    const double ratio = isdbc::SyncScore(stream.as<uint8_t>(), stream.elements(), &off);
+    const int junk = static_cast<int>(JNum("isdbc_stream_junk", 57));
+    bool ok = off == junk && ratio > 0.8;
+    isdbc::FrameDecoder fd;
+    std::vector<uint8_t> got;
+    const uint8_t* s = stream.as<uint8_t>() + off;
+    const size_t n_tsp = (stream.elements() - off) / isdbc::kRsN;
+    int bad = 0, n_out = 0;
+    for (size_t i = 0; i < n_tsp; ++i) {
+        uint8_t pkt[188];
+        int nerr = 0;
+        if (fd.Push(s + i * isdbc::kRsN, pkt, &nerr)) {
+            got.insert(got.end(), pkt, pkt + 188);
+            ++n_out;
+            if (nerr != 5) ++bad;       // 各 TSP に 5 バイト誤りを入れてある
+        }
+    }
+    // 出力 i は入力パケット i + 11 に対応（先頭 11 TSP は履歴なし）
+    const size_t n_cmp = std::min<size_t>(n_out, want.rows() - 11);
+    ok = ok && n_cmp > 100 && bad == 0 &&
+         std::memcmp(got.data(), want.data.data() + 11 * 188, n_cmp * 188) == 0;
+    Report(ok, "isdbc_frame_decoder", "sync off " + std::to_string(off) + " ratio " + std::to_string(ratio) +
+                                      " out " + std::to_string(n_out) + " bad " + std::to_string(bad));
+}
+
+void TestIsdbcTsmf() {
+    NpyArray h = NpyRead(Path("isdbc_tsmf_header.npy"));
+    NpyArray slots = NpyRead(Path("isdbc_tsmf_slots.npy"));
+    isdbc::TsmfHeader th;
+    bool ok = isdbc::ParseTsmfHeader(h.as<uint8_t>(), &th);
+    ok = ok && th.continuity_counter == 9 && th.sync_inverted && th.version == 5 && th.emergency == 1;
+    ok = ok && th.available[0] && !th.available[1] && th.available[2];
+    ok = ok && th.ts_id[0] == 16625 && th.onid[0] == 4 && th.ts_id[2] == 16592;
+    for (int i = 0; ok && i < isdbc::kTsmfDataSlots; ++i) ok = th.slot_ts[i] == slots.as<int64_t>()[i];
+    std::vector<uint8_t> bad(h.data);
+    bad[100] ^= 1;                      // 1 ビット壊すと CRC で弾く
+    ok = ok && !isdbc::ParseTsmfHeader(bad.data(), &th);
+    Report(ok, "isdbc_tsmf_header");
+    Report(isdbc::Crc32Mpeg(reinterpret_cast<const uint8_t*>("123456789"), 9) == 0x0376E6E7u, "isdbc_crc32");
+}
+
+// 連続一致区間の長さ（want の 1/4 地点をアンカーにする）
+size_t MatchedPackets(const std::vector<uint8_t>& got, const NpyArray& want) {
+    const size_t n = want.rows();
+    const uint8_t* anchor = want.data.data() + (n / 4) * 188;
+    size_t pos = std::string::npos;
+    for (size_t i = 0; i + 188 <= got.size(); i += 188) {
+        if (std::memcmp(got.data() + i, anchor, 188) == 0) { pos = i / 188; break; }
+    }
+    if (pos == std::string::npos) return 0;
+    const size_t m = std::min(got.size() / 188 - pos, n - n / 4);
+    size_t matched = 0;
+    for (size_t k = 0; k < m; ++k) {
+        if (std::memcmp(got.data() + (pos + k) * 188, want.data.data() + (n / 4 + k) * 188, 188) != 0) break;
+        ++matched;
+    }
+    return matched;
+}
+
+// ループバック SigMF（TSMF 2 本、CFO −12 kHz、+16 ppm）を小さなブロックで Feed し、
+// 相対 TS 2 が元 TS と一致すること
+void TestIsdbcDemod() {
+    SigmfMeta meta;
+    std::vector<cfloat> iq = ReadSigmf(Path("isdbc_iq"), &meta);
+    NpyArray want = NpyRead(Path("isdbc_ts2.npy"));
+    isdbc::IsdbcConfig cfg;
+    cfg.fs = meta.sample_rate;
+    cfg.select.rel = 2;
+    std::vector<uint8_t> got;
+    isdbc::IsdbcDemod demod(cfg, [&](const uint8_t* pk, size_t n) { got.insert(got.end(), pk, pk + n * 188); });
+    const auto t0 = std::chrono::steady_clock::now();
+    const size_t blk = 65536;
+    for (size_t i = 0; i < iq.size(); i += blk) demod.Feed(iq.data() + i, std::min(blk, iq.size() - i));
+    const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    const isdbc::IsdbcStatus st = demod.status();
+    const size_t matched = MatchedPackets(got, want);
+    const size_t n = want.rows();
+    const double cfo_want = JNum("isdbc_cfo_hz", 0.0), ppm_want = JNum("isdbc_clock_ppm", 0.0);
+    // 変調器の出力は末尾で途切れる（RRC の裾 + 無信号）ので、最後の十数 TSP は訂正不能になり
+    // バイト同期も最後に外れうる。先頭から 90% 以上の連続一致と、尻尾以外の RS 誤りなしを要求する
+    const bool ok = st.rs_uncorrectable <= 16 && st.sync_losses <= 1 && st.reacquisitions == 0 &&
+                    matched >= (n - n / 4) * 9 / 10 &&
+                    std::fabs(st.cfo_hz - cfo_want) < 300.0 && std::fabs(st.clock_ppm - ppm_want) < 3.0 &&
+                    st.tsmf_selected == 2 && st.tsmf_streams.size() == 2 && st.mer_db > 26.0;
+    char buf[320];
+    std::snprintf(buf, sizeof(buf),
+                  "locked %d mer %.1f cfo %.0f ppm %.1f rs_bad %lld/%lld matched %zu/%zu sync_losses %lld "
+                  "reacq %lld tsmf sel %d (%.2fs for %.2fs of I/Q)",
+                  st.locked ? 1 : 0, st.mer_db, st.cfo_hz, st.clock_ppm, st.rs_uncorrectable, st.rs_packets,
+                  matched, n - n / 4, st.sync_losses, st.reacquisitions, st.tsmf_selected, sec,
+                  iq.size() / meta.sample_rate);
+    Report(ok, "isdbc_demod_loopback", buf);
+    if (ok) std::printf("     (%s)\n", buf);
+}
+
+// 実放送キャプチャ（testdata/captured/catv_56ch_g30、gitignore）があれば復調して RS 誤り 0 を確認
+void TestIsdbcReal() {
+    const std::string path = g_dir + "/../captured/catv_56ch_g30";
+    SigmfMeta meta;
+    std::vector<cfloat> iq;
+    try {
+        iq = ReadSigmf(path, &meta);
+    } catch (const std::exception&) {
+        std::printf("skip isdbc_real (testdata/captured/catv_56ch_g30 が無い)\n");
+        return;
+    }
+    isdbc::IsdbcConfig cfg;
+    cfg.fs = meta.sample_rate;
+    long long n_out = 0;
+    unsigned pat_tsid = 0;
+    isdbc::IsdbcDemod demod(cfg, [&](const uint8_t* pk, size_t n) {
+        n_out += static_cast<long long>(n);
+        for (size_t i = 0; i < n; ++i) {
+            const uint8_t* p = pk + i * 188;
+            if ((((p[1] & 0x1F) << 8) | p[2]) == 0 && (p[1] & 0x40) && pat_tsid == 0) {
+                pat_tsid = static_cast<unsigned>((p[8] << 8) | p[9]);
+            }
+        }
+    });
+    const auto t0 = std::chrono::steady_clock::now();
+    const size_t blk = 1 << 18;
+    for (size_t i = 0; i < iq.size(); i += blk) demod.Feed(iq.data() + i, std::min(blk, iq.size() - i));
+    const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    const isdbc::IsdbcStatus st = demod.status();
+    char buf[320];
+    std::snprintf(buf, sizeof(buf), "locked %d mer %.1f cfo %.0f ppm %.1f rs_bad %lld/%lld out %lld pat_tsid %u "
+                  "tsmf sel %d streams %zu (%.2fs for %.2fs)",
+                  st.locked ? 1 : 0, st.mer_db, st.cfo_hz, st.clock_ppm, st.rs_uncorrectable, st.rs_packets,
+                  n_out, pat_tsid, st.tsmf_selected, st.tsmf_streams.size(), sec, iq.size() / meta.sample_rate);
+    const bool ok = st.locked && st.rs_uncorrectable == 0 && st.rs_packets > 5000 && pat_tsid == 16625 &&
+                    st.mer_db > 28.0 && !st.inverted;
+    Report(ok, "isdbc_real_catv56ch", buf);
+    if (ok) std::printf("     (%s)\n", buf);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -423,6 +595,15 @@ int main(int argc, char** argv) {
             TestTrackedDropout();
         } else {
             std::printf("skip tracked tests (track ベクタ未生成: tools/gen_rt_vectors.py を再実行)\n");
+        }
+        if (JNum("isdbc_fs", 0.0) > 0.0) {
+            TestIsdbcMapping();
+            TestIsdbcFraming();
+            TestIsdbcTsmf();
+            TestIsdbcDemod();
+            TestIsdbcReal();
+        } else {
+            std::printf("skip isdbc tests (isdbc ベクタ未生成: tools/gen_rt_vectors.py を再実行)\n");
         }
     } catch (const std::exception& e) {
         std::printf("FAIL exception: %s\n", e.what());

@@ -1,9 +1,14 @@
-; BonDriver_PlutoSDR_T.ini — DLL と同じフォルダに DLL と同名（拡張子 .ini）で置く
+; BonDriver_PlutoSDR_T.ini / BonDriver_PlutoSDR_TC.ini — DLL と同じフォルダに DLL と同名（拡張子 .ini）で置く
 ; （DLL を BonDriver_PlutoSDR_T2.dll などに改名したら ini も同じ名前にする）
 ;
 ; この DLL が Pluto SDR を直接開いて DLL 内で復調する（スタンドアロンモード）。
 ; 復調デーモン（isdbtd / demod_server.py）と TCP で話すデーモンモードの設定
 ; （[SDR] Enable=0 + [Daemon] セクション）は rt/bondriver/README.md を参照。
+;
+; _T  版: チューニング空間 0 = UHF（地デジ 13〜52ch）
+; _TC 版: 空間 0 = UHF、空間 1 = CATV（ケーブルテレビの BS/CS トランスモジュレーション、64QAM）。
+;         CATV のチャンネル番号は BonDriver_BDA の TransModulation と同じ通し番号
+;         （0〜2 = VHF 1〜3ch、3〜11 = 4〜12ch、12〜61 = UHF 13〜62ch、62〜71 = C13〜C22、72〜112 = C23〜C63）
 
 [SDR]
 ; 1 = スタンドアロン（既定の使い方）。0 = デーモンモード（README 参照）
@@ -13,16 +18,21 @@ Uri=usb:
 ; 取り込みレート Hz。空なら 7111111（公称 512/63 MHz の 7/8。USB 2.0 の帯域対策）。
 ; GbE 機（Pluto+ / LibreSDR）なら 8126984 に上げてよい
 Fs=
-; RF 帯域 Hz。空なら 5600000
+; RF 帯域幅 Hz。空なら方式ごとの既定（地デジ 5600000 / CATV 6000000）
 Bw=
-; 手動ゲイン dB。空なら slow_attack AGC（推奨。手動は実測で大幅に悪化する）
+; ゲイン。空 = ソフトウェア AGC（推奨。帯域内レベルを AgcTargetDbfs に保つよう 0.5 秒ごとに調整）
+;        hw = AD936x 内蔵の slow_attack AGC（旧動作。ケーブル端子のように全帯域が強い入力では
+;             フロントエンドが圧縮されて MER が 20 dB 前後に張り付く）
+;        数値 = 手動固定 dB（例 30）
 Gain=
+; ソフトウェア AGC の目標帯域内レベル dBFS（既定 -24。圧縮が始まる約 -21 dBFS に 3 dB の余裕）
+AgcTargetDbfs=-24
 ; 1 = USB 瞬断などでストリームが切れたら自動で再接続する（既定）。0 = 切れたら停止
 Reconnect=1
 ; 伝送モードと GI（日本の実運用は Mode 3 / GI 1/8 固定）
 Mode=3
 GI=1/8
-; ウィンドウ並列復調のパラメータ（isdbtd --win-frames / --ctx-frames / --workers と同じ）
+; ウィンドウ並列復調のパラメータ（isdbtd --win-frames / --ctx-frames / --workers と同じ。地デジのみ）
 WinFrames=16
 CtxFrames=4
 Workers=2
@@ -30,13 +40,21 @@ Workers=2
 ; 空なら DLL と同じフォルダ → 通常の DLL 検索パス（ADI インストーラの PATH 等）の順で探す
 LibiioDir=
 
+[CATV]
+; _TC 版のみ。1 本の 64QAM キャリアに複数 TS が TSMF 多重されているときに出す TS。
+;   空 / auto = 有効 TS のうち最小の相対 TS 番号（1 本しか無い局はそれ。通常はこれでよい）
+;   1〜15     = 相対 TS 番号を固定
+;   all       = TSMF ヘッダ含め全スロットをそのまま通す（BonDriver_BDA の相対 TS 未指定と同じ挙動）
+Ts=
+
 [Tuner]
-Name=ISDB-T SDR
+; TVTest に表示されるチューナ名。空なら _T 版 "ISDB-T SDR" / _TC 版 "ISDB-T/C SDR"
+Name=
 
 [Debug]
 ; 1 にすると DLL の隣に <DLL 名>.log を書き、10 秒ごとに復調統計も記録する
 ; （rs_uncorrectable が伸びる = C/N 不足、underruns / frames_lost = 取り込み・処理落ち、
 ;   hw_ovf が伸びる = FPGA が報告したサンプル落ち（USB 帯域不足の確定検出）、
 ;   rx_rate が Fs の 99% 未満 / rx_slow = 実測レートからの補助検出、
-;   sdr_reconnects = USB 瞬断からの自動再接続回数）
+;   sdr_reconnects = USB 瞬断からの自動再接続回数、gain_db / rx_level_dbfs = ソフト AGC の状態）
 Log=0

@@ -31,54 +31,76 @@ add_library(isdbt_core STATIC
   ${RT_DIR}/isdbt/equalize.cpp
   ${RT_DIR}/isdbt/sync.cpp
   ${RT_DIR}/isdbt/demod.cpp
+  # ISDB-C（ケーブル TV トラモジ、J.83 Annex C + TSMF）
+  ${RT_DIR}/isdbc/mapping.cpp
+  ${RT_DIR}/isdbc/framing.cpp
+  ${RT_DIR}/isdbc/tsmf.cpp
+  ${RT_DIR}/isdbc/demod.cpp
 )
-target_include_directories(isdbt_core PUBLIC ${RT_DIR}/isdbt)
-
-add_library(BonDriver_PlutoSDR SHARED
-  BonDriver_PlutoSDR.cpp
-  BonDriver_PlutoSDR.def
-  IBonDriver.h
-  IBonDriver2.h
-  ${RT_DIR}/demod/live_demod.h
-  ${RT_DIR}/demod/live_demod.cpp
-  ${RT_DIR}/demod/sdr_source.h
-  ${RT_DIR}/demod/sdr_source.cpp
-  ${RT_DIR}/demod/rate_monitor.h
-)
-target_link_libraries(BonDriver_PlutoSDR PRIVATE isdbt_core ws2_32)
-# 出力 DLL 名は地デジ(T)を示す _T 付き。ini / log は DLL 名から実行時に導出されるので
-# BonDriver_PlutoSDR_T.ini / .log になる（BonDriver_PlutoSDR.cpp の LoadConfig 参照）。
-set_target_properties(BonDriver_PlutoSDR PROPERTIES PREFIX "" OUTPUT_NAME "BonDriver_PlutoSDR_T")
+target_include_directories(isdbt_core PUBLIC ${RT_DIR}/isdbt ${RT_DIR}/isdbc)
 
 # SDR スタンドアロンモード: rt/third_party/libiio があれば有効化（x64 のみ。配布 .lib が x64 のため）。
 # 無ければ [SDR] Enable=1 が実行時エラーになるだけで、ビルドとデーモンモードは通る。
 # libiio1.dll は /DELAYLOAD にして、libiio が無い環境でも DLL 自体は読み込めるようにする
 # （デーモンモードは libiio 無しで動く。実際のロードは OpenTuner の PreloadLibiio）。
 set(ISDBT_LIBIIO_DIR "${RT_DIR}/third_party/libiio")
+set(ISDBT_HAVE_LIBIIO OFF)
 if(CMAKE_SIZEOF_VOID_P EQUAL 8
    AND EXISTS "${ISDBT_LIBIIO_DIR}/include/iio/iio.h"
    AND EXISTS "${ISDBT_LIBIIO_DIR}/lib/libiio1.lib")
+  set(ISDBT_HAVE_LIBIIO ON)
   message(STATUS "libiio found: ${ISDBT_LIBIIO_DIR} -> [SDR] standalone enabled")
-  target_compile_definitions(BonDriver_PlutoSDR PRIVATE ISDBT_WITH_LIBIIO)
-  target_include_directories(BonDriver_PlutoSDR PRIVATE "${ISDBT_LIBIIO_DIR}/include")
-  target_link_libraries(BonDriver_PlutoSDR PRIVATE "${ISDBT_LIBIIO_DIR}/lib/libiio1.lib" delayimp)
-  target_link_options(BonDriver_PlutoSDR PRIVATE "/DELAYLOAD:libiio1.dll")
-  # ADI のインストーラを入れない環境向けに、TVTest フォルダへコピーできる DLL 一式を隣に置く
-  file(GLOB ISDBT_LIBIIO_DLLS "${ISDBT_LIBIIO_DIR}/bin/*.dll")
-  foreach(dll ${ISDBT_LIBIIO_DLLS})
-    add_custom_command(TARGET BonDriver_PlutoSDR POST_BUILD
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different "${dll}" "$<TARGET_FILE_DIR:BonDriver_PlutoSDR>")
-  endforeach()
 else()
   message(STATUS "libiio not found (rt/third_party/libiio, x64) -> [SDR] standalone はスタブ")
 endif()
 
+set(BON_SOURCES
+  BonDriver_PlutoSDR.cpp
+  BonDriver_PlutoSDR.def
+  IBonDriver.h
+  IBonDriver2.h
+  ${RT_DIR}/demod/live_demod.h
+  ${RT_DIR}/demod/live_demod.cpp
+  ${RT_DIR}/demod/live_isdbc.h
+  ${RT_DIR}/demod/live_isdbc.cpp
+  ${RT_DIR}/demod/live_switch.h
+  ${RT_DIR}/demod/live_switch.cpp
+  ${RT_DIR}/demod/sdr_source.h
+  ${RT_DIR}/demod/sdr_source.cpp
+  ${RT_DIR}/demod/rate_monitor.h
+)
+
+# 同じソースから 2 つの DLL を作る。ini / log は DLL 名から実行時に導出される
+# （BonDriver_PlutoSDR_T.ini / BonDriver_PlutoSDR_TC.ini。BonDriver_PlutoSDR.cpp の LoadConfig 参照）。
+#   T  … 地デジ（ISDB-T）のみ
+#   TC … 地デジ + ケーブル TV の BS/CS トランスモジュレーション（ISDB-C）。BONDRIVER_CATV 定義で空間 1 = CATV
+foreach(variant T TC)
+  set(tgt BonDriver_PlutoSDR_${variant})
+  add_library(${tgt} SHARED ${BON_SOURCES})
+  target_link_libraries(${tgt} PRIVATE isdbt_core ws2_32)
+  set_target_properties(${tgt} PROPERTIES PREFIX "" OUTPUT_NAME "BonDriver_PlutoSDR_${variant}")
+  if(variant STREQUAL "TC")
+    target_compile_definitions(${tgt} PRIVATE BONDRIVER_CATV)
+  endif()
+  if(ISDBT_HAVE_LIBIIO)
+    target_compile_definitions(${tgt} PRIVATE ISDBT_WITH_LIBIIO)
+    target_include_directories(${tgt} PRIVATE "${ISDBT_LIBIIO_DIR}/include")
+    target_link_libraries(${tgt} PRIVATE "${ISDBT_LIBIIO_DIR}/lib/libiio1.lib" delayimp)
+    target_link_options(${tgt} PRIVATE "/DELAYLOAD:libiio1.dll")
+    # ADI のインストーラを入れない環境向けに、TVTest フォルダへコピーできる DLL 一式を隣に置く
+    file(GLOB ISDBT_LIBIIO_DLLS "${ISDBT_LIBIIO_DIR}/bin/*.dll")
+    foreach(dll ${ISDBT_LIBIIO_DLLS})
+      add_custom_command(TARGET ${tgt} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${dll}" "$<TARGET_FILE_DIR:${tgt}>")
+    endforeach()
+  endif()
+  # サンプル ini を DLL の隣に置く（DLL 名に合わせたファイル名で）
+  add_custom_command(TARGET ${tgt} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${CMAKE_CURRENT_SOURCE_DIR}/BonDriver_PlutoSDR.ini.sample
+            $<TARGET_FILE_DIR:${tgt}>/BonDriver_PlutoSDR_${variant}.ini.sample
+  )
+endforeach()
+
 # DLL を TVTest 無しで叩く確認用コンソール
 add_executable(bontest bontest.cpp IBonDriver.h IBonDriver2.h)
-
-# サンプル ini を DLL の隣に置く（既にあれば上書きしない）
-add_custom_command(TARGET BonDriver_PlutoSDR POST_BUILD
-  COMMAND ${CMAKE_COMMAND} -E copy_if_different
-          ${CMAKE_CURRENT_SOURCE_DIR}/BonDriver_PlutoSDR.ini.sample
-          $<TARGET_FILE_DIR:BonDriver_PlutoSDR>/BonDriver_PlutoSDR_T.ini.sample
-)

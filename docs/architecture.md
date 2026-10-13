@@ -80,6 +80,24 @@ TVTest / EDCB
   transport_error_indicator を立てる。本来の多重フレーム（BTS）順への復元は TODO。
 - `rt/bondriver/bontest.exe` で TVTest 無しに DLL を叩ける。
 
+## ケーブル TV トランスモジュレーション（ISDB-C、2026-10-13 実装）
+```
+I/Q (任意 fs)
+  → 2 sps へリサンプル → 帯域端で粗 CFO → RRC 整合フィルタ（α=0.13）     [ref/isdbc/demod.py]
+  → Oerder–Meyr タイミング（ブロック推定 → 直線フィット）→ シンボル抽出
+  → z^4 で微 CFO → ブロック 4 乗法位相 → 判定指向 LS 等化（T 間隔 FFE）→ 判定指向位相
+  → 硬判定 → 2 MSB 差動復号 → ビット境界探索（204 周期の同期バイト）     [ref/isdbc/mapping.py]
+  → デインターリーブ → RS(204,188) → 逆ランダマイズ（8 パケット単位）      [ref/isdbc/framing.py]
+  → TSMF 分離（PID 0x002F ヘッダ、53 スロット、相対 TS 番号）→ TS           [ref/isdbc/tsmf.py]
+```
+- 内符号が無い（RS のみ）ので 64QAM の実用限界は MER ≈ 22 dB。実放送（ケーブル端子）は MER 33 dB。
+- `rt/isdbc/` は同じ推定器を逐次化（入力レートの多相 RRC 補間でシンボル直接抽出、O&M をブロックごと、
+  LS 等化をチャンクごとに再解）。`rt/demod/live_isdbc` は 1 ワーカーの逐次復調（ウィンドウ分割不要、
+  レイテンシ < 0.5 s）。`rt/demod/live_switch` が地デジ / ISDB-C を 1 台の SDR で切り替える。
+- 変調器 `ref/isdbc/modulator.py` と `tsmf.multiplex` でループバック（AWGN / CFO / クロック / 反射 /
+  スペクトル反転 / TSMF 2 本）を検証。実放送キャプチャは `ref/tests/test_isdbc_real.py` と rt_test の
+  `isdbc_real_catv56ch`。
+
 ## デバイス抽象（hw/）
 ```
 class IQSource:

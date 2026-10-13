@@ -47,7 +47,7 @@ def test_rt_matches_ref():
 
 
 # ---------------------------------------------------------------------------
-# isdbtd.exe のプロトコル試験（--ts 再生。docs/daemon-protocol.md v1）
+# isdbtd.exe のプロトコル試験（--ts 再生。docs/daemon-protocol.md v2）
 # ---------------------------------------------------------------------------
 def _free_port() -> int:
     s = socket.socket()
@@ -110,10 +110,16 @@ def test_isdbtd_control(daemon):
     port = daemon
     s, f = _connect(port)
     r = _cmd(f, {"cmd": "hello"})
-    assert r["ok"] and r["protocol"] == 1 and r["source"].startswith("replay:")
+    assert r["ok"] and r["protocol"] == 2 and r["source"].startswith("replay:")
 
     r = _cmd(f, {"cmd": "tune", "channel": 27})
     assert r["ok"] and r["channel"] == 27 and r["freq_hz"] == pytest.approx(557_142_857.0)
+    assert r["system"] == "isdbt"
+    # v2: ケーブル TV（ISDB-C）の通し番号 55 = UHF 56ch = 731 MHz
+    r = _cmd(f, {"cmd": "tune", "system": "isdbc", "channel": 55})
+    assert r["ok"] and r["system"] == "isdbc" and r["freq_hz"] == pytest.approx(731e6)
+    assert not _cmd(f, {"cmd": "tune", "system": "isdbc", "channel": 113})["ok"]
+    assert not _cmd(f, {"cmd": "tune", "system": "foo", "channel": 1})["ok"]
     r = _cmd(f, {"cmd": "tune", "freq_hz": 500e6})
     assert r["ok"] and r["freq_hz"] == 500e6
     assert not _cmd(f, {"cmd": "tune", "channel": 99})["ok"]
