@@ -145,14 +145,6 @@ void SdrSource::Connect() {
         if (!im.phy_rx || !im.phy_lo) throw std::runtime_error("ad9361-phy のチャンネルが見つからない");
         WriteAttr(im.phy_rx, "sampling_frequency", FormatLL(cfg_.fs));
         WriteAttr(im.phy_rx, "rf_bandwidth", FormatLL(cfg_.bw));
-        if (cfg_.agc && cfg_.hw_agc) {
-            WriteAttr(im.phy_rx, "gain_control_mode", "slow_attack");
-        } else {
-            // 手動 / ソフト AGC（再接続時は直前のゲインを引き継ぐ）
-            if (gain_db_ == 0.0 && cfg_.gain_db != 0.0) gain_db_ = cfg_.gain_db;
-            WriteAttr(im.phy_rx, "gain_control_mode", "manual");
-            WriteAttr(im.phy_rx, "hardwaregain", std::to_string(static_cast<int>(std::lround(gain_db_))));
-        }
         double freq;
         {
             std::lock_guard<std::mutex> lk(mu_);
@@ -176,6 +168,23 @@ void SdrSource::Connect() {
                                      "（I/Q 2ch で 4 = int16 か 2 = int8 のどちらかを想定）");
         }
         sample_bytes_ = static_cast<int>(ss);
+        // ゲインモードはサンプル幅が分かってから決める: 8bit ファーム（+6 dB 前置ゲイン、FS = ADC −6 dBFS）
+        // では AD936x の slow_attack（帯域内 −11 dBFS 程度）だと OFDM のピークが約 1% クリップする（実測）ので、
+        // Gain=hw が指定されていてもソフト AGC に切り替える
+        bool hw_agc = cfg_.agc && cfg_.hw_agc;
+        if (hw_agc && ss == 2) {
+            std::fprintf(stderr, "sdr: 8bit firmware: hardware slow_attack AGC would clip, using software AGC\n");
+            hw_agc = false;
+            cfg_.hw_agc = false;    // Run() のソフト AGC ループも有効にする
+        }
+        if (hw_agc) {
+            WriteAttr(im.phy_rx, "gain_control_mode", "slow_attack");
+        } else {
+            // 手動 / ソフト AGC（再接続時は直前のゲインを引き継ぐ）
+            if (gain_db_ == 0.0 && cfg_.gain_db != 0.0) gain_db_ = cfg_.gain_db;
+            WriteAttr(im.phy_rx, "gain_control_mode", "manual");
+            WriteAttr(im.phy_rx, "hardwaregain", std::to_string(static_cast<int>(std::lround(gain_db_))));
+        }
         im.block_samples = cfg_.block_samples;
         iio_stream* st = iio_buffer_create_stream(buf, cfg_.nb_blocks, cfg_.block_samples, im.mask);
         CheckPtr(st, "iio_buffer_create_stream");
