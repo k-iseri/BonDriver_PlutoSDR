@@ -79,6 +79,15 @@ void LiveSwitch::TeardownFeed() {
 }
 
 void LiveSwitch::Start(System initial) {
+    if (p_.sdr.fs <= 0.0) {
+        // レート自動: ファームのサンプル幅で決める（16bit = 7/8 レート、8bit = 公称レート）。
+        // 調べられなければ（接続失敗など）16bit の既定にして、本接続で改めてエラーにする
+        const int bytes = SdrSource::ProbeSampleBytes(p_.sdr.uri);
+        p_.sdr.fs = SdrSource::DefaultFsFor(bytes);
+        std::fprintf(stderr, "sdr: sample format %s -> fs %.0f Hz\n",
+                     bytes == 2 ? "int8 (8bit firmware)" : bytes == 4 ? "int16" : "unknown (assume int16)",
+                     p_.sdr.fs);
+    }
     BuildFeed(initial, p_.sdr.freq_hz);
     SdrConfig sc = p_.sdr;
     sc.bw = BwFor(initial);

@@ -28,6 +28,7 @@ void SdrSource::Stop() {}
 void SdrSource::Run() {}
 void SdrSource::Connect() {}
 void SdrSource::Teardown() {}
+int SdrSource::ProbeSampleBytes(const std::string&) { return 0; }
 
 #else  // ISDBT_WITH_LIBIIO
 
@@ -78,6 +79,31 @@ struct SdrSource::Impl {
 };
 
 SdrSource::~SdrSource() { Stop(); }
+
+// cf-ad9361-lpc の voltage0/1 を有効にしたときのサンプルサイズ = scan-element 申告の合計。
+// 純正ファームは le:s12/16 × 2 = 4、pluto-fw-isdbt の 8bit ファームは le:s8/8 × 2 = 2
+//（カーネルがコアの CHAN_USR_CNTRL_1 申告を読んで型を決める。ホストは申告だけで判断し、
+// ファーム識別子には依存しない）
+int SdrSource::ProbeSampleBytes(const std::string& uri) {
+    iio_context* ctx = iio_create_context(nullptr, uri.c_str());
+    if (iio_err(ctx) || !ctx) return 0;
+    int bytes = 0;
+    iio_device* rxdev = iio_context_find_device(ctx, "cf-ad9361-lpc");
+    iio_channel* v0 = rxdev ? iio_device_find_channel(rxdev, "voltage0", false) : nullptr;
+    iio_channel* v1 = rxdev ? iio_device_find_channel(rxdev, "voltage1", false) : nullptr;
+    if (v0 && v1) {
+        iio_channels_mask* mask = iio_create_channels_mask(iio_device_get_channels_count(rxdev));
+        if (mask) {
+            iio_channel_enable(v0, mask);
+            iio_channel_enable(v1, mask);
+            const ssize_t ss = iio_device_get_sample_size(rxdev, mask);
+            if (ss > 0) bytes = static_cast<int>(ss);
+            iio_channels_mask_destroy(mask);
+        }
+    }
+    iio_context_destroy(ctx);
+    return bytes;
+}
 
 void SdrSource::Start(const SdrConfig& cfg, BlockFn on_block, EventFn on_event) {
     impl_ = new Impl;
@@ -135,10 +161,11 @@ void SdrSource::Connect() {
         iio_buffer* buf = iio_device_get_buffer(rxdev, 0);
         if (!buf) throw std::runtime_error("cf-ad9361-lpc に buffer0 が無い");
         const ssize_t ss = iio_device_get_sample_size(rxdev, im.mask);
-        if (ss != 4) {
+        if (ss != 4 && ss != 2) {
             throw std::runtime_error("sample size " + std::to_string(ss) +
-                                     " != 4（I/Q 16bit 2ch 前提。8bit ファームは未対応）");
+                                     "（I/Q 2ch で 4 = int16 か 2 = int8 のどちらかを想定）");
         }
+        sample_bytes_ = static_cast<int>(ss);
         im.block_samples = cfg_.block_samples;
         iio_stream* st = iio_buffer_create_stream(buf, cfg_.nb_blocks, cfg_.block_samples, im.mask);
         CheckPtr(st, "iio_buffer_create_stream");
@@ -212,7 +239,10 @@ void SdrSource::Stop() {
 
 void SdrSource::Run() {
     std::vector<std::complex<float>> out(impl_->block_samples);
-    constexpr float kScale = 1.0f / 2048.0f;    // AD936x は 12bit（int16 の下位 12bit）
+    // 純正ファーム: int16 の下位 12bit（AD936x は 12bit）。8bit ファーム: 12bit を 4bit 右シフト（丸め）した
+    // int8 なので 1/128。どちらも同じ振幅（フルスケール ±1.0）になる
+    constexpr float kScale16 = 1.0f / 2048.0f;
+    constexpr float kScale8 = 1.0f / 128.0f;
     int backoff_ms = 500;
     bool ovf_usable = true;         // reg アクセス不能なコア（将来の別ボード等）では監視を止める
     bool ovf_armed = false;         // 最初のブロック到着（= DMA 稼働）後にクリアしてから監視を始める
@@ -256,12 +286,23 @@ void SdrSource::Run() {
             }
             continue;
         }
-        const int16_t* p = static_cast<const int16_t*>(iio_block_start(blk));
-        const int16_t* e = static_cast<const int16_t*>(iio_block_end(blk));
-        const size_t n = static_cast<size_t>(e - p) / 2;    // 複素サンプル数
-        if (out.size() < n) out.resize(n);
-        for (size_t i = 0; i < n; ++i) {
-            out[i] = {p[2 * i] * kScale, p[2 * i + 1] * kScale};
+        size_t n;
+        if (sample_bytes_ == 2) {
+            const int8_t* p = static_cast<const int8_t*>(iio_block_start(blk));
+            const int8_t* e = static_cast<const int8_t*>(iio_block_end(blk));
+            n = static_cast<size_t>(e - p) / 2;     // 複素サンプル数
+            if (out.size() < n) out.resize(n);
+            for (size_t i = 0; i < n; ++i) {
+                out[i] = {p[2 * i] * kScale8, p[2 * i + 1] * kScale8};
+            }
+        } else {
+            const int16_t* p = static_cast<const int16_t*>(iio_block_start(blk));
+            const int16_t* e = static_cast<const int16_t*>(iio_block_end(blk));
+            n = static_cast<size_t>(e - p) / 2;
+            if (out.size() < n) out.resize(n);
+            for (size_t i = 0; i < n; ++i) {
+                out[i] = {p[2 * i] * kScale16, p[2 * i + 1] * kScale16};
+            }
         }
         ++blocks_;
         if (on_block_) on_block_(out.data(), n);
@@ -328,5 +369,9 @@ void SdrSource::Run() {
 }
 
 #endif  // ISDBT_WITH_LIBIIO
+
+double SdrSource::DefaultFsFor(int sample_bytes) {
+    return (sample_bytes == 2) ? 8'126'984.0 : 7'111'111.0;
+}
 
 }  // namespace isdbt

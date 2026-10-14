@@ -23,12 +23,13 @@ namespace isdbt {
 struct SdrConfig {
     std::string uri = "usb:";
     double freq_hz = 0.0;
-    // 既定レートは公称 512/63 MHz の 7/8 = 7,111,111 Hz。
-    // 16bit × 公称レート（32.5 MB/s）は USB 2.0 の実効スループットに約 3〜4% 足りず、
-    // 初期バッファ枯渇後（~15 s）にサンプル落ちが続発する（実機で確認）。
-    // 7/8 レート（28.4 MB/s）なら持続し、復調コアが内部で 8/7 リサンプルして吸収する。
-    // GbE 機（Pluto+ / LibreSDR）では --fs 8126984 に戻してよい。
-    double fs = 7'111'111.0;
+    // 取り込みレート。0 = 自動: ファームのサンプル幅（scan-element の申告）で決める。
+    //   16bit（純正ファーム）: 公称 512/63 MHz の 7/8 = 7,111,111 Hz。16bit × 公称レート（32.5 MB/s）は
+    //     USB 2.0 の実効スループットに約 3〜4% 足りず、初期バッファ枯渇後（~15 s）にサンプル落ちが
+    //     続発する（実機で確認）。7/8 レート（28.4 MB/s）なら持続し、復調コアが内部で 8/7 リサンプルして吸収する。
+    //   8bit（pluto-fw-isdbt の 8bit パッキングファーム）: 公称 8,126,984 Hz（16.3 MB/s、余裕 2 倍）。
+    // GbE 機（Pluto+ / LibreSDR）では --fs 8126984 を明示してよい。
+    double fs = 0.0;
     // 5.6 MHz（信号帯域ちょうど）。7.111 MSPS ではナイキスト余裕が薄く、6 MHz だと
     // フィルタ裾のエイリアシングで帯域端の MER が落ちる（tools/iq_record.py の既定と同じ値）
     double bw = 5'600'000.0;
@@ -57,6 +58,13 @@ public:
 
     ~SdrSource();
 
+    // 接続先の 1 複素サンプルのバイト数を scan-element の申告から調べる（4 = int16 I/Q の純正ファーム、
+    // 2 = int8 I/Q の 8bit パッキングファーム）。失敗は 0。fs を自動決定するために Start() の前に
+    // 一度だけ呼ぶ（コンテキストを開いて閉じるので約 0.3 秒かかる）
+    static int ProbeSampleBytes(const std::string& uri);
+    // 16bit なら 7/8 レート、8bit なら公称レート（SdrConfig::fs のコメント参照）
+    static double DefaultFsFor(int sample_bytes);
+
     // 接続・設定して受信スレッドを開始する。初回接続の失敗は std::runtime_error
     //（設定ミスを呼び出し元へ即座に伝える。再接続するのはいったん開けた後のエラーだけ）。
     void Start(const SdrConfig& cfg, BlockFn on_block, EventFn on_event = {});
@@ -76,6 +84,7 @@ public:
     long long hw_ovf() const { return hw_ovf_; }
     double gain_db() const { return gain_db_; }             // 現在の hardwaregain（AGC モードでも）
     double level_dbfs() const { return level_dbfs_; }       // 直近の帯域内平均電力
+    int sample_bytes() const { return sample_bytes_; }      // 接続中のファームの 1 複素サンプルのバイト数（4 / 2）
 
 private:
     void Run();
@@ -96,6 +105,7 @@ private:
     std::atomic<long long> hw_ovf_{0};
     std::atomic<double> gain_db_{0.0};
     std::atomic<double> level_dbfs_{-100.0};
+    std::atomic<int> sample_bytes_{4};
     volatile long long blocks_ = 0;
     std::string desc_;
 };
