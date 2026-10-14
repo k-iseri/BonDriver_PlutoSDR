@@ -90,6 +90,14 @@ def main():
         rx.reg_write(REG | R_DECIM, args.decim)
         rx.reg_write(REG | R_MODE, 2)
         time.sleep(args.settle)
+        f0 = rx.reg_read(REG | R_FRAMES)
+        time.sleep(0.5)
+        f1 = rx.reg_read(REG | R_FRAMES)
+        st0 = rx.reg_read(REG | R_STATUS)
+        print(f"after settle: frames {f0} -> {f1} in 0.5 s (expect ~{0.5 * FS / T / args.decim:.0f}), overrun {st0 & 0xFFFF}, fifo_ovf {st0 >> 16}")
+        if f1 == f0:
+            print("no windows are being produced (sync not locking?)")
+            sys.exit(1)
         st = iio.Stream(rx.get_buffer(0), rx_mask, 1 << 18, nb_blocks=4)
         need = (args.windows + 2) * (8 + N) * 4
         chunks, got = [], 0

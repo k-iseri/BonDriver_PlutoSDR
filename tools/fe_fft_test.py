@@ -197,7 +197,9 @@ def main():
                 prev = h
             print(f"{len(wins)} windows: worst relative rms error {worst_rel:.2e} ({20 * np.log10(max(worst_rel, 1e-12)):.1f} dB), "
                   f"worst time-domain max error {worst_t:.2f} LSB")
-            ok = ok and worst_rel < 1e-3 and worst_t < 2.0
+            # 判定: FFT は 12bit（BFP）なので丸め雑音はフルスケール比 −59 dB 程度（16bit なら −72 dB）。
+            # 相対 rms −50 dB 未満、時間領域の最大誤差 16 LSB 未満（パターン ±1000）なら窓切り出しも中身も正しい
+            ok = ok and worst_rel < 3e-3 and worst_t < 16.0
             print("PASS" if ok else "FAIL")
     finally:
         if not args.keep:
