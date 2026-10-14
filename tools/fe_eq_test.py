@@ -28,6 +28,7 @@ REG = 0x80000000
 R_MAGIC, R_VERSION, R_MODE, R_DECIM, R_STATUS, R_FRAMES = 0x3000, 0x3004, 0x3020, 0x302C, 0x3030, 0x3034
 R_SYNC_STATUS, R_SYNC_PEAK = 0x3038, 0x303C
 R_EQ_CTRL, R_EQ_STATUS, R_EQ_OMEGA, R_TIM_EST, R_TIM_DELTA = 0x3040, 0x3044, 0x3048, 0x304C, 0x3050
+R_FORMAT, R_ADC_LEVEL = 0x3018, 0x3054      # ADC_LEVEL は VERSION 4（CAPS bit4）から
 HDR_MAGIC = 0x49534254
 N, NG, T = 8192, 1024, 9216
 FS = 512e6 / 63
@@ -175,6 +176,11 @@ def main():
         time.sleep(0.5)
         f1 = rx.reg_read(REG | R_FRAMES)
         print(f"fe frames/s ~ {2 * (f1 - f0)} (expect {FS / T:.0f})")
+        if ver >= 4:
+            # ファームのレベル計: pack8 後の 8bit I/Q の I²+Q² × 65536 サンプル → raw と同じ dBFS 定義
+            shift = rx.reg_read(REG | R_FORMAT) & 0xFF
+            lvl = rx.reg_read(REG | R_ADC_LEVEL)
+            print(f"  adc level {10 * np.log10(max(lvl, 1) / 65536 * ((1 << shift) / 2048) ** 2):.1f} dBFS (raw {lvl})")
         print("  " + FC.sync_state_str(rx.reg_read(REG | R_SYNC_STATUS), rx.reg_read(REG | R_SYNC_PEAK)))
         print("  " + eq_state_str(rx.reg_read(REG | R_EQ_STATUS), rx.reg_read(REG | R_EQ_OMEGA), rx.reg_read(REG | R_TIM_EST), rx.reg_read(REG | R_TIM_DELTA)))
         if f1 == f0:

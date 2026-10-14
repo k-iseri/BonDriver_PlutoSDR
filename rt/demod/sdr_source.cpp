@@ -84,7 +84,9 @@ constexpr uint32_t kRegDecim = 0x302C;
 constexpr uint32_t kRegSyncStatus = 0x3038;
 constexpr uint32_t kRegEqCtrl = 0x3040;     // bit[7:0] δ、bit8 AFC、bit9 CPE
 constexpr uint32_t kRegEqStatus = 0x3044;
+constexpr uint32_t kRegAdcLevel = 0x3054;   // pack8 後の I²+Q² を 65536 サンプル積算（CAPS bit4、VERSION 4）
 constexpr uint32_t kCapsEq = 1u << 3;
+constexpr uint32_t kCapsLevel = 1u << 4;
 constexpr uint32_t kHdrMagic = 0x49534254;  // "ISBT"
 constexpr int kFeN = 8192;
 constexpr int kFeTotal = 5617;
@@ -250,6 +252,7 @@ void SdrSource::Connect() {
             fpga_capable_ = hw_counter_ && iio_device_reg_read(rxdev, kPcoreRegMagic | kRegCaps, &caps) == 0 &&
                             (caps & kCapsEq) != 0;
             if (fpga_capable_) (void)iio_device_reg_write(rxdev, kPcoreRegMagic | kRegMode, 0);
+            fpga_level_ = fpga_capable_ && (caps & kCapsLevel) != 0;
             if (cfg_.fpga_eq == 1 && !fpga_capable_) throw std::runtime_error("fpga_eq=1 だがファームに等化器が無い（CAPS bit3）");
             fpga_eq_ = false;
         }
@@ -355,6 +358,25 @@ void SdrSource::Run() {
     constexpr int kAgcBlocks = 4;   // 約 0.5 秒
     double agc_acc = 0.0, agc_cnt = 0.0;
     int agc_blocks = 0;
+    // 帯域内レベル [dBFS] から hardwaregain を目標へ寄せる（raw の測定と、モード 3/4 中のファームのレベル計で共用）
+    auto agc_apply = [&](double level) {
+        level_dbfs_ = level;
+        if (!(cfg_.agc && !cfg_.hw_agc)) return;
+        const double diff = cfg_.agc_target_dbfs - level;
+        if (std::fabs(diff) < 1.0) return;
+        const double step = std::max(-12.0, std::min(12.0, diff));
+        const double g = std::max(0.0, std::min(73.0, std::round(gain_db_ + step)));
+        if (g == gain_db_) return;
+        std::lock_guard<std::mutex> lk(mu_);
+        if (connected_ && impl_->phy_rx) {
+            try {
+                WriteAttr(impl_->phy_rx, "hardwaregain", std::to_string(static_cast<int>(g)));
+                gain_db_ = g;
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "sdr: agc gain write failed: %s\n", e.what());
+            }
+        }
+    };
     // FPGA 前段の状態: raw（AGC）→ cfo（モード 3 で整数 CFO）→ eq（モード 4）
     enum class Fe { kRaw, kCfo, kEqWait, kEq };
     Fe fe = Fe::kRaw;
@@ -493,11 +515,22 @@ void SdrSource::Run() {
             }
             if (ovf_usable && --ovf_countdown <= 0) {
                 ovf_countdown = kOvfCheckBlocks;
-                uint32_t v = 0;
-                std::lock_guard<std::mutex> lk(mu_);
-                if (connected_ && impl_->rxdev) {
-                    if (iio_device_reg_read(impl_->rxdev, kPcoreRegMagic | kRegSyncStatus, &v) == 0) fe_sync_status_ = v;
-                    if (iio_device_reg_read(impl_->rxdev, kPcoreRegMagic | kRegEqStatus, &v) == 0) fe_eq_status_ = v;
+                bool have_level = false;
+                uint32_t lvl = 0;
+                {
+                    uint32_t v = 0;
+                    std::lock_guard<std::mutex> lk(mu_);
+                    if (connected_ && impl_->rxdev) {
+                        if (iio_device_reg_read(impl_->rxdev, kPcoreRegMagic | kRegSyncStatus, &v) == 0) fe_sync_status_ = v;
+                        if (iio_device_reg_read(impl_->rxdev, kPcoreRegMagic | kRegEqStatus, &v) == 0) fe_eq_status_ = v;
+                        if (fpga_level_ && iio_device_reg_read(impl_->rxdev, kPcoreRegMagic | kRegAdcLevel, &lvl) == 0) have_level = true;
+                    }
+                }
+                if (have_level) {
+                    // ファームのレベル計（pack8 後の 8bit I/Q の I²+Q² × 65536 サンプル）→ raw と同じ dBFS 定義
+                    const double s8 = static_cast<double>(1 << pack_shift_) / 2048.0;
+                    const double level = 10.0 * std::log10(static_cast<double>(lvl) / 65536.0 * s8 * s8 + 1e-30);
+                    agc_apply(level);
                 }
             }
             continue;
@@ -544,29 +577,10 @@ void SdrSource::Run() {
             agc_cnt += static_cast<double>(cnt);
             if (++agc_blocks >= kAgcBlocks) {
                 const double level = 10.0 * std::log10(agc_acc / std::max(agc_cnt, 1.0) + 1e-30);
-                level_dbfs_ = level;
                 agc_acc = 0.0;
                 agc_cnt = 0.0;
                 agc_blocks = 0;
-                if (cfg_.agc && !cfg_.hw_agc) {
-                    const double diff = cfg_.agc_target_dbfs - level;
-                    if (std::fabs(diff) >= 1.0) {
-                        const double step = std::max(-12.0, std::min(12.0, diff));
-                        const double g = std::max(0.0, std::min(73.0, std::round(gain_db_ + step)));
-                        if (g != gain_db_) {
-                            std::lock_guard<std::mutex> lk(mu_);
-                            if (connected_ && impl_->phy_rx) {
-                                try {
-                                    WriteAttr(impl_->phy_rx, "hardwaregain",
-                                              std::to_string(static_cast<int>(g)));
-                                    gain_db_ = g;
-                                } catch (const std::exception& e) {
-                                    std::fprintf(stderr, "sdr: agc gain write failed: %s\n", e.what());
-                                }
-                            }
-                        }
-                    }
-                }
+                agc_apply(level);
             }
         }
         // UI_OVF 監視（約 1 秒周期。reg アクセスは制御転送 1 回で、ストリームへの影響は無視できる）

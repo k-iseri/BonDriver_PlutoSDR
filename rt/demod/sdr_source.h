@@ -139,6 +139,7 @@ private:
     std::atomic<int> sample_bytes_{4};
     std::atomic<int> pack_shift_{4};        // 8bit ファームの 12→8bit シフト量（FORMAT レジスタ。無ければ 4）
     std::atomic<bool> fpga_capable_{false};
+    std::atomic<bool> fpga_level_{false};   // ファームに ADC レベル計がある（CAPS bit4）: モード 3/4 中もソフト AGC を回せる
     std::atomic<bool> fpga_eq_{false};
     std::atomic<int> fpga_delta_{0};
     std::atomic<uint32_t> fe_sync_status_{0}, fe_eq_status_{0};
