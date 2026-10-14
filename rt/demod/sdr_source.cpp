@@ -66,6 +66,16 @@ constexpr uint32_t kRegUiStatus = 0x0088;   // adi_regmap_adc: UI_STATUS
 constexpr uint32_t kUiOvf = 1u << 2;        // bit2 = UI_OVF (RW1C)
 constexpr long long kOvfCheckBlocks = 8;    // 約 1 秒周期（1 ブロック ≈ 129〜147 ms）
 
+// pluto-fw-isdbt ファームのサンプルカウンタブロック（axi_ad9361 コアのバイト 0x3000。
+// hdl フォーク library/axi_ad9361/isdbt_sample_counter.v）。純正コアはこの領域に応答しない
+//（0xDEADDEAD を返す）ので MAGIC で判別する。すべて読み出し専用、32bit はラップする
+constexpr uint32_t kRegCntMagic = 0x3000;   // 0x49534442 "ISDB"
+constexpr uint32_t kRegCntOvfCnt = 0x3010;  // adc_dovf 立ち上がり回数（overflow イベント）
+constexpr uint32_t kRegCntDropCnt = 0x3014; // adc_dovf が立っていたクロック数 = 捨てられた DMA ビート数
+constexpr uint32_t kRegCntFormat = 0x3018;  // bit[7:0] = pack8 の右シフト量（8bit 値 × 2^shift = 12bit 値）
+constexpr uint32_t kCntMagic = 0x49534442;
+constexpr long long kSamplesPerBeat = 2;    // 1R1T では 16bit/8bit どちらも 1 ビート = 複素 2 サンプル
+
 }  // namespace
 
 struct SdrSource::Impl {
@@ -170,6 +180,20 @@ void SdrSource::Connect() {
         iio_stream* st = iio_buffer_create_stream(buf, cfg_.nb_blocks, cfg_.block_samples, im.mask);
         CheckPtr(st, "iio_buffer_create_stream");
         im.stream = st;
+        {
+            uint32_t magic = 0;
+            hw_counter_ = (iio_device_reg_read(rxdev, kPcoreRegMagic | kRegCntMagic, &magic) == 0 &&
+                           magic == kCntMagic);
+            // 8bit 値のフルスケール換算: 情報ブロックがあればその申告（前置ゲイン分）、無ければ素直な 12→8bit
+            uint32_t shift = 4;
+            if (hw_counter_ && iio_device_reg_read(rxdev, kPcoreRegMagic | kRegCntFormat, &shift) == 0) {
+                shift &= 0xFF;
+                if (shift > 11) shift = 4;
+            } else {
+                shift = 4;
+            }
+            pack_shift_ = static_cast<int>(shift);
+        }
     } catch (...) {
         if (im.stream) iio_stream_destroy(im.stream);
         if (im.mask) iio_channels_mask_destroy(im.mask);
@@ -239,14 +263,31 @@ void SdrSource::Stop() {
 
 void SdrSource::Run() {
     std::vector<std::complex<float>> out(impl_->block_samples);
-    // 純正ファーム: int16 の下位 12bit（AD936x は 12bit）。8bit ファーム: 12bit を 4bit 右シフト（丸め）した
-    // int8 なので 1/128。どちらも同じ振幅（フルスケール ±1.0）になる
+    // 純正ファーム: int16 の下位 12bit（AD936x は 12bit）。8bit ファーム: 12bit を pack_shift_ 右シフト（丸め）
+    // した int8 なので 2^shift/2048（shift 4 で 1/128、前置ゲイン +6 dB の shift 3 で 1/256）。
+    // どちらも ADC フルスケール = ±1.0 に揃うので、ソフト AGC の dBFS 目標はファームに依らず同じ意味
     constexpr float kScale16 = 1.0f / 2048.0f;
-    constexpr float kScale8 = 1.0f / 128.0f;
+    const float kScale8 = static_cast<float>(1 << pack_shift_) / 2048.0f;
     int backoff_ms = 500;
     bool ovf_usable = true;         // reg アクセス不能なコア（将来の別ボード等）では監視を止める
     bool ovf_armed = false;         // 最初のブロック到着（= DMA 稼働）後にクリアしてから監視を始める
     long long ovf_countdown = kOvfCheckBlocks;
+    // サンプルカウンタ（対応ファームのみ）: ストリーム開始前は DMA が止まっていて全ビートが overflow に
+    // 数えられるので、UI_OVF と同じタイミングで基準値を取り、以降の増分だけを積む
+    uint32_t cnt_drop_last = 0, cnt_ovf_last = 0;
+    auto read_counters = [&](bool baseline) {
+        uint32_t drop = 0, ovf = 0;
+        if (iio_device_reg_read(impl_->rxdev, kPcoreRegMagic | kRegCntDropCnt, &drop) < 0 ||
+            iio_device_reg_read(impl_->rxdev, kPcoreRegMagic | kRegCntOvfCnt, &ovf) < 0) {
+            return;
+        }
+        if (!baseline) {
+            hw_dropped_samples_ += kSamplesPerBeat * static_cast<long long>(drop - cnt_drop_last);
+            hw_ovf_events_ += static_cast<long long>(ovf - cnt_ovf_last);
+        }
+        cnt_drop_last = drop;
+        cnt_ovf_last = ovf;
+    };
     constexpr int kAgcBlocks = 4;   // 約 0.5 秒
     double agc_acc = 0.0, agc_cnt = 0.0;
     int agc_blocks = 0;
@@ -352,8 +393,18 @@ void SdrSource::Run() {
                 if (iio_device_reg_write(impl_->rxdev, kPcoreRegMagic | kRegUiStatus, kUiOvf) < 0) {
                     ovf_usable = false;
                 }
+                if (hw_counter_) read_counters(true);
             } else if (--ovf_countdown <= 0) {
                 ovf_countdown = kOvfCheckBlocks;
+                if (hw_counter_) {
+                    const long long before = hw_dropped_samples_;
+                    read_counters(false);
+                    if (hw_dropped_samples_ != before) {
+                        std::fprintf(stderr, "sdr: hardware drop counter: +%lld samples (total %lld)\n",
+                                     static_cast<long long>(hw_dropped_samples_ - before),
+                                     static_cast<long long>(hw_dropped_samples_));
+                    }
+                }
                 uint32_t v = 0;
                 if (iio_device_reg_read(impl_->rxdev, kPcoreRegMagic | kRegUiStatus, &v) < 0) {
                     ovf_usable = false;

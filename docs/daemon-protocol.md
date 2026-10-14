@@ -88,6 +88,11 @@ TVTest / EDCB
   を返す。`channel_name`（"56ch" / "C47ch"）も付く。
 - SDR ソースでは `sdr_connected` / `sdr_reconnects` / `hw_ovf` / `rx_rate` / `rx_slow` /
   `gain_db`（現在の hardwaregain）/ `rx_level_dbfs`（帯域内平均電力）も返す。
+  pluto-fw-isdbt ファーム（サンプルカウンタ付き）に接続しているときだけ `hw_dropped`（ストリーム開始後に
+  FPGA の DMA が捨てた複素サンプル数）と `hw_ovf_events`（overflow パルス数。現行ファームでは捨てたビートごとに
+  パルスが立つので `hw_dropped` / 2 と同じ値になり、バースト回数ではない）が付く（任意項目。
+  受信側は無いものとして扱ってよい）。実機確認 2026-10-14: 20 MSPS 指定で USB を飽和させると到着 15.83 MSPS、
+  `hw_dropped` の増分 4.1M/s で差分と一致。
 
 ### stream
 ```

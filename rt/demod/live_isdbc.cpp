@@ -128,6 +128,10 @@ std::string LiveIsdbc::StatusJson() {
     s += ", \"sdr_connected\": " + std::string(sdr_->connected() ? "true" : "false");
     s += ", \"sdr_reconnects\": " + std::to_string(sdr_->reconnects());
     s += ", \"hw_ovf\": " + std::to_string(sdr_->hw_ovf());
+    if (sdr_->hw_counter()) {
+        s += ", \"hw_dropped\": " + std::to_string(sdr_->hw_dropped_samples());
+        s += ", \"hw_ovf_events\": " + std::to_string(sdr_->hw_ovf_events());
+    }
     s += ", \"gain_db\": " + FormatDouble(sdr_->gain_db());
     s += ", \"rx_level_dbfs\": " + FormatDouble(sdr_->level_dbfs());
     s += ", \"rx_rate\": " + FormatDouble(rx_rate_.load());

@@ -100,6 +100,12 @@ copy ..\..\..\bondriver\BonDriver_PlutoSDR.ini.sample BonDriver_PlutoSDR_T.ini  
 - スタンドアロンモードは AD936x コアの UI_OVF レジスタを約 1 秒周期で監視し、USB 帯域不足による
   サンプル落ちをハード側で確定検出する（ログ統計の `hw_ovf`。純正ファームで動作、
   対応レジスタが無いデバイスでは自動で無効化）。
+- **カスタムファーム（[pluto-fw-isdbt](https://github.com/k-iseri/pluto-fw-isdbt)）に自動適応する。**
+  同ファームは I/Q を 8bit で転送する（scan-element が `le:s8/8`）ので、DLL は接続時にサンプル幅を
+  申告から読み、8bit なら公称 8.127 MSPS で取り込む（純正 16bit ファームは従来どおり 7/8 レート。
+  `[SDR] Fs` 未指定時）。さらにファームのサンプルカウンタ（コアのレジスタ 0x3000、MAGIC "ISDB"）が
+  読めれば、捨てられたサンプル数 `hw_dropped` と overflow イベント数 `hw_ovf_events` をログ統計に加える。
+  ファーム識別子では分岐しない（申告ベース）。
 - スタンドアロンモードは USB 瞬断などで SDR のストリームが切れても自動で再接続する
   （`[SDR] Reconnect=1` 既定。バックオフ 0.5→5 秒、選局中の周波数は再接続時に再適用）。
   切断中は信号レベルが 0 になり、復帰後 10〜15 秒でパイプラインが再同期する。

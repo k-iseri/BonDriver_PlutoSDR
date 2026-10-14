@@ -82,6 +82,12 @@ public:
     // FPGA が報告したハード確定ドロップ（axi_ad9361 UI_STATUS の UI_OVF を約 1 秒周期で
     // 監視した検出回数）。純正ファームで動く。実機検証 2026-10-12（健全時 0、USB 飽和で検出）。
     long long hw_ovf() const { return hw_ovf_; }
+    // pluto-fw-isdbt ファームのサンプルカウンタブロック（コアのバイト 0x3000、MAGIC "ISDB"）が
+    // 読めるとき: ストリーム開始後に DMA が捨てた複素サンプル数（ビート×2）と overflow イベント数。
+    // 純正ファーム（MAGIC 無し）では常に 0 で hw_counter() が false
+    bool hw_counter() const { return hw_counter_; }
+    long long hw_dropped_samples() const { return hw_dropped_samples_; }
+    long long hw_ovf_events() const { return hw_ovf_events_; }
     double gain_db() const { return gain_db_; }             // 現在の hardwaregain（AGC モードでも）
     double level_dbfs() const { return level_dbfs_; }       // 直近の帯域内平均電力
     int sample_bytes() const { return sample_bytes_; }      // 接続中のファームの 1 複素サンプルのバイト数（4 / 2）
@@ -103,9 +109,13 @@ private:
     std::atomic<bool> connected_{false};
     std::atomic<long long> reconnects_{0};
     std::atomic<long long> hw_ovf_{0};
+    std::atomic<bool> hw_counter_{false};
+    std::atomic<long long> hw_dropped_samples_{0};
+    std::atomic<long long> hw_ovf_events_{0};
     std::atomic<double> gain_db_{0.0};
     std::atomic<double> level_dbfs_{-100.0};
     std::atomic<int> sample_bytes_{4};
+    std::atomic<int> pack_shift_{4};        // 8bit ファームの 12→8bit シフト量（FORMAT レジスタ。無ければ 4）
     volatile long long blocks_ = 0;
     std::string desc_;
 };
