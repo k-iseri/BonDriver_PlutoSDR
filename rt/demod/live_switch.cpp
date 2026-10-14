@@ -25,6 +25,12 @@ void LiveSwitch::ForwardBlock(const cfloat* p, size_t n) {
     else if (fwd_t_) fwd_t_->OnBlock(p, n);
 }
 
+// FPGA 等化モードの等化済みシンボルは地デジ側だけが受ける（ISDB-C はファームの前段を使わない）
+void LiveSwitch::ForwardSymbol(const EqSymbol& s) {
+    std::lock_guard<std::mutex> lk(fwd_mu_);
+    if (fwd_t_) fwd_t_->OnSymbol(s);
+}
+
 void LiveSwitch::ForwardEvent(bool up) {
     std::lock_guard<std::mutex> lk(fwd_mu_);
     if (fwd_c_) fwd_c_->OnSdrEvent(up);
@@ -94,7 +100,8 @@ void LiveSwitch::Start(System initial) {
     freq_hz_ = sc.freq_hz;
     try {
         sdr_.Start(sc, [this](const cfloat* p, size_t n) { ForwardBlock(p, n); },
-                   [this](bool up) { ForwardEvent(up); });
+                   [this](bool up) { ForwardEvent(up); },
+                   [this](const EqSymbol& s) { ForwardSymbol(s); });
     } catch (...) {
         TeardownFeed();
         throw;

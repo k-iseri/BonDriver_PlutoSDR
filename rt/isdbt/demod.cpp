@@ -176,8 +176,16 @@ void EqualizeAndDeinterleave(const Mat<cfloat>& Y, Mode mode, int frame_start,
     for (size_t r = 0; r < csi.rows; ++r) {     // バースト検出シンボルは消失扱い
         if (bad[r]) std::fill(csi[r], csi[r] + csi.cols, 0.0f);
     }
-    NullInterferedCarriers(D, &csi, mode, frame_start, layers);
     if (H_out) *H_out = std::move(H);
+    DeinterleaveEqualized(D, csi, mode, frame_start, layers, groups, Xt, Wt);
+}
+
+void DeinterleaveEqualized(const Mat<cfloat>& D, const Mat<float>& csi_in, Mode mode, int frame_start,
+                           const std::vector<RxLayer>& layers,
+                           const std::vector<std::vector<int>>& groups,
+                           Mat<cfloat>* Xt, Mat<float>* Wt) {
+    Mat<float> csi = csi_in;
+    NullInterferedCarriers(D, &csi, mode, frame_start, layers);
 
     Mat<cfloat> Yl = DataToLogical(D, mode, frame_start);
     Mat<float> Wl = DataToLogical(csi, mode, frame_start);
@@ -192,6 +200,14 @@ void EqualizeAndDeinterleave(const Mat<cfloat>& Y, Mode mode, int frame_start,
     IntersegmentDeinterleave(&Wl, mode, groups);
     *Xt = TimeDeinterleave(Yl, mode, I_seg);
     *Wt = TimeDeinterleave(Wl, mode, I_seg);
+}
+
+Mat<cfloat> MatSource::Symbols(int i0, int i1) {
+    i0 = std::max(0, i0);
+    i1 = std::min(i1, static_cast<int>(m_->rows));
+    Mat<cfloat> out(static_cast<size_t>(std::max(0, i1 - i0)), m_->cols);
+    if (i1 > i0) std::copy((*m_)[i0], (*m_)[i1 - 1] + m_->cols, out.data());
+    return out;
 }
 
 int LayerFirstFrame(const RxLayer& lyr, int frame_start) {
@@ -230,8 +246,10 @@ namespace {
 // 1 本のソースをフレーム同期からブロック復号まで処理する。
 // 前段（Symbols → 等化 → デインターリーブ）を別スレッドで 1 ブロック先行して走らせ、
 // 復号（Viterbi〜RS）と重ねる。ソースへのアクセスは常に前段スレッド 1 本だけ。
+// csi_full が非 null なら src は等化済み D を返すものとして、等化を飛ばしてデインターリーブだけ行う
 void DecodeSource(ISymbolSource* src, Mode mode, int block_frames,
-                  FrameSyncInfo* fsi_out, std::map<std::string, LayerResult>* layers_out) {
+                  FrameSyncInfo* fsi_out, std::map<std::string, LayerResult>* layers_out,
+                  const Mat<float>* csi_full = nullptr) {
     *fsi_out = FrameSync(src, mode);
     const FrameSyncInfo& fsi = *fsi_out;
     const int f0 = fsi.frame_start;
@@ -260,7 +278,13 @@ void DecodeSource(ISymbolSource* src, Mode mode, int block_frames,
         fe.s0 = std::max(0, f0 + (fa - hist) * kSymbolsPerFrame - kEqContextSymbols);
         const int s1 = std::min(src->n_sym(), f0 + fe.b1 * kSymbolsPerFrame + kEqContextSymbols);
         Mat<cfloat> Y = src->Symbols(fe.s0, s1);
-        EqualizeAndDeinterleave(Y, mode, f0 - fe.s0, fsi.layers, fsi.groups, nullptr, &fe.Xt, &fe.Wt);
+        if (csi_full) {
+            Mat<float> csi(static_cast<size_t>(s1 - fe.s0), csi_full->cols);
+            std::copy((*csi_full)[fe.s0], (*csi_full)[s1 - 1] + csi_full->cols, csi.data());
+            DeinterleaveEqualized(Y, csi, mode, f0 - fe.s0, fsi.layers, fsi.groups, &fe.Xt, &fe.Wt);
+        } else {
+            EqualizeAndDeinterleave(Y, mode, f0 - fe.s0, fsi.layers, fsi.groups, nullptr, &fe.Xt, &fe.Wt);
+        }
         return fe;
     };
 
@@ -325,6 +349,16 @@ void DecodeSource(ISymbolSource* src, Mode mode, int block_frames,
 }
 
 }  // namespace
+
+DemodResult DemodulateEqualized(const Mat<cfloat>& D, const Mat<float>& csi, Mode mode, int block_frames) {
+    MatSource src(&D);
+    DemodResult out;
+    out.sync.gi_start0 = 0.0;
+    out.sync.n_sym = static_cast<int>(D.rows);
+    out.sync.fft_size = ModeParamsOf(mode).fft_size;
+    DecodeSource(&src, mode, block_frames, &out.fsi, &out.layers, &csi);
+    return out;
+}
 
 DemodResult Demodulate(std::vector<cfloat> iq, double fs, Mode mode, Gi gi, int block_frames) {
     CarrierSource src(std::move(iq), fs, mode, gi);

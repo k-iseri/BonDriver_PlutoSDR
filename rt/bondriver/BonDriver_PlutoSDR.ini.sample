@@ -31,6 +31,9 @@ Gain=
 AgcTargetDbfs=-24
 ; 1 = USB 瞬断などでストリームが切れたら自動で再接続する（既定）。0 = 切れたら停止
 Reconnect=1
+; FPGA 前段（pluto-fw-isdbt v2 の同期・FFT・等化器）。auto = ファームにあれば使う（既定）、0 = 使わない
+; （raw I/Q をホストで復調）、1 = 必須（無いファームでは開けない）。地デジのみ。CATV は常に raw
+FpgaEq=auto
 ; 伝送モードと GI（日本の実運用は Mode 3 / GI 1/8 固定）
 Mode=3
 GI=1/8

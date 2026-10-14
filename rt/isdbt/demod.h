@@ -72,6 +72,28 @@ void EqualizeAndDeinterleave(const Mat<cfloat>& Y, Mode mode, int frame_start,
                              const std::vector<std::vector<int>>& groups,
                              Mat<cfloat>* H_out, Mat<cfloat>* Xt, Mat<float>* Wt);
 
+// 等化済みキャリア（D = Y/H と CSI）からデインターリーブ以降。FPGA 等化器（pluto-fw-isdbt モード 4）の
+// 出力をホスト後段に渡す入口。EqualizeAndDeinterleave の等化部分を飛ばしたもの
+void DeinterleaveEqualized(const Mat<cfloat>& D, const Mat<float>& csi, Mode mode, int frame_start,
+                           const std::vector<RxLayer>& layers,
+                           const std::vector<std::vector<int>>& groups,
+                           Mat<cfloat>* Xt, Mat<float>* Wt);
+
+// 行列をそのまま返す ISymbolSource（等化済みキャリア行列のフレーム同期・復号用）
+class MatSource : public ISymbolSource {
+public:
+    explicit MatSource(const Mat<cfloat>* m) : m_(m) {}
+    int n_sym() const override { return static_cast<int>(m_->rows); }
+    Mat<cfloat> Symbols(int i0, int i1) override;
+private:
+    const Mat<cfloat>* m_;
+};
+
+// 等化済みキャリア行列 D (n_sym, total) と CSI → 階層ごとの TS（Demodulate の後段だけ）。
+// 同期情報は gi_start0 = 0（行 i はウィンドウ先頭 + i シンボル）として返す
+DemodResult DemodulateEqualized(const Mat<cfloat>& D, const Mat<float>& csi, Mode mode,
+                                int block_frames = 6);
+
 // 時間デインターリーブの参照先が揃う最初の受信フレーム番号
 int LayerFirstFrame(const RxLayer& lyr, int frame_start);
 

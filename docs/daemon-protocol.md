@@ -80,6 +80,9 @@ TVTest / EDCB
   起動オプションの固定値。
 - `locked` は同期が取れているか（地デジ: TMCC フレーム同期。ISDB-C: バイト同期かつ MER > 15 dB）。
 - `rs_uncorrectable` は起動（または選局）以降の RS 訂正不能 TSP 数。
+- SDR ライブ受信で FPGA 前段（pluto-fw-isdbt v2 の等化器）を使っているときは `fpga_eq`（true = モード 4 で
+  等化済みキャリアを受信中）、`fpga_delta`（整数 CFO [ビン]）、`fpga_symbols`（受けたシンボル数）、
+  `fpga_symbol_gaps`（連番の途切れ）が付く（2026-10-15 追加。すべて省略可で、無いクライアントは無視してよい）。
 - `dropped` はストリーム送信が実時間に追いつかず捨てた TSP 数。
 - ISDB-C（`"system": "isdbc"`）では `mode` / `gi` / `layers` の代わりに
   `"mer_db"`, `"acquired"`, `"byte_sync"`, `"inverted"`（スペクトル反転を検出した）, `"cfo_hz"`, `"clock_ppm"`,

@@ -95,6 +95,7 @@ public:
     // 外部 SDR 所有者から呼ぶ入力（SDR 受信スレッドから）
     void OnBlock(const cfloat* p, size_t n);
     void OnSdrEvent(bool up);
+    void OnSymbol(const EqSymbol& s);       // FPGA 等化モード（等化済みシンボル）
     // Start() の前に呼ぶ
     void SetFirstBurst(FirstBurst mode) { first_burst_ = mode; }
 
@@ -154,6 +155,11 @@ private:
     std::deque<std::vector<cfloat>> iq_q_;
     long long iq_total_ = 0;
     bool overflowed_ = false;
+    // FPGA 等化モード: 等化済みシンボル列（iq_q_ の代わり。同じ iq_mu_ で守る）
+    std::deque<EqSymbol> sym_q_;
+    static constexpr size_t kSymBound = 12000;      // 待ち上限 ≈ 13.6 s（1 シンボル 17 KB）
+    std::atomic<bool> sym_mode_{false};             // 等化済みシンボルが届いている
+    std::atomic<long long> sym_gaps_{0};            // 連番の途切れ（窓の欠け）の回数
     // 選局直後の暫定信号レベル: 最初のウィンドウが復調されるまで（約 6 秒）MER が無いので、GI 相関から
     // C/N を見積もって signal_db に入れる。TVTest のチャンネルスキャンは待ち時間（既定 5 秒）経過時点で
     // 信号レベル ≥ 7 dB か SDT 受信済みでなければ即座に次へ進むため（2026-10-14、ChannelScan.cpp より）

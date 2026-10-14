@@ -88,6 +88,7 @@ private:
     IFeed* ActiveLocked() { return isdbc_ ? static_cast<IFeed*>(isdbc_.get()) : static_cast<IFeed*>(isdbt_.get()); }
     void ForwardBlock(const cfloat* p, size_t n);
     void ForwardEvent(bool up);
+    void ForwardSymbol(const EqSymbol& s);
 
     LiveParams p_;
     SdrSource sdr_;

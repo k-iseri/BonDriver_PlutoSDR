@@ -47,6 +47,19 @@ struct SdrConfig {
     size_t block_samples = 1 << 20; // 1 ブロックの複素サンプル数（≈129 ms, 4 MiB）
     size_t nb_blocks = 4;           // デバイス側のブロック数（≈516 ms 分のバッファ）
     bool reconnect = true;          // ストリームエラー時に自動再接続する（USB 瞬断対策）
+    // FPGA 前段（pluto-fw-isdbt モード 4: 同期・FFT・等化を FPGA で行い、等化済みキャリア I/Q/CSI 各 8bit を
+    // 受け取る）。-1 = 自動（CAPS bit3 があれば使う）、0 = 使わない（raw I/Q）、1 = 必須（無ければ Start が失敗）。
+    // 選局直後は raw I/Q でソフト AGC を約 1 秒走らせ、モード 3（同期 FFT）で整数 CFO を求めてからモード 4 へ移る
+    int fpga_eq = -1;
+};
+
+// FPGA 等化器の 1 シンボル（キャリア順）。I/Q は 1/64 単位の int8、CSI は 1/64 単位の uint8
+struct EqSymbol {
+    uint64_t start = 0;             // 窓開始の ADC サンプル番号（FPGA のサンプルカウンタ）
+    uint32_t seq = 0;               // 窓の連番（欠けの検出用）
+    int32_t delta_q = 0;            // 窓タイミングの小数部 Δ_n（1/256 サンプル）
+    uint32_t status = 0;            // 同期の status_word
+    std::vector<uint8_t> raw;       // 5617 × {I8, Q8, CSI8}
 };
 
 class SdrSource {
@@ -55,6 +68,7 @@ public:
     // up=false: ストリームが切れた（以降のサンプルは不連続。呼び出し側は継ぎ目を仕切り直す）。
     // up=true: 再接続して受信を再開した。どちらも受信スレッドから呼ばれる（on_block と同じスレッド）。
     using EventFn = std::function<void(bool up)>;
+    using SymbolFn = std::function<void(const EqSymbol&)>;   // FPGA 等化モードの 1 シンボル（受信スレッドから）
 
     ~SdrSource();
 
@@ -67,7 +81,7 @@ public:
 
     // 接続・設定して受信スレッドを開始する。初回接続の失敗は std::runtime_error
     //（設定ミスを呼び出し元へ即座に伝える。再接続するのはいったん開けた後のエラーだけ）。
-    void Start(const SdrConfig& cfg, BlockFn on_block, EventFn on_event = {});
+    void Start(const SdrConfig& cfg, BlockFn on_block, EventFn on_event = {}, SymbolFn on_symbol = {});
     // LO だけ変更（ストリームは止めない）。例外を投げない:
     // 切断中は周波数を記録するだけで、再接続時に適用される。
     void Retune(double freq_hz);
@@ -91,6 +105,13 @@ public:
     double gain_db() const { return gain_db_; }             // 現在の hardwaregain（AGC モードでも）
     double level_dbfs() const { return level_dbfs_; }       // 直近の帯域内平均電力
     int sample_bytes() const { return sample_bytes_; }      // 接続中のファームの 1 複素サンプルのバイト数（4 / 2）
+    // FPGA 前段
+    bool fpga_capable() const { return fpga_capable_; }     // ファームに等化器がある（CAPS bit3）
+    bool fpga_eq() const { return fpga_eq_; }               // モード 4 で等化済みシンボルを受信中
+    int fpga_delta() const { return fpga_delta_; }          // 整数 CFO δ [ビン]
+    uint32_t fpga_sync_status() const { return fe_sync_status_; }
+    uint32_t fpga_eq_status() const { return fe_eq_status_; }
+    long long fpga_symbols() const { return fpga_symbols_; }
 
 private:
     void Run();
@@ -102,6 +123,7 @@ private:
     SdrConfig cfg_;                 // freq_hz は Retune で更新される現在値
     BlockFn on_block_;
     EventFn on_event_;
+    SymbolFn on_symbol_;
     std::thread thread_;
     std::mutex mu_;                 // impl_ のハンドルと cfg_.freq_hz を守る（Retune ↔ 再接続）
     std::condition_variable cv_;    // 再接続バックオフ待ちを Stop() で即中断するため
@@ -116,6 +138,12 @@ private:
     std::atomic<double> level_dbfs_{-100.0};
     std::atomic<int> sample_bytes_{4};
     std::atomic<int> pack_shift_{4};        // 8bit ファームの 12→8bit シフト量（FORMAT レジスタ。無ければ 4）
+    std::atomic<bool> fpga_capable_{false};
+    std::atomic<bool> fpga_eq_{false};
+    std::atomic<int> fpga_delta_{0};
+    std::atomic<uint32_t> fe_sync_status_{0}, fe_eq_status_{0};
+    std::atomic<long long> fpga_symbols_{0};
+    std::atomic<bool> fe_restart_{false};   // Retune: raw からやり直す（AGC → δ → モード 4）
     volatile long long blocks_ = 0;
     std::string desc_;
 };

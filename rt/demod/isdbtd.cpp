@@ -666,6 +666,7 @@ void Usage() {
         "                      USB 2.0 の帯域対策）/ 8bit パッキングファーム = 8126984（公称）)\n"
         "  --gain F | hw       手動ゲイン dB / AD936x の slow_attack AGC。省略時はソフト AGC\n"
         "  --agc-target F      ソフト AGC の目標帯域内レベル dBFS (default -24)\n"
+        "  --fpga-eq auto|0|1  FPGA 前段（pluto-fw-isdbt v2 の同期・FFT・等化）を使う (default auto)\n"
         "  --bw F              RF 帯域幅 Hz を固定（省略時は方式ごとの既定: 地デジ 5.6 MHz / ISDB-C 6 MHz）\n"
         "  --no-reconnect      ストリームエラー時に自動再接続しない（既定は再接続）\n"
         "  --win-frames N      ウィンドウの新規フレーム数 (default 8。選局後の遅延 vs CPU 効率)\n"
@@ -709,6 +710,7 @@ int main(int argc, char** argv) {
             else { sdr_cfg.agc = false; sdr_cfg.gain_db = std::atof(g.c_str()); }
         }
         else if (a == "--agc-target") sdr_cfg.agc_target_dbfs = std::atof(next().c_str());
+        else if (a == "--fpga-eq") { const std::string v = next(); sdr_cfg.fpga_eq = (v == "0") ? 0 : (v == "1") ? 1 : -1; }
         else if (a == "--no-reconnect") sdr_cfg.reconnect = false;
         else if (a == "--dump-iq") dump_iq = next();
         else if (a == "--win-frames") win_frames = std::atoi(next().c_str());

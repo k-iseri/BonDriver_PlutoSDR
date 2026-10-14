@@ -29,7 +29,8 @@ LiveDemod::LiveDemod(SdrConfig cfg, Mode mode, Gi gi, int new_frames, int ctx_fr
 void LiveDemod::Start() {
     if (!external_) {
         sdr_->Start(cfg_, [this](const cfloat* p, size_t n) { OnBlock(p, n); },
-                    [this](bool up) { OnSdrEvent(up); });
+                    [this](bool up) { OnSdrEvent(up); },
+                    [this](const EqSymbol& s) { OnSymbol(s); });
     }
     skip_samples_ = static_cast<long long>(kRetuneSkipSeconds * cfg_.fs);
     quick_level_pending_ = true;
@@ -82,6 +83,8 @@ void LiveDemod::Tune(bool has_ch, int ch, double freq) {
     std::lock_guard<std::mutex> lock(mu_);
     ++gen_;                 // 仕掛かり中のウィンドウ結果は捨てる
     iq_q_.clear();
+    sym_q_.clear();
+    sym_mode_ = false;
     has_channel_ = has_ch;
     channel_ = ch;
     freq_hz_ = freq;
@@ -118,6 +121,10 @@ std::string LiveDemod::StatusJson() {
     s += ", \"underruns\": " + std::to_string(underruns_);
     s += ", \"frames_lost\": " + std::to_string(frames_lost_);
     s += ", \"sdr_blocks\": " + std::to_string(sdr_->blocks());
+    s += ", \"fpga_eq\": " + std::string(sdr_->fpga_eq() ? "true" : "false");
+    s += ", \"fpga_delta\": " + std::to_string(sdr_->fpga_delta());
+    s += ", \"fpga_symbols\": " + std::to_string(sdr_->fpga_symbols());
+    s += ", \"fpga_symbol_gaps\": " + std::to_string(sym_gaps_.load());
     s += ", \"sdr_connected\": " + std::string(sdr_->connected() ? "true" : "false");
     s += ", \"sdr_reconnects\": " + std::to_string(sdr_->reconnects());
     s += ", \"hw_ovf\": " + std::to_string(sdr_->hw_ovf());
@@ -185,6 +192,25 @@ void LiveDemod::OnBlock(const cfloat* p, size_t n) {
     iq_cv_.notify_one();
 }
 
+// FPGA 等化モードの 1 シンボル（SDR 受信スレッドから）
+void LiveDemod::OnSymbol(const EqSymbol& s) {
+    const double t = std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    // FPGA のシンボルは公称レートの 1 シンボル分の入力に相当する（レート監視は入力サンプル単位）
+    if (rate_mon_.Feed(static_cast<long long>(std::llround(SymbolSamples(mode_, gi_) * in_per_nominal_)), t)) {
+        rx_rate_ = rate_mon_.rate();
+        rx_slow_ = rate_mon_.slow();
+    }
+    std::lock_guard<std::mutex> lock(iq_mu_);
+    if (sym_q_.size() > kSymBound) {        // 復調が追いつかない: 全部捨てて仕切り直し
+        sym_q_.clear();
+        overflowed_ = true;
+    }
+    sym_q_.push_back(s);
+    sym_mode_ = true;
+    iq_cv_.notify_one();
+}
+
 // SDR の切断/再接続（sdr_source の自動再接続）。受信スレッドから呼ばれる。
 // 切断をまたいだサンプルは不連続なので、オーバーフロー時と同じ経路で
 // パイプラインを仕切り直す（SchedLoop が ResetSplice する。underruns にも数えられるが、
@@ -198,6 +224,7 @@ void LiveDemod::OnSdrEvent(bool up) {
         std::lock_guard<std::mutex> lock(iq_mu_);
         iq_q_.clear();
         iq_total_ = 0;
+        sym_q_.clear();
         overflowed_ = true;
     }
     iq_cv_.notify_all();
@@ -231,6 +258,11 @@ void LiveDemod::SchedLoop() {
     long long acc_abs0 = 0, abs_in = 0;
     long long cur_gen = 0;
     std::deque<WindowJob> jobs;
+    // FPGA 等化モード: シンボル単位のウィンドウ（連番が途切れたら組み直す）
+    std::vector<EqSymbol> acc_sym;
+    uint32_t last_seq = 0;
+    bool have_seq = false;
+    auto win_syms_for = [&](int nf, int ctx) { return static_cast<size_t>(ctx + nf + 1) * kSymbolsPerFrame; };
     // 仕掛かり数は現世代のジョブだけ数える。選局前のジョブ（1 本 4〜5 秒）を待っていると
     // 次のチャンネルの最初のウィンドウが遅れ、信号のあるチャンネルが続くとスキャンが交互に落ちる
     auto active_jobs = [&]() {
@@ -244,14 +276,30 @@ void LiveDemod::SchedLoop() {
         {
             std::unique_lock<std::mutex> lock(iq_mu_);
             iq_cv_.wait_for(lock, std::chrono::milliseconds(200),
-                            [&] { return !iq_q_.empty() || stop_; });
+                            [&] { return !iq_q_.empty() || !sym_q_.empty() || stop_; });
             if (overflowed_) {
                 overflowed_ = false;
                 acc.clear();
+                acc_sym.clear();
+                have_seq = false;
                 cur_new = first_new;
                 lock.unlock();
                 ResetSplice(&cur_gen);
                 lock.lock();
+            }
+            while (!sym_q_.empty()) {
+                EqSymbol& s = sym_q_.front();
+                if (have_seq && s.seq != last_seq + 1) {
+                    // 窓の欠け（FPGA の同期ミス・USB 取りこぼし）: 継ぎ目をまたぐウィンドウは作れないので
+                    // 溜めた分を捨てて組み直す。継ぎ位置は絶対サンプル番号（start）で決まるので Emit の
+                    // アンカーはそのまま（弱い局で窓が頻繁に欠けても underruns を膨らませない）
+                    acc_sym.clear();
+                    ++sym_gaps_;
+                }
+                last_seq = s.seq;
+                have_seq = true;
+                acc_sym.push_back(std::move(s));
+                sym_q_.pop_front();
             }
             while (!iq_q_.empty()) {
                 auto& blk = iq_q_.front();
@@ -267,6 +315,8 @@ void LiveDemod::SchedLoop() {
             if (gen_ != cur_gen) {          // tune された
                 cur_gen = gen_;
                 acc.clear();
+                acc_sym.clear();
+                have_seq = false;
                 cur_new = first_new;
                 anchored_ = false;
                 last_emitted_ = -1;
@@ -288,8 +338,46 @@ void LiveDemod::SchedLoop() {
             cur_new = first_new;
             ResetSplice(&cur_gen);
         }
+        // FPGA 等化モードのウィンドウ投入（等化済みシンボル → デインターリーブ以降だけ）
+        if (sym_mode_ && !acc_sym.empty()) {
+            std::lock_guard<std::mutex> lock(mu_);
+            if (!locked_ && mer_db_ == 0.0) mer_db_ = 10.0;     // 暫定レベル（FPGA が同期しているので信号はある）
+        }
+        while (sym_mode_ && acc_sym.size() >= win_syms_for(cur_new, cur_new == first_new ? first_ctx : ctx_frames_) &&
+               active_jobs() < workers_) {
+            const bool first = (cur_new == first_new);
+            const size_t win_syms = win_syms_for(cur_new, first ? first_ctx : ctx_frames_);
+            const size_t adv_syms = static_cast<size_t>(first ? std::max(1, cur_new - (ctx_frames_ - first_ctx)) : cur_new) *
+                                    kSymbolsPerFrame;
+            cur_new = new_frames_;
+            const int total = ModeParamsOf(mode_).total_carriers;
+            auto D = std::make_shared<Mat<cfloat>>(win_syms, static_cast<size_t>(total));
+            auto csi = std::make_shared<Mat<float>>(win_syms, static_cast<size_t>(total));
+            for (size_t r = 0; r < win_syms; ++r) {
+                const uint8_t* raw = acc_sym[r].raw.data();
+                cfloat* d = (*D)[r];
+                float* c = (*csi)[r];
+                for (int k = 0; k < total; ++k) {
+                    d[k] = cfloat(static_cast<int8_t>(raw[k * 3]) / 64.0f, static_cast<int8_t>(raw[k * 3 + 1]) / 64.0f);
+                    c[k] = raw[k * 3 + 2] / 64.0f;
+                }
+            }
+            WindowJob job;
+            job.gen = cur_gen;
+            // FPGA のサンプルカウンタは公称レート。Emit は入力サンプル単位で継ぐので換算しておく
+            job.abs0 = static_cast<long long>(std::llround(static_cast<double>(acc_sym[0].start) * in_per_nominal_));
+            job.fut = std::async(std::launch::async, [this, D, csi]() -> std::shared_ptr<DemodResult> {
+                try {
+                    return std::make_shared<DemodResult>(DemodulateEqualized(*D, *csi, mode_));
+                } catch (const std::exception&) {
+                    return nullptr;
+                }
+            });
+            jobs.push_back(std::move(job));
+            acc_sym.erase(acc_sym.begin(), acc_sym.begin() + static_cast<std::ptrdiff_t>(adv_syms));
+        }
         // ウィンドウの投入（仕掛かりは workers_ まで）
-        while (static_cast<long long>(acc.size()) >=
+        while (!sym_mode_ && static_cast<long long>(acc.size()) >=
                    win_samples_for(cur_new, cur_new == first_new ? first_ctx : ctx_frames_) &&
                active_jobs() < workers_) {
             const bool first = (cur_new == first_new);

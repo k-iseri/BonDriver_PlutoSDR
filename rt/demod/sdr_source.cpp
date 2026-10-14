@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <vector>
 
@@ -18,7 +19,7 @@ namespace isdbt {
 
 struct SdrSource::Impl {};
 SdrSource::~SdrSource() {}
-void SdrSource::Start(const SdrConfig&, BlockFn, EventFn) {
+void SdrSource::Start(const SdrConfig&, BlockFn, EventFn, SymbolFn) {
     throw std::runtime_error(
         "libiio 無しでビルドされている。rt\\third_party\\fetch_libiio.ps1 を実行してから make rt し直す");
 }
@@ -76,6 +77,47 @@ constexpr uint32_t kRegCntFormat = 0x3018;  // bit[7:0] = pack8 の右シフト�
 constexpr uint32_t kCntMagic = 0x49534442;
 constexpr long long kSamplesPerBeat = 2;    // 1R1T では 16bit/8bit どちらも 1 ビート = 複素 2 サンプル
 
+// pluto-fw-isdbt v2 の前段レジスタ（rtl/isdbt_regs.v）と DMA フレーム（rtl/isdbt_fe_out.v）
+constexpr uint32_t kRegCaps = 0x301C;       // bit0 8bit、bit1 カウンタ、bit2 FFT 出力、bit3 等化済みキャリア出力
+constexpr uint32_t kRegMode = 0x3020;       // 0 raw I/Q、3 同期 FFT 8bit ビン、4 等化済みキャリア
+constexpr uint32_t kRegDecim = 0x302C;
+constexpr uint32_t kRegSyncStatus = 0x3038;
+constexpr uint32_t kRegEqCtrl = 0x3040;     // bit[7:0] δ、bit8 AFC、bit9 CPE
+constexpr uint32_t kRegEqStatus = 0x3044;
+constexpr uint32_t kCapsEq = 1u << 3;
+constexpr uint32_t kHdrMagic = 0x49534254;  // "ISBT"
+constexpr int kFeN = 8192;
+constexpr int kFeTotal = 5617;
+constexpr int kFeCenter = 2808;
+constexpr int kFeEqWords = (kFeTotal * 3 + 3) / 4;   // 4213
+constexpr int kFeSettleBlocks = 8;          // raw でソフト AGC を走らせる時間（≈ 1 秒）
+constexpr int kFeCfoFrames = 16;            // 整数 CFO 推定に使う同期 FFT の窓数
+constexpr int kFeCfoTimeoutBlocks = 40;     // モード 3 で窓が来ないときの諦め（≈ 5 秒 → raw へ戻してやり直す）
+
+// DMA ワード列から前段フレーム（ヘッダ 8 ワード + 本体）を切り出す。ブロック境界をまたぐので持ち越す
+class FeParser {
+public:
+    void Reset() { buf_.clear(); }
+    template <typename Fn>
+    void Feed(const uint8_t* p, size_t n, Fn&& on_frame) {
+        buf_.insert(buf_.end(), p, p + n);
+        size_t pos = 0;
+        while (buf_.size() - pos >= 32) {
+            const uint32_t* w = reinterpret_cast<const uint32_t*>(buf_.data() + pos);
+            if (w[0] != kHdrMagic) { pos += 4; continue; }
+            const int fmt = static_cast<int>((w[1] >> 24) & 3);
+            const size_t nw = (fmt == 2) ? kFeEqWords : (fmt == 1) ? kFeN / 2 : kFeN;
+            if (buf_.size() - pos < (8 + nw) * 4) break;
+            on_frame(w, fmt, nw);
+            if (buf_.empty()) return;       // コールバックが Reset() した
+            pos += (8 + nw) * 4;
+        }
+        if (pos) buf_.erase(buf_.begin(), buf_.begin() + static_cast<std::ptrdiff_t>(pos));
+    }
+private:
+    std::vector<uint8_t> buf_;
+};
+
 }  // namespace
 
 struct SdrSource::Impl {
@@ -115,10 +157,11 @@ int SdrSource::ProbeSampleBytes(const std::string& uri) {
     return bytes;
 }
 
-void SdrSource::Start(const SdrConfig& cfg, BlockFn on_block, EventFn on_event) {
+void SdrSource::Start(const SdrConfig& cfg, BlockFn on_block, EventFn on_event, SymbolFn on_symbol) {
     impl_ = new Impl;
     on_block_ = std::move(on_block);
     on_event_ = std::move(on_event);
+    on_symbol_ = std::move(on_symbol);
     cfg_ = cfg;
     Connect();          // 初回は同期（失敗はそのまま投げる）。以降のエラーは Run が再接続する
     desc_ = "sdr:" + cfg_.uri;
@@ -202,6 +245,13 @@ void SdrSource::Connect() {
                 shift = 4;
             }
             pack_shift_ = static_cast<int>(shift);
+            // FPGA 前段（等化器）の有無。接続のたびに raw（モード 0）から始める
+            uint32_t caps = 0;
+            fpga_capable_ = hw_counter_ && iio_device_reg_read(rxdev, kPcoreRegMagic | kRegCaps, &caps) == 0 &&
+                            (caps & kCapsEq) != 0;
+            if (fpga_capable_) (void)iio_device_reg_write(rxdev, kPcoreRegMagic | kRegMode, 0);
+            if (cfg_.fpga_eq == 1 && !fpga_capable_) throw std::runtime_error("fpga_eq=1 だがファームに等化器が無い（CAPS bit3）");
+            fpga_eq_ = false;
         }
     } catch (...) {
         if (im.stream) iio_stream_destroy(im.stream);
@@ -235,6 +285,7 @@ void SdrSource::Retune(double freq_hz) {
     if (!connected_ || !impl_->phy_lo) return;      // 再接続時に Connect() が適用する
     try {
         WriteAttr(impl_->phy_lo, "frequency", FormatLL(freq_hz));
+        if (fpga_capable_) fe_restart_ = true;      // raw からやり直す（AGC → δ → モード 4）
     } catch (const std::exception& e) {
         // デバイスが消えた直後など。ストリーム側もすぐエラーになり再接続が走るので、
         // ここでは記録だけ（cfg_.freq_hz は更新済みなので再接続後に正しい周波数になる）
@@ -265,6 +316,10 @@ void SdrSource::Stop() {
     }
     cv_.notify_all();           // 再接続バックオフ待ちを起こす
     if (thread_.joinable()) thread_.join();
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (fpga_capable_ && connected_ && impl_->rxdev) (void)iio_device_reg_write(impl_->rxdev, kPcoreRegMagic | kRegMode, 0);
+    }
     Teardown();
     delete impl_;
     impl_ = nullptr;
@@ -300,6 +355,28 @@ void SdrSource::Run() {
     constexpr int kAgcBlocks = 4;   // 約 0.5 秒
     double agc_acc = 0.0, agc_cnt = 0.0;
     int agc_blocks = 0;
+    // FPGA 前段の状態: raw（AGC）→ cfo（モード 3 で整数 CFO）→ eq（モード 4）
+    enum class Fe { kRaw, kCfo, kEqWait, kEq };
+    Fe fe = Fe::kRaw;
+    int fe_blocks = 0;
+    FeParser parser;
+    std::vector<double> cfo_pow(static_cast<size_t>(kFeN), 0.0);
+    int cfo_frames = 0;
+    const bool fe_wanted = fpga_capable_ && cfg_.fpga_eq != 0 && on_symbol_;
+    FILE* fe_dump = nullptr;            // 開発用: ISDBT_FE_DUMP=path で前段フレーム列をそのまま書く
+    if (const char* dp = std::getenv("ISDBT_FE_DUMP")) fe_dump = std::fopen(dp, "wb");
+    auto fe_write = [&](uint32_t reg, uint32_t v) {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (connected_ && impl_->rxdev) (void)iio_device_reg_write(impl_->rxdev, kPcoreRegMagic | reg, v);
+    };
+    auto fe_to_raw = [&]() {
+        fe_write(kRegMode, 0);
+        fe = Fe::kRaw;
+        fe_blocks = 0;
+        fpga_eq_ = false;
+        parser.Reset();
+    };
+    auto fe_car0 = [&]() { return (kFeCenter - fpga_delta_ + kFeTotal) % kFeTotal; };
     while (!stop_) {
         const iio_block* blk = iio_stream_get_next_block(impl_->stream);
         if (iio_err(blk)) {
@@ -329,10 +406,99 @@ void SdrSource::Run() {
                 backoff_ms = 500;
                 ovf_usable = true;
                 ovf_armed = false;
+                fe = Fe::kRaw;          // Connect() がモード 0 にしている
+                fe_blocks = 0;
+                fpga_eq_ = false;
+                parser.Reset();
                 std::fprintf(stderr, "sdr: reconnected (#%lld)\n",
                              static_cast<long long>(reconnects_));
                 if (on_event_) on_event_(true);
                 break;
+            }
+            continue;
+        }
+        if (fe_restart_.exchange(false) && fe != Fe::kRaw) fe_to_raw();
+        if (fe != Fe::kRaw) {
+            // ---- FPGA 前段のフレーム列（32bit ワード）----
+            const uint8_t* p = static_cast<const uint8_t*>(iio_block_start(blk));
+            const uint8_t* e = static_cast<const uint8_t*>(iio_block_end(blk));
+            ++blocks_;
+            ++fe_blocks;
+            if (fe_dump) std::fwrite(p, 1, static_cast<size_t>(e - p), fe_dump);
+            parser.Feed(p, static_cast<size_t>(e - p), [&](const uint32_t* w, int fmt, size_t /*nw*/) {
+                if (fe == Fe::kCfo && fmt == 1) {
+                    // 同期 FFT 8bit ビン: 電力を積算して帯域（5617 本）の位置から整数 CFO を求める
+                    const int8_t* b = reinterpret_cast<const int8_t*>(w + 8);
+                    for (int i = 0; i < kFeN; ++i) {
+                        const double bi = b[2 * i], bq = b[2 * i + 1];
+                        cfo_pow[static_cast<size_t>(i)] += bi * bi + bq * bq;
+                    }
+                    if (++cfo_frames >= kFeCfoFrames) {
+                        int best_d = 0;
+                        double best_e = -1.0;
+                        for (int d = -100; d <= 100; ++d) {
+                            double e_sum = 0.0;
+                            for (int k = 0; k < kFeTotal; ++k) {
+                                const int bin = ((k - kFeCenter + d) % kFeN + kFeN) % kFeN;   // キャリア k のビン
+                                e_sum += cfo_pow[static_cast<size_t>(bin)];
+                            }
+                            if (e_sum > best_e) { best_e = e_sum; best_d = d; }
+                        }
+                        if (std::abs(best_d) >= 60) {
+                            // 帯域が見えていない（無信号・取り込み不良）。raw に戻して AGC からやり直す
+                            std::fprintf(stderr, "sdr: fpga front-end: integer CFO estimate %d unreliable; retrying\n", best_d);
+                            fe_to_raw();
+                            return;
+                        }
+                        fpga_delta_ = best_d;
+                        // いったんモード 0 に戻してから等化へ（tools/fe_eq_test.py と同じ手順。モード 3 から直接 4 に
+                        // すると時間軸のずれ Δ が −10 サンプル以上に育ち MER が 10 dB 台に落ちた、2026-10-15）
+                        fe_write(kRegMode, 0);
+                        fe = Fe::kEqWait;
+                        fe_blocks = 0;
+                        parser.Reset();
+                        std::fprintf(stderr, "sdr: fpga front-end: integer CFO %d bins\n", best_d);
+                    }
+                } else if (fe == Fe::kEq && fmt == 2) {
+                    EqSymbol sym;
+                    sym.start = static_cast<uint64_t>(w[2]) | (static_cast<uint64_t>(w[3]) << 32);
+                    sym.seq = w[4];
+                    sym.delta_q = static_cast<int32_t>(w[5]);
+                    sym.status = w[7];
+                    sym.raw.resize(static_cast<size_t>(kFeTotal) * 3);
+                    // FPGA はビン順（キャリア car0 から 5616、続いて 0 から）で出す → キャリア順へ
+                    const uint8_t* b = reinterpret_cast<const uint8_t*>(w + 8);
+                    const int car0 = fe_car0();
+                    for (int k = 0; k < kFeTotal; ++k) {
+                        const int i = (k - car0 + kFeTotal) % kFeTotal;
+                        sym.raw[static_cast<size_t>(k) * 3 + 0] = b[i * 3 + 0];
+                        sym.raw[static_cast<size_t>(k) * 3 + 1] = b[i * 3 + 1];
+                        sym.raw[static_cast<size_t>(k) * 3 + 2] = b[i * 3 + 2];
+                    }
+                    ++fpga_symbols_;
+                    on_symbol_(sym);
+                }
+            });
+            if (fe == Fe::kEqWait && fe_blocks >= 2) {       // ≈ 260 ms モード 0 で待ってから等化へ
+                fe_write(kRegEqCtrl, static_cast<uint32_t>(fpga_delta_.load() & 0xFF) | (0x3u << 8));
+                fe_write(kRegMode, 4);
+                fe = Fe::kEq;
+                fe_blocks = 0;
+                fpga_eq_ = true;
+                std::fprintf(stderr, "sdr: fpga front-end: equalized carriers (mode 4)\n");
+            }
+            if (fe == Fe::kCfo && fe_blocks > kFeCfoTimeoutBlocks) {
+                std::fprintf(stderr, "sdr: fpga front-end: no synchronized windows (not locked?); retrying\n");
+                fe_to_raw();
+            }
+            if (ovf_usable && --ovf_countdown <= 0) {
+                ovf_countdown = kOvfCheckBlocks;
+                uint32_t v = 0;
+                std::lock_guard<std::mutex> lk(mu_);
+                if (connected_ && impl_->rxdev) {
+                    if (iio_device_reg_read(impl_->rxdev, kPcoreRegMagic | kRegSyncStatus, &v) == 0) fe_sync_status_ = v;
+                    if (iio_device_reg_read(impl_->rxdev, kPcoreRegMagic | kRegEqStatus, &v) == 0) fe_eq_status_ = v;
+                }
             }
             continue;
         }
@@ -356,6 +522,16 @@ void SdrSource::Run() {
         }
         ++blocks_;
         if (on_block_) on_block_(out.data(), n);
+        // raw で AGC が落ち着いたら FPGA 前段へ（モード 3 で整数 CFO を求めてからモード 4）
+        if (fe_wanted && ++fe_blocks >= kFeSettleBlocks) {
+            parser.Reset();
+            std::fill(cfo_pow.begin(), cfo_pow.end(), 0.0);
+            cfo_frames = 0;
+            fe_write(kRegDecim, 1);
+            fe_write(kRegMode, 3);
+            fe = Fe::kCfo;
+            fe_blocks = 0;
+        }
         // ソフトウェア AGC: 帯域内平均電力（間引き）を測り、約 0.5 秒ごとに hardwaregain を目標へ寄せる
         {
             double acc = 0.0;
@@ -426,6 +602,7 @@ void SdrSource::Run() {
             }
         }
     }
+    if (fe_dump) std::fclose(fe_dump);
 }
 
 #endif  // ISDBT_WITH_LIBIIO
