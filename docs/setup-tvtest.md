@@ -130,6 +130,14 @@ UHF/CATV 帯のチャンネルに載っている。`BonDriver_PlutoSDR_TC.dll` �
 5. 1 つのチャンネルに複数の TS が多重（TSMF）されている局では、ini の `[CATV] Ts=` で
    相対 TS 番号を指定できる（既定は最小番号の TS）。
 
+## 9. カスタムファームウェア（任意、HamGeek PlutoSDR Nano）
+
+[pluto-fw-isdbt](https://github.com/k-iseri/pluto-fw-isdbt) を書くと、I/Q が 8bit で転送されて USB 2.0 の
+帯域余裕が約 2 倍になり（公称 8.127 MSPS でそのまま取り込む）、サンプル落ちを FPGA が数えて
+ログ統計 `hw_dropped` に出る。v1.2.0 以降の DLL は接続時にファームを自動判別するので、ini はそのままでよい
+（`[SDR] Fs` は空のまま）。対象基板・書き込み・戻し方は向こうの README を参照。
+純正ファームでも動作は従来どおりで、ファームを入れないと使えない機能は無い。
+
 ## 補足
 
 - 録画（EDCB）でも同じ DLL・ini が使える。配置方法は TVTest と同じ。
