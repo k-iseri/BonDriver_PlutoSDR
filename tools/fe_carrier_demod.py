@@ -22,10 +22,11 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "ref"))
-from isdbt import demod, measure, params as P  # noqa: E402
+from isdbt import demod, measure, params as P, pilots  # noqa: E402
 
 REG = 0x80000000
 R_MAGIC, R_MODE, R_DECIM, R_STATUS, R_FRAMES = 0x3000, 0x3020, 0x302C, 0x3030, 0x3034
+R_SYNC_STATUS, R_SYNC_PEAK = 0x3038, 0x303C
 HDR_MAGIC = 0x49534254
 N, NG, T = 8192, 1024, 9216
 FS = 512e6 / 63
@@ -86,6 +87,13 @@ def integer_cfo_from_bins(Yb: np.ndarray, search: int = 100) -> int:
     return best[0]
 
 
+def sync_state_str(sy: int, pk: int) -> str:
+    """SYNC_STATUS / SYNC_PEAK（ファーム v2b3a-diag 以降。旧ファームは 0）を人が読める形に。"""
+    st = ("ACQ", "TRACK", "?", "?")[sy >> 30]
+    return (f"sync {st} search {(sy >> 29) & 1} locked {(sy >> 28) & 1} miss {(sy >> 24) & 0xF} "
+            f"acq_fail {(sy >> 16) & 0xFF} lock_losses {sy & 0xFFFF} avg_peak_hi {pk >> 16} peak_hi {pk & 0xFFFF}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--uri", default="usb:")
@@ -96,7 +104,17 @@ def main():
     ap.add_argument("--sec", type=float, default=2.0, help="取り込む秒数")
     ap.add_argument("--settle", type=float, default=2.0)
     ap.add_argument("--ts-ref", default=str(ROOT / "testdata" / "synthetic" / "std_mode3_gi8_layerB.ts"))
+    ap.add_argument("--dump", default=None, help="取り込んだ窓（ヘッダ + ビン）を npz に保存")
+    ap.add_argument("--ts-out", default=None, help="復号した階層 TS を npz（A, B: (n, 188) uint8）に保存")
+    ap.add_argument("--load", default=None, help="取り込みの代わりに --dump した npz を読む（オフライン解析）")
     args = ap.parse_args()
+    if args.load:
+        z = np.load(args.load)
+        Yd = z["Y"]                                   # NpzFile は添字ごとに読み直すので一度だけ取り出す
+        hd = {k: z[k] for k in ("mode", "dropped", "blk_exp", "start", "seq", "cfo_inc", "status")}
+        frames = [({k: int(hd[k][i]) for k in hd}, Yd[i]) for i in range(len(hd["seq"]))]
+        analyze(frames, args)
+        return
 
     os.environ["PATH"] = str(Path(sys.executable).parent) + os.pathsep + os.environ["PATH"]
     import iio
@@ -122,6 +140,7 @@ def main():
         blk.write(bytearray(tx.tobytes()))
         blk.enqueue(None, True)
         tx_bs.started = True
+        time.sleep(1.0)      # 大きい TX ブロック（1 フレーム 7.5 MB）は走り出すまで時間がかかる
     else:
         freq = args.freq if args.freq else 473_142_857.0 + 6_000_000.0 * (args.ch - 13)
         phy.find_channel("altvoltage0", True).attrs["frequency"].value = str(int(freq))
@@ -140,7 +159,8 @@ def main():
         f0 = rx.reg_read(REG | R_FRAMES)
         time.sleep(0.5)
         f1 = rx.reg_read(REG | R_FRAMES)
-        print(f"fe frames/s ≈ {2 * (f1 - f0)} (expect {FS / T:.0f})")
+        print(f"fe frames/s ~ {2 * (f1 - f0)} (expect {FS / T:.0f})")
+        print("  " + sync_state_str(rx.reg_read(REG | R_SYNC_STATUS), rx.reg_read(REG | R_SYNC_PEAK)))
         if f1 == f0:
             sys.exit("no windows (sync not locked)")
         st = iio.Stream(rx.get_buffer(0), rx_mask, 1 << 19, nb_blocks=4)    # 1 MB ブロック
@@ -163,6 +183,14 @@ def main():
 
     frames = parse_frames(b"".join(chunks))
     print(f"frames {len(frames)}")
+    if args.dump:
+        np.savez_compressed(args.dump, Y=np.array([y for _, y in frames], dtype=np.complex64),
+                            **{k: np.array([h[k] for h, _ in frames], dtype=np.int64)
+                               for k in ("mode", "dropped", "blk_exp", "start", "seq", "cfo_inc", "status")})
+    analyze(frames, args)
+
+
+def analyze(frames, args):
     if len(frames) < 300:
         sys.exit("too few frames")
     seqs = np.array([h["seq"] for h, _ in frames])
@@ -179,10 +207,48 @@ def main():
     Yb = np.array([y for _, y in frames])                     # (n_sym, 8192) ビン順（DC = 0）
     delta = integer_cfo_from_bins(Yb)
     print(f"integer CFO (bin shift) {delta}")
-    Ys = np.fft.fftshift(Yb, axes=1)
-    lo = N // 2 - CENTER + delta
-    Y = Ys[:, lo:lo + TOTAL]                                  # (n_sym, 5617) キャリア k=0..5616
     mode = P.JP_DEFAULT_MODE
+    # ref/isdbt/sync.active_carriers と同じ: キャリア k はビン (carrier_to_fft_bin(k) + δ) mod N。
+    # 整数 CFO は時間領域では e^{j2π δ n/N} の回転なので、窓の開始位置 s に応じた位相 e^{-j2π δ s/N} で打ち消す
+    bins = (P.carrier_to_fft_bin(mode, np.arange(TOTAL)) + delta) % N
+    starts_w = np.array([h["start"] for h, _ in frames], dtype=np.float64)
+    ph = np.exp(-2j * np.pi * delta * (starts_w % N) / N)
+    # 窓開始の揺れの補償: FPGA の追従は窓開始を整数サンプルで動かす（雑音で ±数サンプル/シンボル）。窓を Δ だけ
+    # 遅らせるとビン b（符号付き）の位相は +2π b Δ / N 回り、帯域端（|b| ≈ 2800）では 1 サンプルで 2.1 rad なので
+    # チャネル推定の時間補間が壊れる（A 層 17 dB、B 層 −16 dB になった）。ref/isdbt/sync.py と同じ方針で、
+    # 直線フィット（クロック偏差で窓が信号に追従して流れる分）はそのまま残す: 追従した窓は信号に対して一定位置
+    # （GI 内 142 サンプル前）なのでチャネルは静的で、位相傾斜はチャネル推定が吸収する。公称 s_0 + nT からの
+    # 偏差を全部消すと、逆に「流れる窓」を作ってしまい帯域端が崩れる（実波で B 層 19 → 15 dB になった）。
+    # 消すのはフィットからの偏差（追従の揺れ）だけ
+    n_idx = np.arange(len(starts_w), dtype=np.float64)
+    rel = starts_w - starts_w[0]
+    coef = np.polyfit(n_idx, rel, 1)
+    dev = rel - np.polyval(coef, n_idx)
+    print(f"window start: clock drift {coef[0] - T:+.4f} samples/symbol ({(coef[0] - T) / T * 1e6:+.1f} ppm), "
+          f"jitter vs linear fit std {dev.std():.2f}, max |dev| {np.abs(dev).max():.1f} samples")
+    b_signed = ((bins + N // 2) % N) - N // 2
+    jit = np.exp(-2j * np.pi * np.outer(dev, b_signed) / N)
+    Y = Yb[:, bins] * ph[:, None] * jit                       # (n_sym, 5617) キャリア k=0..5616
+    # 残留 CFO の補償: FPGA の NCO は GI 相関位相の IIR から小数 CFO を決めるが 0.01〜0.02 ビンの誤差が残る
+    # （実波では XO ドリフトも）。これはシンボルごとの共通位相回転（0.016 ビンで 0.11 rad/シンボル）になり、
+    # 8 シンボル平均のチャネル推定格子（隣の格子点は別シンボル由来）がジグザグになってデータキャリアの補間だけが
+    # 崩れる（パイロット位置は自シンボルで補正されるので MER 29 dB、データは 17 dB になった）。SP は 4 シンボル周期で
+    # 同じ値なので Σ_k Y[n+4,k]·conj(Y[n,k]) の位相 / 4 が 1 シンボルあたりの回転。平滑化して積算し、逆回転する
+    fs0 = demod.frame_sync(CarrierMatrixSource(Y, {}), mode)["frame_start"]
+    n_sym = Y.shape[0]
+    rot = np.zeros(n_sym)
+    for n in range(n_sym - 4):
+        k = pilots.sp_positions(mode, (n - fs0) % P.SP_SYMBOL_PERIOD)
+        rot[n] = np.angle(np.vdot(Y[n, k], Y[n + 4, k])) / 4.0
+    rot[n_sym - 4:] = rot[n_sym - 5]
+    win = 33
+    rot_s = np.convolve(rot, np.ones(win) / win, mode="same")
+    rot_s[:win // 2] = rot_s[win // 2]
+    rot_s[-(win // 2):] = rot_s[-(win // 2) - 1]
+    cpe = np.concatenate([[0.0], np.cumsum(rot_s[:-1])])
+    Y = Y * np.exp(-1j * cpe)[:, None]
+    print(f"residual CFO from SP rotation: mean {rot.mean() / (2 * np.pi) * N / T:+.4f} bins "
+          f"({rot.mean() / (2 * np.pi) * N / T * FS / N:+.1f} Hz), per-symbol rotation std {rot.std():.3f} rad")
     src = CarrierMatrixSource(Y, {"source": "fpga-mode3", "int_cfo": delta})
     fsi = demod.frame_sync(src, mode)
     print(f"frame_start {fsi['frame_start']}, tmcc parity ok {fsi['tmcc_parity_ok']}, "
@@ -202,14 +268,35 @@ def main():
     for name, pk in out.items():
         nerr = np.asarray(dbg["rs_errors"].get(name, []))
         print(f"  layer {name}: {len(pk)} TS packets, RS uncorrectable {int(np.sum(nerr < 0))} / {len(nerr)}")
+    if args.ts_out:
+        np.savez_compressed(args.ts_out, **{k: np.asarray(v) for k, v in out.items()})
     if args.stim and "B" in out and Path(args.ts_ref).exists():
         ref_ts = np.fromfile(args.ts_ref, dtype=np.uint8)
         ref_ts = ref_ts[: len(ref_ts) // 188 * 188].reshape(-1, 188)
-        got = out["B"]
+        ts_a = Path(args.ts_ref).with_name(Path(args.ts_ref).name.replace("layerB", "layerA"))
+        if ts_a.exists() and ts_a != Path(args.ts_ref):
+            a = np.fromfile(ts_a, dtype=np.uint8)
+            ref_ts = np.concatenate([ref_ts, a[: len(a) // 188 * 188].reshape(-1, 188)])
+        # 刺激は k フレームの巡回ループなので、時間インターリーブ（B 層 I=2 で最大 190 シンボル遅延）が
+        # ループの継ぎ目をまたぐフレーム（各周期の先頭 1 フレーム）は変調器の TS と一致しない。
+        # 合格は「一致パケットが 1 フレーム分（tsp_per_frame）以上連続する」ことで判定する
         ref_set = {bytes(p) for p in ref_ts}
-        hit = sum(1 for p in got if bytes(p) in ref_set)
-        print(f"  layer B packets found in the modulator's TS: {hit} / {len(got)} ({100.0 * hit / max(len(got), 1):.1f}%)")
-        print("PASS" if hit >= 0.98 * len(got) and len(got) > 100 else "FAIL")
+        for lname in ("B", "A"):
+            if lname not in out:
+                continue
+            lyr = next(l for l in fsi["layers"] if l.name == lname)
+            got = out[lname]
+            hitmask = np.array([bytes(p) in ref_set for p in got], dtype=bool)
+            # 最長の連続一致
+            best = run = 0
+            for h in hitmask:
+                run = run + 1 if h else 0
+                best = max(best, run)
+            tsp_pf = P.tsp_per_frame(mode, lyr.mod, lyr.rate, len(lyr.segments))
+            print(f"  layer {lname}: packets in the modulator's TS {int(hitmask.sum())} / {len(got)} "
+                  f"({100.0 * hitmask.mean():.1f}%), longest matching run {best} (1 frame = {tsp_pf})")
+            if lname == "B":
+                print("PASS" if best >= tsp_pf else "FAIL")
 
 
 if __name__ == "__main__":

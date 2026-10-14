@@ -21,6 +21,7 @@ import numpy as np
 REG = 0x80000000
 R_MAGIC, R_CAPS = 0x3000, 0x301C
 R_MODE, R_STRIDE, R_OFFSET, R_DECIM, R_STATUS, R_FRAMES = 0x3020, 0x3024, 0x3028, 0x302C, 0x3030, 0x3034
+R_SYNC_STATUS, R_SYNC_PEAK = 0x3038, 0x303C
 HDR_MAGIC = 0x49534254
 N, NG, T = 8192, 1024, 9216
 FS = 512e6 / 63
@@ -41,6 +42,13 @@ def parse_windows(buf: bytes):
         out.append((hdr, d[:, 0].astype(np.float64) + 1j * d[:, 1].astype(np.float64)))
         i += 8 + N
     return out
+
+
+def sync_state_str(sy: int, pk: int) -> str:
+    """SYNC_STATUS / SYNC_PEAK（ファーム v2b3a-diag 以降。旧ファームは 0）を人が読める形に。"""
+    st = ("ACQ", "TRACK", "?", "?")[sy >> 30]
+    return (f"sync {st} search {(sy >> 29) & 1} locked {(sy >> 28) & 1} miss {(sy >> 24) & 0xF} "
+            f"acq_fail {(sy >> 16) & 0xFF} lock_losses {sy & 0xFFFF} avg_peak_hi {pk >> 16} peak_hi {pk & 0xFFFF}")
 
 
 def main():
@@ -80,7 +88,7 @@ def main():
     blk.write(bytearray(tx.tobytes()))
     blk.enqueue(None, True)
     tx_bs.started = True
-    time.sleep(0.3)
+    time.sleep(1.0)      # 大きい TX ブロック（1 フレーム 7.5 MB）は走り出すまで 0.3 s では足りない
 
     rx_mask = iio.ChannelsMask(rx)
     rx_mask.channels = [rx.find_channel("voltage0", False), rx.find_channel("voltage1", False)]
@@ -95,6 +103,7 @@ def main():
         f1 = rx.reg_read(REG | R_FRAMES)
         st0 = rx.reg_read(REG | R_STATUS)
         print(f"after settle: frames {f0} -> {f1} in 0.5 s (expect ~{0.5 * FS / T / args.decim:.0f}), overrun {st0 & 0xFFFF}, fifo_ovf {st0 >> 16}")
+        print("  " + sync_state_str(rx.reg_read(REG | R_SYNC_STATUS), rx.reg_read(REG | R_SYNC_PEAK)))
         if f1 == f0:
             print("no windows are being produced (sync not locking?)")
             sys.exit(1)
