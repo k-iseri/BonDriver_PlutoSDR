@@ -472,29 +472,41 @@ std::vector<uint8_t> LiveDemod::FilterPsi(const std::vector<uint8_t>& chunk) {
         const bool keep = pid < 0x30 || std::find(pmt_pids_.begin(), pmt_pids_.end(), pid) != pmt_pids_.end();
         if (keep) out.insert(out.end(), p, p + kTsPacket);
     }
-    // 連続分が揃うまでの間、同じ PSI/SI を繰り返し送るために取っておく（上限 4000 パケット ≈ 0.75 MB）。
-    // 繰り返し時の continuity_counter は最後に出した値から続ける
-    if (psi_cc_.size() != 8192) psi_cc_.assign(8192, 0);
-    for (size_t i = 0; i + kTsPacket <= out.size(); i += kTsPacket) {
-        const uint8_t* p = out.data() + i;
-        psi_cc_[static_cast<size_t>(((p[1] & 0x1F) << 8) | p[2])] = static_cast<uint8_t>(p[3] & 0x0F);
-    }
+    // 連続分が揃うまでの間、同じ PSI/SI を繰り返し送るために取っておく（上限 4000 パケット ≈ 0.75 MB）
     if (psi_cache_.size() < 4000u * kTsPacket) psi_cache_.insert(psi_cache_.end(), out.begin(), out.end());
     return out;
 }
 
-// psi_cache_ のコピー。PID ごとに continuity_counter を進めて、重複パケットではなく正規の繰り返しに見せる
-std::vector<uint8_t> LiveDemod::RepeatPsi() {
-    if (psi_cc_.size() != 8192) psi_cc_.assign(8192, 0);
-    std::vector<uint8_t> out(psi_cache_);
-    for (size_t i = 0; i + kTsPacket <= out.size(); i += kTsPacket) {
-        uint8_t* p = out.data() + i;
-        const int pid = ((p[1] & 0x1F) << 8) | p[2];
-        if (p[3] & 0x10) {                                  // ペイロードがあるときだけ CC が進む
-            psi_cc_[static_cast<size_t>(pid)] = static_cast<uint8_t>((psi_cc_[static_cast<size_t>(pid)] + 1) & 0x0F);
-            p[3] = static_cast<uint8_t>((p[3] & 0xF0) | psi_cc_[static_cast<size_t>(pid)]);
-        }
+bool LiveDemod::IsPsiPid(int pid) const {
+    return pid < 0x30 || std::find(pmt_pids_.begin(), pmt_pids_.end(), pid) != pmt_pids_.end();
+}
+
+// PSI/SI の PID の continuity_counter を出力側の連番に振り直す。最初のバースト → 繰り返し → 本流と
+// 出どころが変わっても CC がつながり、TVTest にドロップとして数えられない（映像・音声は触らない）
+void LiveDemod::RemapPsiCc(std::vector<uint8_t>* chunk) {
+    if (psi_cc_.size() != 8192) {
+        psi_cc_.assign(8192, 0);
+        psi_cc_tracked_.assign(8192, 0);
     }
+    for (size_t i = 0; i + kTsPacket <= chunk->size(); i += kTsPacket) {
+        uint8_t* p = chunk->data() + i;
+        const int pid = ((p[1] & 0x1F) << 8) | p[2];
+        if (!IsPsiPid(pid) || !(p[3] & 0x10)) continue;      // ペイロードがあるときだけ CC が進む
+        const size_t k = static_cast<size_t>(pid);
+        if (!psi_cc_tracked_[k]) {
+            psi_cc_tracked_[k] = 1;
+            psi_cc_[k] = static_cast<uint8_t>(p[3] & 0x0F);  // 初出はそのまま
+            continue;
+        }
+        psi_cc_[k] = static_cast<uint8_t>((psi_cc_[k] + 1) & 0x0F);
+        p[3] = static_cast<uint8_t>((p[3] & 0xF0) | psi_cc_[k]);
+    }
+}
+
+// psi_cache_ のコピーを、CC を振り直して返す
+std::vector<uint8_t> LiveDemod::RepeatPsi() {
+    std::vector<uint8_t> out(psi_cache_);
+    RemapPsiCc(&out);
     return out;
 }
 
@@ -543,6 +555,7 @@ void LiveDemod::PaceLoop() {
                 emitted = starved = holding = first_hold_done = false;
                 pmt_pids_.clear();
                 psi_cache_.clear();
+                psi_cc_.clear();            // 次の RemapPsiCc で初期化し直す
             }
             if (!pace_cv_.wait_for(lock, std::chrono::milliseconds(200),
                                    [&] { return !pace_q_.empty() || stop_; })) {
@@ -595,8 +608,11 @@ void LiveDemod::PaceLoop() {
             pace_q_.pop_front();
             backlog = pace_q_.size();
             emitted = true;
-            // 最初のバースト（連続分が揃う前）は既定で PSI/SI だけ通す
-            if (!first_hold_done && first_burst_ == FirstBurst::kPsi) chunk = FilterPsi(chunk);
+            // 最初のバースト（連続分が揃う前）は既定で PSI/SI だけ通す。PSI/SI の CC は出力側で振り直す
+            if (first_burst_ == FirstBurst::kPsi) {
+                if (!first_hold_done) chunk = FilterPsi(chunk);
+                RemapPsiCc(&chunk);
+            }
         }
         if (chunk.empty()) continue;
         SendToClients(chunk);

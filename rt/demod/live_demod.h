@@ -141,9 +141,12 @@ private:
     FirstBurst first_burst_ = FirstBurst::kPsi;
     std::vector<int> pmt_pids_;             // 最初のバーストの PAT から拾った PMT の PID（ペーサースレッド専用）
     std::vector<uint8_t> psi_cache_;        // 最初のバーストで出した PSI/SI（連続分が揃うまで繰り返し送る）
-    std::vector<uint8_t> psi_cc_;           // 繰り返し送出時の PID ごとの continuity_counter
+    std::vector<uint8_t> psi_cc_;           // PSI/SI の PID ごとに出力側で振り直している continuity_counter
+    std::vector<uint8_t> psi_cc_tracked_;   // その PID を一度でも出したか（0/1）
     std::vector<uint8_t> FilterPsi(const std::vector<uint8_t>& chunk);
     std::vector<uint8_t> RepeatPsi();       // psi_cache_ のコピーを CC を進めて返す
+    void RemapPsiCc(std::vector<uint8_t>* chunk);   // PSI/SI の CC を出力側の連番に振り直す（繰り返し分と本流をつなぐ）
+    bool IsPsiPid(int pid) const;
     void SendToClients(const std::vector<uint8_t>& chunk);
 
     std::mutex iq_mu_;
