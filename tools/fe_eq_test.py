@@ -64,8 +64,8 @@ def eq_state_str(st: int, om: int, te: int, td: int) -> str:
     states = ["IDLE", "A", "B1", "B1T", "AFC", "CPEi", "CPEw", "DIV", "B2", "B2T", "FLUSH"]
     s = st >> 28
     return (f"eq state {states[s] if s < len(states) else s} sp_phase {(st >> 26) & 3} overrun {(st >> 25) & 1} "
-            f"cpe {((st >> 12) & 0xFFF) / 4096 * 360:.1f}deg sym_count {st & 0xFFF}, omega {np.int32(om) / 2 ** 32 * N / T:+.4f} bins, "
-            f"T_est {te / 65536:.4f}, delta {np.int32(td) / 256:+.2f}")
+            f"cpe {((st >> 12) & 0xFFF) / 4096 * 360:.1f}deg sym_count {st & 0xFFF}, omega {int(np.int32(np.uint32(om))) / 2 ** 32 * N / T:+.4f} bins, "
+            f"T_est {te / 65536:.4f}, delta {int(np.int32(np.uint32(td))) / 256:+.2f}")
 
 
 def main():
@@ -96,7 +96,7 @@ def main():
     rx = ctx.find_device("cf-ad9361-lpc")
     assert rx.reg_read(REG | R_MAGIC) == 0x49534442
     ver = rx.reg_read(REG | R_VERSION)
-    if ver < 3:
+    if ver < 3 and rx.reg_read(REG | R_EQ_CTRL) == 0:
         sys.exit(f"firmware VERSION {ver} has no equalizer (need >= 3)")
     rxch = phy.find_channel("voltage0", False)
     rxch.attrs["sampling_frequency"].value = str(int(round(FS)))
