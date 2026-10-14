@@ -472,7 +472,47 @@ std::vector<uint8_t> LiveDemod::FilterPsi(const std::vector<uint8_t>& chunk) {
         const bool keep = pid < 0x30 || std::find(pmt_pids_.begin(), pmt_pids_.end(), pid) != pmt_pids_.end();
         if (keep) out.insert(out.end(), p, p + kTsPacket);
     }
+    // 連続分が揃うまでの間、同じ PSI/SI を繰り返し送るために取っておく（上限 4000 パケット ≈ 0.75 MB）。
+    // 繰り返し時の continuity_counter は最後に出した値から続ける
+    if (psi_cc_.size() != 8192) psi_cc_.assign(8192, 0);
+    for (size_t i = 0; i + kTsPacket <= out.size(); i += kTsPacket) {
+        const uint8_t* p = out.data() + i;
+        psi_cc_[static_cast<size_t>(((p[1] & 0x1F) << 8) | p[2])] = static_cast<uint8_t>(p[3] & 0x0F);
+    }
+    if (psi_cache_.size() < 4000u * kTsPacket) psi_cache_.insert(psi_cache_.end(), out.begin(), out.end());
     return out;
+}
+
+// psi_cache_ のコピー。PID ごとに continuity_counter を進めて、重複パケットではなく正規の繰り返しに見せる
+std::vector<uint8_t> LiveDemod::RepeatPsi() {
+    if (psi_cc_.size() != 8192) psi_cc_.assign(8192, 0);
+    std::vector<uint8_t> out(psi_cache_);
+    for (size_t i = 0; i + kTsPacket <= out.size(); i += kTsPacket) {
+        uint8_t* p = out.data() + i;
+        const int pid = ((p[1] & 0x1F) << 8) | p[2];
+        if (p[3] & 0x10) {                                  // ペイロードがあるときだけ CC が進む
+            psi_cc_[static_cast<size_t>(pid)] = static_cast<uint8_t>((psi_cc_[static_cast<size_t>(pid)] + 1) & 0x0F);
+            p[3] = static_cast<uint8_t>((p[3] & 0xF0) | psi_cc_[static_cast<size_t>(pid)]);
+        }
+    }
+    return out;
+}
+
+void LiveDemod::SendToClients(const std::vector<uint8_t>& chunk) {
+    std::vector<std::shared_ptr<ClientQueue>> clients;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        clients = clients_;
+    }
+    for (auto& q : clients) {
+        std::lock_guard<std::mutex> ql(q->mu);
+        if (q->chunks.size() >= kQueueMaxChunks) {
+            dropped_ += chunk.size() / kTsPacket;
+        } else {
+            q->chunks.push_back(chunk);
+            q->cv.notify_one();
+        }
+    }
 }
 
 // ペーサー: 1 フレーム（≈231 ms）周期でクライアントへ送出する。
@@ -492,7 +532,8 @@ void LiveDemod::PaceLoop() {
     const size_t kResumeBacklogLater = 4;
     constexpr auto kResumeMaxWait = std::chrono::seconds(6);
     bool emitted = false, starved = false, holding = false, first_hold_done = false;
-    std::chrono::steady_clock::time_point hold_since{};
+    std::chrono::steady_clock::time_point hold_since{}, psi_last{};
+    constexpr auto kPsiRepeatInterval = std::chrono::milliseconds(250);
     while (!stop_) {
         std::vector<uint8_t> chunk;
         size_t backlog = 0;
@@ -501,6 +542,7 @@ void LiveDemod::PaceLoop() {
             if (pace_reset_.exchange(false)) {
                 emitted = starved = holding = first_hold_done = false;
                 pmt_pids_.clear();
+                psi_cache_.clear();
             }
             if (!pace_cv_.wait_for(lock, std::chrono::milliseconds(200),
                                    [&] { return !pace_q_.empty() || stop_; })) {
@@ -508,6 +550,13 @@ void LiveDemod::PaceLoop() {
                 if (emitted && !starved) {
                     starved = true;
                     if (first_hold_done) ++pace_starved_;        // 定常中に空になった回数（status の pace_starved）
+                }
+                // キューが空の間も PSI/SI の繰り返し送出は続ける（下の待ち分岐と同じ条件）
+                if (starved && !first_hold_done && first_burst_ == FirstBurst::kPsi && !psi_cache_.empty() &&
+                    t_next - psi_last >= kPsiRepeatInterval) {
+                    psi_last = t_next;
+                    lock.unlock();
+                    SendToClients(RepeatPsi());
                 }
                 continue;
             }
@@ -527,6 +576,14 @@ void LiveDemod::PaceLoop() {
                 const size_t need = first_hold_done ? kResumeBacklogLater : kResumeBacklogFirst;
                 if (pace_q_.size() < need && now - hold_since < kResumeMaxWait) {
                     lock.unlock();
+                    // 連続分が揃うまでの待ちの間、最初のバーストの PSI/SI を繰り返し送る。TVTest の
+                    // チャンネルスキャンは待ち時間経過時点の受信状態を見るので、途切れるとその時点で
+                    // 「信号なし」と判定されて検出されない（2026-10-14 の実測）。
+                    if (!first_hold_done && first_burst_ == FirstBurst::kPsi && !psi_cache_.empty() &&
+                        now - psi_last >= kPsiRepeatInterval) {
+                        psi_last = now;
+                        SendToClients(RepeatPsi());
+                    }
                     std::this_thread::sleep_for(std::chrono::milliseconds(50));
                     continue;
                 }
@@ -542,20 +599,7 @@ void LiveDemod::PaceLoop() {
             if (!first_hold_done && first_burst_ == FirstBurst::kPsi) chunk = FilterPsi(chunk);
         }
         if (chunk.empty()) continue;
-        std::vector<std::shared_ptr<ClientQueue>> clients;
-        {
-            std::lock_guard<std::mutex> lock(mu_);
-            clients = clients_;
-        }
-        for (auto& q : clients) {
-            std::lock_guard<std::mutex> ql(q->mu);
-            if (q->chunks.size() >= kQueueMaxChunks) {
-                dropped_ += chunk.size() / kTsPacket;
-            } else {
-                q->chunks.push_back(chunk);
-                q->cv.notify_one();
-            }
-        }
+        SendToClients(chunk);
         if (backlog > kPaceCatchupFrames) continue;     // 溜まりすぎ: 間隔なしで追いつく
         t_next += frame_dt;
         const auto now = std::chrono::steady_clock::now();

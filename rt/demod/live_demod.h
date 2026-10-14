@@ -140,7 +140,11 @@ private:
     std::atomic<long long> pace_starved_{0};   // 定常中に送出キューが空になった回数（復調の遅れの指標）
     FirstBurst first_burst_ = FirstBurst::kPsi;
     std::vector<int> pmt_pids_;             // 最初のバーストの PAT から拾った PMT の PID（ペーサースレッド専用）
+    std::vector<uint8_t> psi_cache_;        // 最初のバーストで出した PSI/SI（連続分が揃うまで繰り返し送る）
+    std::vector<uint8_t> psi_cc_;           // 繰り返し送出時の PID ごとの continuity_counter
     std::vector<uint8_t> FilterPsi(const std::vector<uint8_t>& chunk);
+    std::vector<uint8_t> RepeatPsi();       // psi_cache_ のコピーを CC を進めて返す
+    void SendToClients(const std::vector<uint8_t>& chunk);
 
     std::mutex iq_mu_;
     std::condition_variable iq_cv_;
