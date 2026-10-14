@@ -65,10 +65,11 @@ def parse_eq_frames(buf: bytes, delta_rot=None):
 
 
 def eq_state_str(st: int, om: int, te: int, td: int) -> str:
-    states = ["IDLE", "A", "B1", "B1T", "AFC", "CPEi", "CPEw", "DIV", "B2", "B2T", "FLUSH"]
+    states = ["IDLE", "A", "B1", "B1T", "AFC", "CPEi", "CPEw", "DIV", "B2", "B2T", "FLUSH", "NORM"]
     s = st >> 28
-    return (f"eq state {states[s] if s < len(states) else s} sp_phase {(st >> 26) & 3} overrun {(st >> 25) & 1} "
-            f"cpe {((st >> 12) & 0xFFF) / 4096 * 360:.1f}deg sym_count {st & 0xFFF}, omega {int(np.int32(np.uint32(om))) / 2 ** 32 * N / T:+.4f} bins, "
+    return (f"eq state {states[s] if s < len(states) else s} sp_phase {(st >> 26) & 3} sp_known {(st >> 25) & 1} pending {(st >> 24) & 1} "
+            f"overrun_cnt {(st >> 16) & 0xFF} cpe {((st >> 8) & 0xFF) / 256 * 360:.1f}deg sym_count {st & 0xFF}, "
+            f"omega {int(np.int32(np.uint32(om))) / 2 ** 32 * N / T:+.4f} bins (raw 0x{om:08x}: e_hi {om >> 16} e_lo {om & 0xFFFF}), "
             f"T_est {te / 65536:.4f}, delta {int(np.int32(np.uint32(td))) / 256:+.2f}")
 
 
