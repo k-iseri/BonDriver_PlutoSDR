@@ -22,6 +22,12 @@ namespace isdbt {
 enum class System { kIsdbt, kIsdbc };
 
 inline const char* SystemName(System s) { return s == System::kIsdbc ? "isdbc" : "isdbt"; }
+inline bool ParseFirstBurst(const std::string& s, FirstBurst* out) {
+    if (s.empty() || s == "psi") { *out = FirstBurst::kPsi; return true; }
+    if (s == "all") { *out = FirstBurst::kAll; return true; }
+    if (s == "none") { *out = FirstBurst::kNone; return true; }
+    return false;
+}
 inline bool ParseSystem(const std::string& s, System* out) {
     if (s.empty() || s == "isdbt") { *out = System::kIsdbt; return true; }
     if (s == "isdbc") { *out = System::kIsdbc; return true; }
@@ -37,6 +43,7 @@ struct LiveParams {
     Mode mode = Mode::M3;
     Gi gi{8};
     int win_frames = 8, ctx_frames = 4, workers = 3;
+    FirstBurst first_burst = FirstBurst::kPsi;   // 選局直後の最初のバーストの出し方（live_demod.h）
     std::string dump_iq;
     // ISDB-C
     isdbc::TsmfDemux::Select select;

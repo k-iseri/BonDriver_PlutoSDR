@@ -65,6 +65,13 @@ public:
     virtual const std::string& source_desc() const = 0;
 };
 
+// 選局直後の最初の（短い）ウィンドウの出し方。連続再生できる量が溜まる前に出すものを決める:
+//   kPsi  … PSI/SI（PID < 0x30 と PAT に載る PMT）だけ出す。TVTest のチャンネルスキャンは検出でき、
+//           映像・音声は連続分が揃ってから始まるので切替直後にかくつかない（既定）
+//   kAll  … 全パケットを出す（一瞬映ってから数秒止まる）
+//   kNone … 何も出さない（連続分が揃うまで無信号。スキャンは待ち時間を延ばす必要がある）
+enum class FirstBurst { kPsi, kAll, kNone };
+
 class LiveDemod : public IFeed {
 public:
     // external_sdr が非 null なら SDR を自分で開かず、所有者（LiveSwitch）が OnBlock / OnSdrEvent を呼ぶ
@@ -88,6 +95,8 @@ public:
     // 外部 SDR 所有者から呼ぶ入力（SDR 受信スレッドから）
     void OnBlock(const cfloat* p, size_t n);
     void OnSdrEvent(bool up);
+    // Start() の前に呼ぶ
+    void SetFirstBurst(FirstBurst mode) { first_burst_ = mode; }
 
 private:
     struct WindowJob {
@@ -129,6 +138,9 @@ private:
     std::deque<std::vector<uint8_t>> pace_q_;
     std::atomic<bool> pace_reset_{false};   // 選局でペーサーの再開待ち状態を初期化する
     std::atomic<long long> pace_starved_{0};   // 定常中に送出キューが空になった回数（復調の遅れの指標）
+    FirstBurst first_burst_ = FirstBurst::kPsi;
+    std::vector<int> pmt_pids_;             // 最初のバーストの PAT から拾った PMT の PID（ペーサースレッド専用）
+    std::vector<uint8_t> FilterPsi(const std::vector<uint8_t>& chunk);
 
     std::mutex iq_mu_;
     std::condition_variable iq_cv_;

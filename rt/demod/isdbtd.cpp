@@ -669,7 +669,8 @@ void Usage() {
         "  --no-reconnect      ストリームエラー時に自動再接続しない（既定は再接続）\n"
         "  --win-frames N      ウィンドウの新規フレーム数 (default 8。選局後の遅延 vs CPU 効率)\n"
         "  --ctx-frames N      ウィンドウの文脈フレーム数 (default 4)\n"
-        "  --workers N         並列復調ワーカー数 (default 3)\n");
+        "  --workers N         並列復調ワーカー数 (default 3)\n"
+        "  --first-burst psi|all|none  選局直後の最初のバースト（default psi: PSI/SI だけ先に出す）\n");
 }
 
 }  // namespace
@@ -684,6 +685,7 @@ int main(int argc, char** argv) {
     std::string dump_iq, system_str;
     int init_ch = 0;
     int win_frames = 8, ctx_frames = 4, workers = 3;
+    std::string first_burst_str;
     bool bw_fixed = false;
     isdbc::TsmfDemux::Select ts_sel;
     for (int i = 1; i < argc; ++i) {
@@ -711,6 +713,7 @@ int main(int argc, char** argv) {
         else if (a == "--win-frames") win_frames = std::atoi(next().c_str());
         else if (a == "--ctx-frames") ctx_frames = std::atoi(next().c_str());
         else if (a == "--workers") workers = std::atoi(next().c_str());
+        else if (a == "--first-burst") first_burst_str = next();
         else if (a == "--mode") mode_i = std::atoi(next().c_str());
         else if (a == "--gi") gi_str = next();
         else if (a == "--max-seconds") max_seconds = std::atof(next().c_str());
@@ -764,6 +767,7 @@ int main(int argc, char** argv) {
             lp.dump_iq = dump_iq;
             lp.select = ts_sel;
             lp.verbose = !quiet;
+            if (!ParseFirstBurst(first_burst_str, &lp.first_burst)) throw std::runtime_error("bad --first-burst: " + first_burst_str);
             LiveSwitch live(lp);
             live.Start(system);
             if (init_ch) live.TuneSystem(system, true, init_ch, init_freq);

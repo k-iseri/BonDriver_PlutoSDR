@@ -9,7 +9,8 @@ namespace isdbt {
 
 namespace {
 constexpr double kRetuneSkipSeconds = 0.65;    // SDR のブロックキュー（4 × 147 ms = 0.59 s）+ 余裕
-constexpr int kFirstWindowNewFrames = 4;        // 選局直後の最初のウィンドウの新規フレーム数（TS まで約 4〜5 秒）
+constexpr int kFirstWindowNewFrames = 6;        // 選局直後の最初のウィンドウの新規フレーム数（TS まで約 5 秒、
+                                                // 排出 5 フレーム ≈ 1.2 s で SDT の繰り返し周期 1 s を覆う）
 constexpr int kFirstWindowCtxFrames = 2;        // 同・文脈フレーム数（定常は ctx_frames_ = 4）
 }
 
@@ -440,6 +441,40 @@ void LiveDemod::Emit(const DemodResult& res, long long abs0) {
     pace_cv_.notify_one();
 }
 
+// 最初のバースト用: PSI/SI（PID < 0x30）と、PAT に載っている PMT だけを残す。
+// 映像・音声の PES が無ければ TVTest は再生を始めないので、連続分が揃うまで映像が止まって見えない。
+std::vector<uint8_t> LiveDemod::FilterPsi(const std::vector<uint8_t>& chunk) {
+    std::vector<uint8_t> out;
+    out.reserve(chunk.size() / 8);
+    for (size_t i = 0; i + kTsPacket <= chunk.size(); i += kTsPacket) {
+        const uint8_t* p = chunk.data() + i;
+        if (p[0] != 0x47) continue;
+        const int pid = ((p[1] & 0x1F) << 8) | p[2];
+        if (pid == 0 && (p[1] & 0x40) && (p[3] & 0x10)) {
+            // PAT: program_number ≠ 0 のエントリの PMT PID を集める（セクションは 1 パケットに収まる前提）
+            size_t off = 4;
+            if (p[3] & 0x20) off += 1 + p[4];           // adaptation field
+            if (off < kTsPacket) {
+                off += 1 + p[off];                      // pointer_field
+                if (off + 8 <= kTsPacket && p[off] == 0x00) {
+                    const size_t sec_len = ((p[off + 1] & 0x0F) << 8) | p[off + 2];
+                    const size_t end = std::min<size_t>(off + 3 + sec_len - 4, kTsPacket);
+                    for (size_t e = off + 8; e + 4 <= end; e += 4) {
+                        const int prog = (p[e] << 8) | p[e + 1];
+                        const int pmt = ((p[e + 2] & 0x1F) << 8) | p[e + 3];
+                        if (prog != 0 && std::find(pmt_pids_.begin(), pmt_pids_.end(), pmt) == pmt_pids_.end()) {
+                            pmt_pids_.push_back(pmt);
+                        }
+                    }
+                }
+            }
+        }
+        const bool keep = pid < 0x30 || std::find(pmt_pids_.begin(), pmt_pids_.end(), pid) != pmt_pids_.end();
+        if (keep) out.insert(out.end(), p, p + kTsPacket);
+    }
+    return out;
+}
+
 // ペーサー: 1 フレーム（≈231 ms）周期でクライアントへ送出する。
 // 復調は平均で実時間なのでキューは「復調レイテンシ + 1 ウィンドウ」程度で振動する。
 // 大きく溜まったら（瞬断後の再同期など）追いつくまで間隔なしで流す。
@@ -465,6 +500,7 @@ void LiveDemod::PaceLoop() {
             std::unique_lock<std::mutex> lock(pace_mu_);
             if (pace_reset_.exchange(false)) {
                 emitted = starved = holding = first_hold_done = false;
+                pmt_pids_.clear();
             }
             if (!pace_cv_.wait_for(lock, std::chrono::milliseconds(200),
                                    [&] { return !pace_q_.empty() || stop_; })) {
@@ -476,6 +512,12 @@ void LiveDemod::PaceLoop() {
                 continue;
             }
             if (stop_) break;
+            if (!emitted && first_burst_ == FirstBurst::kNone) {
+                emitted = starved = true;       // 最初から「連続分が揃うまで待つ」扱い
+            }
+            if (!first_hold_done && !starved && pace_q_.size() >= kResumeBacklogFirst) {
+                first_hold_done = true;         // 空く前に十分溜まった（最初のバースト扱いを終える）
+            }
             if (starved) {
                 const auto now = std::chrono::steady_clock::now();
                 if (!holding) {
@@ -496,7 +538,10 @@ void LiveDemod::PaceLoop() {
             pace_q_.pop_front();
             backlog = pace_q_.size();
             emitted = true;
+            // 最初のバースト（連続分が揃う前）は既定で PSI/SI だけ通す
+            if (!first_hold_done && first_burst_ == FirstBurst::kPsi) chunk = FilterPsi(chunk);
         }
+        if (chunk.empty()) continue;
         std::vector<std::shared_ptr<ClientQueue>> clients;
         {
             std::lock_guard<std::mutex> lock(mu_);

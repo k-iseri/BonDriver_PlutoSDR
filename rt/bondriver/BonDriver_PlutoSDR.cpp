@@ -98,6 +98,7 @@ struct Config {
 		int winFrames = 8;
 		int ctxFrames = 4;
 		int workers = 3;
+		std::string firstBurst = "psi";   // 選局直後の最初のバースト: psi / all / none（live_demod.h FirstBurst）
 		std::wstring libiioDir;     // libiio1.dll のあるフォルダ（空なら DLL の隣 → PATH）
 	} sdr;
 };
@@ -173,6 +174,7 @@ Config LoadConfig()
 	c.sdr.winFrames = (int)GetPrivateProfileIntW(L"SDR", L"WinFrames", 8, c.iniPath.c_str());
 	c.sdr.ctxFrames = (int)GetPrivateProfileIntW(L"SDR", L"CtxFrames", 4, c.iniPath.c_str());
 	c.sdr.workers = (int)GetPrivateProfileIntW(L"SDR", L"Workers", 3, c.iniPath.c_str());
+	c.sdr.firstBurst = Narrow(ReadIniString(L"SDR", L"FirstBurst", L"psi", c.iniPath));
 	c.sdr.libiioDir = ReadIniString(L"SDR", L"LibiioDir", L"", c.iniPath);
 	return c;
 }
@@ -591,6 +593,10 @@ BOOL CBonDriverPlutoSDR::OpenTunerSdr()
 		lp.win_frames = m_cfg.sdr.winFrames;
 		lp.ctx_frames = m_cfg.sdr.ctxFrames;
 		lp.workers = m_cfg.sdr.workers;
+		if (!isdbt::ParseFirstBurst(m_cfg.sdr.firstBurst, &lp.first_burst)) {
+			Log("bad [SDR] FirstBurst: %s (psi / all / none)", m_cfg.sdr.firstBurst.c_str());
+			return FALSE;
+		}
 		lp.select.rel = m_cfg.catvTs;
 		lp.select.pass_all = m_cfg.catvAll;
 		m_live = new isdbt::LiveSwitch(lp);

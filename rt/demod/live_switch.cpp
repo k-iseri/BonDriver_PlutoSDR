@@ -44,6 +44,7 @@ void LiveSwitch::BuildFeed(System sys, double freq) {
     } else {
         t = std::make_unique<LiveDemod>(sc, p_.mode, p_.gi, p_.win_frames, p_.ctx_frames, p_.workers,
                                         p_.verbose, p_.dump_iq, &sdr_);
+        t->SetFirstBurst(p_.first_burst);
         t->Start();
     }
     {
