@@ -35,7 +35,7 @@ TOTAL = 5617
 EQ_WORDS = (TOTAL * 3 + 3) // 4          # 4213
 
 
-def parse_eq_frames(buf: bytes):
+def parse_eq_frames(buf: bytes, delta_rot=None):
     """バイト列 → [(hdr, D complex (5617,), csi (5617,))]。fmt = 2 のフレームだけ。"""
     w = np.frombuffer(buf, dtype="<u4")
     out = []
@@ -55,6 +55,10 @@ def parse_eq_frames(buf: bytes):
             b = w[i + 8:i + 8 + nw].view(np.uint8)[: TOTAL * 3].reshape(TOTAL, 3)
             D = (b[:, 0].astype(np.int8).astype(np.float64) + 1j * b[:, 1].astype(np.int8).astype(np.float64)) / 64.0
             csi = b[:, 2].astype(np.float64) / 64.0
+            # FPGA はビン順（キャリア car0 = 2808 − δ から 5616、続いて 0 から）で出す → キャリア順に戻す
+            if delta_rot is not None:
+                D = np.roll(D, (2808 - delta_rot) % TOTAL)
+                csi = np.roll(csi, (2808 - delta_rot) % TOTAL)
             out.append((hdr, D, csi))
         i += 8 + nw
     return out
@@ -179,7 +183,7 @@ def main():
         rx.reg_write(REG | R_MODE, 0)
         phy.debug_attrs["loopback"].value = "0"
 
-    frames = parse_eq_frames(buf)
+    frames = parse_eq_frames(buf, delta)
     print(f"frames {len(frames)}")
     if args.dump:
         np.savez_compressed(args.dump, D=np.array([d for _, d, _ in frames], dtype=np.complex64),
