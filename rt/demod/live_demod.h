@@ -154,6 +154,11 @@ private:
     std::deque<std::vector<cfloat>> iq_q_;
     long long iq_total_ = 0;
     bool overflowed_ = false;
+    // 選局直後の暫定信号レベル: 最初のウィンドウが復調されるまで（約 6 秒）MER が無いので、GI 相関から
+    // C/N を見積もって signal_db に入れる。TVTest のチャンネルスキャンは待ち時間（既定 5 秒）経過時点で
+    // 信号レベル ≥ 7 dB か SDT 受信済みでなければ即座に次へ進むため（2026-10-14、ChannelScan.cpp より）
+    std::atomic<bool> quick_level_pending_{false};
+    static double QuickGiRho(const cfloat* x, size_t n, int N, int Ng);
     // 選局直後に捨てる入力サンプル数。SDR 側に積まれている約 0.6 秒分（nb_blocks × block）は
     // LO 変更前の信号なので、混ぜると最初のウィンドウが必ず同期失敗して TS が 1 ウィンドウ分遅れる
     std::atomic<long long> skip_samples_{0};

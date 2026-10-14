@@ -32,6 +32,7 @@ void LiveDemod::Start() {
                     [this](bool up) { OnSdrEvent(up); });
     }
     skip_samples_ = static_cast<long long>(kRetuneSkipSeconds * cfg_.fs);
+    quick_level_pending_ = true;
     sched_ = std::thread(&LiveDemod::SchedLoop, this);
     pacer_ = std::thread(&LiveDemod::PaceLoop, this);
 }
@@ -71,6 +72,7 @@ void LiveDemod::Tune(bool has_ch, int ch, double freq) {
     }
     if (!external_) sdr_->Retune(freq);
     skip_samples_ = static_cast<long long>(kRetuneSkipSeconds * cfg_.fs);
+    quick_level_pending_ = true;
     {
         std::lock_guard<std::mutex> pl(pace_mu_);
         pace_q_.clear();
@@ -217,6 +219,10 @@ void LiveDemod::SchedLoop() {
                                                    SymbolSamples(mode_, gi_) * in_per_nominal_));
     };
     int cur_new = first_new;
+    // 入力レートでの FFT 長・GI 長・シンボル長（暫定信号レベルの GI 相関用）
+    const int N_in = static_cast<int>(std::lround(ModeParamsOf(mode_).fft_size * in_per_nominal_));
+    const int Ng_in = static_cast<int>(std::lround(GuardSamples(mode_, gi_) * in_per_nominal_));
+    const int T_in = N_in + Ng_in;
     std::vector<cfloat> acc;
     long long acc_abs0 = 0, abs_in = 0;
     long long cur_gen = 0;
@@ -261,6 +267,16 @@ void LiveDemod::SchedLoop() {
                 anchored_ = false;
                 last_emitted_ = -1;
             }
+        }
+        // 暫定信号レベル（GI 相関）: 選局後 14 シンボル分（約 0.13 s）の I/Q が溜まったら一度だけ
+        if (quick_level_pending_ && acc.size() >= static_cast<size_t>(14 * T_in)) {
+            quick_level_pending_ = false;
+            const double rho = QuickGiRho(acc.data(), acc.size(), N_in, Ng_in);
+            double est = 0.0;
+            if (rho > 0.25 && rho < 0.999) est = std::max(0.0, std::min(30.0, 10.0 * std::log10(rho / (1.0 - rho))));
+            std::lock_guard<std::mutex> lock(mu_);
+            if (!locked_) mer_db_ = est;
+            if (verbose_) std::fprintf(stderr, "quick level: GI rho %.3f -> %.1f dB\n", rho, est);
         }
         if (static_cast<long long>(acc.size()) > kIqBoundSamples) {
             // 復調が恒常的に追いつかない: 組み立てバッファごと仕切り直す
@@ -439,6 +455,32 @@ void LiveDemod::Emit(const DemodResult& res, long long abs0) {
         for (auto& chunk : frames_out) pace_q_.push_back(std::move(chunk));
     }
     pace_cv_.notify_one();
+}
+
+// GI 相関の正規化ピーク ρ = max_n |Σ_i conj(x[n+i]) x[n+i+N]| / 平均電力（K シンボル分を足し合わせ）。
+// OFDM があれば ρ ≈ C/(C+N)、無信号なら ≈ 0。スライド和で O(T) / シンボル
+double LiveDemod::QuickGiRho(const cfloat* x, size_t n, int N, int Ng) {
+    const int T = N + Ng;
+    const long long K = (static_cast<long long>(n) - N - Ng) / T;
+    if (K < 2) return 0.0;
+    std::vector<double> mag(static_cast<size_t>(T), 0.0);
+    for (long long k = 0; k < K; ++k) {
+        const cfloat* b = x + k * T;
+        std::complex<double> s = 0.0;
+        double p = 0.0;
+        for (int i = 0; i < Ng; ++i) {
+            s += std::conj(std::complex<double>(b[i])) * std::complex<double>(b[i + N]);
+            p += std::norm(b[i]) + std::norm(b[i + N]);
+        }
+        for (int m = 0; m < T; ++m) {
+            mag[static_cast<size_t>(m)] += std::abs(s) / (0.5 * p + 1e-12);
+            s -= std::conj(std::complex<double>(b[m])) * std::complex<double>(b[m + N]);
+            s += std::conj(std::complex<double>(b[m + Ng])) * std::complex<double>(b[m + Ng + N]);
+            p -= std::norm(b[m]) + std::norm(b[m + N]);
+            p += std::norm(b[m + Ng]) + std::norm(b[m + Ng + N]);
+        }
+    }
+    return *std::max_element(mag.begin(), mag.end()) / static_cast<double>(K);
 }
 
 // 最初のバースト用: PSI/SI（PID < 0x30）と、PAT に載っている PMT だけを残す。
