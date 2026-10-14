@@ -161,6 +161,10 @@ def main():
                 sys.exit("mode 3: too few frames (sync not locked?)")
             Yb = np.array([y for _, y in fr])
             delta = FC.integer_cfo_from_bins(Yb)
+            seqs3 = np.array([h["seq"] for h, _ in fr])
+            print(f"mode 3: {len(fr)} frames, seq gaps {int((np.diff(seqs3) != 1).sum())}")
+            if abs(delta) >= 60 or (np.diff(seqs3) != 1).sum() > len(fr) // 4:
+                sys.exit(f"mode 3 capture unreliable (delta {delta}); retry or give --delta")
             rx.reg_write(REG | R_MODE, 0)
             time.sleep(0.2)
         print(f"integer CFO delta {delta}")
