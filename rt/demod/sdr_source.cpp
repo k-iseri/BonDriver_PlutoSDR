@@ -25,6 +25,7 @@ void SdrSource::Start(const SdrConfig&, BlockFn, EventFn, SymbolFn) {
 }
 void SdrSource::Retune(double) {}
 void SdrSource::SetBandwidth(double) {}
+void SdrSource::EnableFpgaFrontEnd(bool) {}
 void SdrSource::Stop() {}
 void SdrSource::Run() {}
 void SdrSource::Connect() {}
@@ -309,6 +310,11 @@ void SdrSource::SetBandwidth(double bw_hz) {
     }
 }
 
+void SdrSource::EnableFpgaFrontEnd(bool on) {
+    fe_enabled_ = on;
+    if (!on) fe_restart_ = true;        // 受信スレッドが raw（モード 0）へ戻す
+}
+
 void SdrSource::Stop() {
     if (!impl_) return;
     {
@@ -556,7 +562,7 @@ void SdrSource::Run() {
         ++blocks_;
         if (on_block_) on_block_(out.data(), n);
         // raw で AGC が落ち着いたら FPGA 前段へ（モード 3 で整数 CFO を求めてからモード 4）
-        if (fe_wanted && ++fe_blocks >= kFeSettleBlocks) {
+        if (fe_wanted && fe_enabled_ && ++fe_blocks >= kFeSettleBlocks) {
             parser.Reset();
             std::fill(cfo_pow.begin(), cfo_pow.end(), 0.0);
             cfo_frames = 0;

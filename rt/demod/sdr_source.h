@@ -87,6 +87,8 @@ public:
     void Retune(double freq_hz);
     // RF 帯域幅だけ変更（ストリームは止めない。方式切替用。例外を投げない）
     void SetBandwidth(double bw_hz);
+    // FPGA 前段を使うか（地デジのときだけ true。ISDB-C は raw I/Q が要るので false にして raw に戻す。例外を投げない）
+    void EnableFpgaFrontEnd(bool on);
     void Stop();
 
     const std::string& desc() const { return desc_; }
@@ -145,6 +147,7 @@ private:
     std::atomic<uint32_t> fe_sync_status_{0}, fe_eq_status_{0};
     std::atomic<long long> fpga_symbols_{0};
     std::atomic<bool> fe_restart_{false};   // Retune: raw からやり直す（AGC → δ → モード 4）
+    std::atomic<bool> fe_enabled_{true};    // EnableFpgaFrontEnd（false の間は raw のまま）
     volatile long long blocks_ = 0;
     std::string desc_;
 };

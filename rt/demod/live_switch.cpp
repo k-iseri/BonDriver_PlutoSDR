@@ -39,6 +39,9 @@ void LiveSwitch::ForwardEvent(bool up) {
 
 // 復調パイプラインを作って起動し、クライアントを付け替え、SDR の転送先にする
 void LiveSwitch::BuildFeed(System sys, double freq) {
+    // FPGA 前段（同期・FFT・等化）は地デジ専用。ISDB-C は raw I/Q で復調するので前段を止める
+    // （止めないと約 1 秒後にモード 3/4 へ移って raw が来なくなり、CATV が映らない。2026-10-15 TVTest で発覚）
+    sdr_.EnableFpgaFrontEnd(sys != System::kIsdbc);
     SdrConfig sc = p_.sdr;
     sc.freq_hz = freq;
     sc.bw = BwFor(sys);
