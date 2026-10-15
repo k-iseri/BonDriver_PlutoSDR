@@ -113,7 +113,7 @@ void DecodeSoftBits(const Mat<float>& soft, const RxLayer& lyr, Mode mode,
                     std::vector<uint8_t>* ts, std::vector<int>* nerr);
 // 同上、範囲復号用: 先頭 head_tsp 個の TSP（助走）を捨て、そこがフレーム先頭として n_frames フレーム分だけ
 // エネルギー逆拡散・RS をかける（入力が足りなければ揃うフレームまで）
-void DecodeSoftBitsRange(const Mat<float>& soft, const RxLayer& lyr, Mode mode, int head_tsp, int n_frames,
-                         std::vector<uint8_t>* ts, std::vector<int>* nerr);
+void DecodeSoftBitsRangeQ(const std::vector<int8_t>& qsoft, const RxLayer& lyr, Mode mode, int head_tsp, int n_frames,
+                          std::vector<uint8_t>* ts, std::vector<int>* nerr, const Mat<float>* vref = nullptr);
 
 }  // namespace isdbt

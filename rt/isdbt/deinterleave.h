@@ -24,6 +24,13 @@ void IntersegmentDeinterleave(Mat<T>* X, Mode mode, const std::vector<std::vecto
 
 // 階層のセグメント列から直列シンボルを取り出し（layer_stream）、軟判定デマップ × CSI 重み →
 // ビットデインターリーブまでを行う。rows[r] は Xt/Wt の行番号。出力 (len(rows)*nseg*dc, bps)。
+// 同上を 1 パスで int8（±q、ビタビの量子化幅）に直接書く版（ライブ経路用）。デマップ → CSI 重み →
+// ビットデインターリーブ（遅延 ≤ 120 スロットなのでリングバッファ）→ 量子化。量子化の尺度は 1/61 の
+// 間引きで平均振幅を先に測って決める（平均 → 12）。float 行列 2 枚（各 n_slots × bps × 4 B）の往復を省く
+std::vector<int8_t> LayerSoftBitsQ(const Mat<cfloat>& Xt, const Mat<float>& Wt,
+                                   const std::vector<int>& rows, const std::vector<int>& segments,
+                                   Modulation mod, Mode mode, int q);
+
 Mat<float> LayerSoftBits(const Mat<cfloat>& Xt, const Mat<float>& Wt,
                          const std::vector<int>& rows, const std::vector<int>& segments,
                          Modulation mod, Mode mode);

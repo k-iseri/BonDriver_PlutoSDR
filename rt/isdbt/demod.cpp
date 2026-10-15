@@ -241,18 +241,19 @@ void DecodeSoftBits(const Mat<float>& soft, const RxLayer& lyr, Mode mode,
     }
 }
 
-void DecodeSoftBitsRange(const Mat<float>& soft, const RxLayer& lyr, Mode mode, int head_tsp, int n_frames,
-                         std::vector<uint8_t>* ts, std::vector<int>* nerr) {
+// 量子化済み軟値（LayerSoftBitsQ）から。vref が非 null なら float 版（Depuncture + ViterbiDecode）と突き合わせる
+void DecodeSoftBitsRangeQ(const std::vector<int8_t>& qsoft, const RxLayer& lyr, Mode mode, int head_tsp, int n_frames,
+                          std::vector<uint8_t>* ts, std::vector<int>* nerr, const Mat<float>* vref) {
     static const bool profile = std::getenv("ISDBT_PROFILE") != nullptr;
     auto now = [] { return std::chrono::steady_clock::now(); };
     auto sec = [](auto a, auto b) { return std::chrono::duration<double>(b - a).count(); };
-    static const bool vcheck = std::getenv("ISDBT_VITERBI_CHECK") != nullptr;
     const auto tp0 = now();
     const auto tp1 = now();
-    std::vector<uint8_t> bits = ViterbiDecodeSoft(soft.data(), soft.size(), lyr.rate);
+    std::vector<uint8_t> bits = ViterbiDecodeQ(qsoft.data(), qsoft.size(), lyr.rate);
     const size_t steps = bits.size();
     const auto tp2 = now();
-    if (vcheck) {
+    if (vref) {
+        const Mat<float>& soft = *vref;
         std::vector<float> pairs;
         const size_t st = Depuncture(soft.data(), soft.size(), lyr.rate, &pairs);
         std::vector<uint8_t> ref = ViterbiDecode(pairs.data(), st);
@@ -459,10 +460,16 @@ void DecodeRange(const Mat<cfloat>& D, const Mat<float>& csi_full, Mode mode, in
             AccumulateMer(Xt, mrows, lyr.segments, lyr.mod, dc, &sig, &err);
             if (err > 0.0) (*layers_out)[lyr.name].mer_db = 10.0 * std::log10(sig / err);
         }
-        Mat<float> soft = LayerSoftBits(Xt, Wt, rows, lyr.segments, lyr.mod, mode);
+        static const bool vcheck = std::getenv("ISDBT_VITERBI_CHECK") != nullptr;
+        std::vector<int8_t> qsoft = LayerSoftBitsQ(Xt, Wt, rows, lyr.segments, lyr.mod, mode, kViterbiSoftQ);
         auto t2 = now();
         LayerResult& lr = (*layers_out)[lyr.name];
-        DecodeSoftBitsRange(soft, lyr, mode, head_tsp, F1 - F0, &lr.ts, &lr.rs_err);
+        if (vcheck) {
+            Mat<float> soft = LayerSoftBits(Xt, Wt, rows, lyr.segments, lyr.mod, mode);
+            DecodeSoftBitsRangeQ(qsoft, lyr, mode, head_tsp, F1 - F0, &lr.ts, &lr.rs_err, &soft);
+        } else {
+            DecodeSoftBitsRangeQ(qsoft, lyr, mode, head_tsp, F1 - F0, &lr.ts, &lr.rs_err, nullptr);
+        }
         t_soft += sec(t1, t2);
         t_fec += sec(t2, now());
         lr.first_frame = F0;

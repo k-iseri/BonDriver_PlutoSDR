@@ -50,6 +50,9 @@ std::vector<uint8_t> ViterbiDecode(const float* pairs, size_t n_steps);
 // 量子化（平均振幅を 12、約 2.6 倍で飽和）で判定が変わるのはごく稀で、AVX2 が無いビルドでは
 // Depuncture + ViterbiDecode に落ちる
 std::vector<uint8_t> ViterbiDecodeSoft(const float* soft, size_t n, CodeRate rate);
+// 同上、量子化済み（±kViterbiSoftQ の int8）の軟値列を受ける版（LayerSoftBitsQ の出力用）
+inline constexpr int kViterbiSoftQ = 31;
+std::vector<uint8_t> ViterbiDecodeQ(const int8_t* qs, size_t n, CodeRate rate);
 
 // --- バイトデインターリーブ（3.7 の逆: ブランチ b を 11 - b TSP 遅延） ---
 // in/out は (n, 204)。先頭 11 TSP は履歴が無く不定（0 由来）。

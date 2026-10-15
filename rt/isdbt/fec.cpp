@@ -235,7 +235,7 @@ public:
     static constexpr int kStates = 64;
     static constexpr size_t kWindow = 1 << 16;
     static constexpr size_t kTail = 192;
-    static constexpr int kQ = 31;                   // 軟値の量子化幅（±kQ）
+    static constexpr int kQ = kViterbiSoftQ;        // 軟値の量子化幅（±kQ）
 
     ViterbiU8() {
         // 枝コスト表 {k=0: (Q−X)+(Q−Y), 1: (Q−X)+(Q+Y), 2: (Q+X)+(Q−Y), 3: (Q+X)+(Q+Y)} を pshufb で引く添字。
@@ -310,12 +310,16 @@ public:
                 qs[i] = static_cast<int8_t>(r);
             }
         }
-        const int8_t* qp = qs.data();
+        t_scale += std::chrono::duration<double>(std::chrono::steady_clock::now() - tq0).count();
+        RunQ(qs.data(), n, pat, out);
+    }
+
+    // 量子化済みの軟値列（±kQ の int8）を復号する本体
+    void RunQ(const int8_t* qp, size_t n, const PuncturePattern* pat, std::vector<uint8_t>* out) {
         const size_t period = std::strlen(pat->x);
         size_t sent = 0;
         for (size_t i = 0; i < period; ++i) sent += (pat->x[i] == '1') + (pat->y[i] == '1');
         const size_t blocks = n / sent;
-        t_scale += std::chrono::duration<double>(std::chrono::steady_clock::now() - tq0).count();
 
         __m256i pm0 = _mm256_load_si256(reinterpret_cast<const __m256i*>(&pm_[0]));
         __m256i pm1 = _mm256_load_si256(reinterpret_cast<const __m256i*>(&pm_[32]));
@@ -403,6 +407,23 @@ private:
 
 }  // namespace
 #endif  // __AVX2__
+
+std::vector<uint8_t> ViterbiDecodeQ(const int8_t* qs, size_t n, CodeRate rate) {
+    const PuncturePattern* pat = FindPuncture(rate);
+    assert(pat);
+#ifdef __AVX2__
+    std::vector<uint8_t> bits;
+    ViterbiU8 dec;
+    dec.RunQ(qs, n, pat, &bits);
+    return bits;
+#else
+    std::vector<float> soft(n);
+    for (size_t i = 0; i < n; ++i) soft[i] = static_cast<float>(qs[i]);
+    std::vector<float> pairs;
+    const size_t steps = Depuncture(soft.data(), n, rate, &pairs);
+    return ViterbiDecode(pairs.data(), steps);
+#endif
+}
 
 std::vector<uint8_t> ViterbiDecodeSoft(const float* soft, size_t n, CodeRate rate) {
     const PuncturePattern* pat = FindPuncture(rate);

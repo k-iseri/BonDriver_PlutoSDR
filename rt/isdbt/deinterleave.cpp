@@ -1,6 +1,7 @@
 #include "deinterleave.h"
 
 #include <cassert>
+#include <cmath>
 #include <map>
 #include <mutex>
 
@@ -164,6 +165,65 @@ Mat<float> LayerSoftBits(const Mat<cfloat>& Xt, const Mat<float>& Wt,
         const size_t d = static_cast<size_t>(kBitInterleaveMaxDelay - delays[i]);
         for (size_t t2 = 0; t2 < n_slots; ++t2) {
             out[t2][i] = (t2 >= d) ? soft[t2 - d][i] : 0.0f;
+        }
+    }
+    return out;
+}
+
+std::vector<int8_t> LayerSoftBitsQ(const Mat<cfloat>& Xt, const Mat<float>& Wt,
+                                   const std::vector<int>& rows, const std::vector<int>& segments,
+                                   Modulation mod, Mode mode, int q) {
+    const int dc = LayoutOf(mode).dc;
+    const int bps = BitsPerSymbol(mod);
+    const size_t slots_per_row = segments.size() * static_cast<size_t>(dc);
+    const size_t n_slots = rows.size() * slots_per_row;
+    const int* delays = BitInterleaveDelays(mod);
+    int d[8] = {};
+    for (int i = 0; i < bps; ++i) d[i] = kBitInterleaveMaxDelay - delays[i];
+
+    // 尺度: 61 スロットおきにデマップして |軟値| の平均を取る
+    double acc = 0.0;
+    size_t cnt = 0;
+    {
+        float tmp[8];
+        size_t t = 0;
+        for (int r : rows) {
+            const cfloat* xr = Xt[r];
+            const float* wr = Wt[r];
+            for (int s : segments) {
+                for (int c = 0; c < dc; ++c, ++t) {
+                    if (t % 61 != 0) continue;
+                    DemapSoft(xr[static_cast<size_t>(s) * dc + c], mod, tmp);
+                    const float w = wr[static_cast<size_t>(s) * dc + c];
+                    for (int i = 0; i < bps; ++i) acc += std::fabs(tmp[i] * w);
+                    cnt += static_cast<size_t>(bps);
+                }
+            }
+        }
+    }
+    const float scale = (acc > 0.0) ? static_cast<float>(12.0 * static_cast<double>(cnt) / acc) : 1.0f;
+    const float qmax = static_cast<float>(q), qmin = -static_cast<float>(q);
+
+    std::vector<int8_t> out(n_slots * static_cast<size_t>(bps));
+    alignas(32) float ring[128][8];                 // 直近 128 スロットのデマップ値（遅延 ≤ 120）
+    size_t t = 0;
+    for (int r : rows) {
+        const cfloat* xr = Xt[r];
+        const float* wr = Wt[r];
+        for (int s : segments) {
+            for (int c = 0; c < dc; ++c, ++t) {
+                float* cur = ring[t & 127];
+                DemapSoft(xr[static_cast<size_t>(s) * dc + c], mod, cur);
+                const float w = wr[static_cast<size_t>(s) * dc + c] * scale;
+                for (int i = 0; i < bps; ++i) cur[i] *= w;
+                int8_t* o = out.data() + t * static_cast<size_t>(bps);
+                for (int i = 0; i < bps; ++i) {
+                    const size_t di = static_cast<size_t>(d[i]);
+                    float v = (t >= di) ? ring[(t - di) & 127][i] : 0.0f;
+                    v = v > qmax ? qmax : (v < qmin ? qmin : v);
+                    o[i] = static_cast<int8_t>(static_cast<int>(v + (v >= 0 ? 0.5f : -0.5f)));
+                }
+            }
         }
     }
     return out;
