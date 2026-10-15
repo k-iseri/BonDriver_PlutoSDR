@@ -43,6 +43,8 @@ public:
     virtual ~ISymbolSource() = default;
     virtual int n_sym() const = 0;
     virtual Mat<cfloat> Symbols(int i0, int i1) = 0;
+    // 受信機の DC（LO リーク）が乗るキャリア番号（不明なら -1）。整数 CFO を打ち消した後は中央 − k_int
+    virtual int dc_carrier() const { return -1; }
 };
 
 // 同期パラメータを一度だけ推定し、Symbols(i0, i1) で有効キャリア行列を返す。
@@ -53,6 +55,7 @@ public:
     int n_sym() const override { return n_sym_; }
     const SyncInfo& info() const { return info_; }
     Mode mode() const { return mode_; }
+    int dc_carrier() const override { return ModeParamsOf(mode_).total_carriers / 2 - k_int_; }
 
     // シンボル i0..i1-1 の有効キャリア行列 (i1-i0, total_carriers)
     Mat<cfloat> Symbols(int i0, int i1) override;

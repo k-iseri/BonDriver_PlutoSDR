@@ -51,6 +51,7 @@ void Usage() {
         "                      値が空か 0 なら自動（--tsmf と同じ）\n"
         "  --device URI        libiio の URI (default usb:)。Pluto+ / LibreSDR の LAN なら ip:192.168.2.1\n"
         "  --fpga-eq auto|0|1  FPGA 前段（pluto-fw-isdbt v2）を使う (default auto)\n"
+        "  --xo-ppm auto|0|F   XO 補正（auto = 同期で測ったクロック偏差を xo_correction に書く。default auto）\n"
         "  --gain F | hw       手動ゲイン dB / AD936x の slow_attack AGC。省略時はソフト AGC\n"
         "  --agc-target F      ソフト AGC の目標帯域内レベル dBFS (default -24)\n"
         "  --fs F              取り込みレート Hz（省略時はファームのサンプル幅で自動）\n"
@@ -205,6 +206,12 @@ int main(int argc, char** argv) {
         }
         else if (a == "--agc-target") sdr_cfg.agc_target_dbfs = std::atof(value().c_str());
         else if (a == "--fpga-eq") { const std::string v = value(); sdr_cfg.fpga_eq = (v == "0") ? 0 : (v == "1") ? 1 : -1; }
+        else if (a == "--xo-ppm") {
+            const std::string v = value();
+            if (v == "auto") sdr_cfg.xo_mode = -1;
+            else if (v == "0" || v == "off") sdr_cfg.xo_mode = 0;
+            else { sdr_cfg.xo_mode = 1; sdr_cfg.xo_ppm = std::atof(v.c_str()); }
+        }
         else if (a == "--no-reconnect") sdr_cfg.reconnect = false;
         else if (a == "--win-frames") win_frames = std::atoi(value().c_str());
         else if (a == "--ctx-frames") ctx_frames = std::atoi(value().c_str());

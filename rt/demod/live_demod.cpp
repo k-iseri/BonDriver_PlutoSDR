@@ -124,6 +124,7 @@ std::string LiveDemod::StatusJson() {
     s += ", \"sdr_blocks\": " + std::to_string(sdr_->blocks());
     s += ", \"fpga_eq\": " + std::string(sdr_->fpga_eq() ? "true" : "false");
     s += ", \"fpga_delta\": " + std::to_string(sdr_->fpga_delta());
+    s += ", \"xo_ppm\": " + FormatDouble(sdr_->xo_ppm());
     s += ", \"fpga_symbols\": " + std::to_string(sdr_->fpga_symbols());
     s += ", \"fpga_symbol_gaps\": " + std::to_string(sym_gaps_.load());
     s += ", \"fpga_timeouts\": " + std::to_string(sdr_->fpga_timeouts());
@@ -417,7 +418,9 @@ void LiveDemod::SchedLoop() {
             job.abs0 = static_cast<long long>(std::llround(static_cast<double>(acc_sym[0].start) * in_per_nominal_));
             job.fut = std::async(std::launch::async, [this, P, fec_frames]() -> std::shared_ptr<DemodResult> {
                 try {
-                    return std::make_shared<DemodResult>(DemodulateEqualizedPacked(P.get(), mode_, fec_frames));
+                    // 受信機の DC（LO リーク）は中央キャリア − δ に乗る（キャリア順に並べ直した後）
+                    const int dc_k = ModeParamsOf(mode_).total_carriers / 2 - sdr_->fpga_delta();
+                    return std::make_shared<DemodResult>(DemodulateEqualizedPacked(P.get(), mode_, fec_frames, dc_k));
                 } catch (const std::exception&) {
                     return nullptr;
                 }
@@ -447,7 +450,8 @@ void LiveDemod::SchedLoop() {
                                  -> std::shared_ptr<DemodResult> {
                 try {
                     auto res = std::make_shared<DemodResult>(
-                        Demodulate(std::move(w), cfg_.fs, mode_, gi_, kDefaultBlockFrames, /*fast_fec=*/true, first_fec));
+                        Demodulate(std::move(w), cfg_.fs, mode_, gi_, kDefaultBlockFrames, /*fast_fec=*/true, first_fec,
+                                   /*null_dc=*/true));
                     return res;
                 } catch (const std::exception&) {
                     return nullptr;         // 同期失敗（無信号など）
@@ -481,6 +485,11 @@ void LiveDemod::SchedLoop() {
                 locked_ = false;
                 if (verbose_) std::fprintf(stderr, "window @%lld: sync failed\n", job.abs0);
                 continue;
+            }
+            // raw 経路: 同期で測ったサンプルクロック偏差を SDR に伝える（XO 補正。接続ごとに 1 回だけ書かれる）
+            if (!sdr_->fpga_eq() && sdr_->SuggestClockPpm(res->sync.clock_ppm)) {
+                if (verbose_) std::fprintf(stderr, "window @%lld: clock %+.2f ppm -> xo_correction applied; resyncing\n",
+                                           job.abs0, res->sync.clock_ppm);
             }
             Emit(*res, job.abs0);
         }

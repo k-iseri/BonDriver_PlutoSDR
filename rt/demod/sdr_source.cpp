@@ -25,6 +25,8 @@ void SdrSource::Start(const SdrConfig&, BlockFn, EventFn, SymbolFn) {
 }
 void SdrSource::Retune(double) {}
 void SdrSource::SetBandwidth(double) {}
+bool SdrSource::SuggestClockPpm(double) { return false; }
+bool SdrSource::ApplyXoPpmLocked(::iio_device*, double) { return false; }
 void SdrSource::EnableFpgaFrontEnd(bool) {}
 void SdrSource::Stop() {}
 void SdrSource::Run() {}
@@ -57,6 +59,22 @@ void WriteAttr(const iio_channel* ch, const char* name, const std::string& value
 }
 
 std::string FormatLL(double v) { return std::to_string(static_cast<long long>(v)); }
+
+// デバイス属性（ad9361-phy の xo_correction など）
+void WriteDevAttr(const iio_device* dev, const char* name, const std::string& value) {
+    const iio_attr* attr = iio_device_find_attr(dev, name);
+    if (!attr) throw std::runtime_error(std::string("device attr not found: ") + name);
+    const ssize_t r = iio_attr_write_string(attr, value.c_str());
+    if (r < 0) Fail(std::string("write ") + name + "=" + value, static_cast<int>(r));
+}
+std::string ReadDevAttr(const iio_device* dev, const char* name) {
+    const iio_attr* attr = iio_device_find_attr(dev, name);
+    if (!attr) throw std::runtime_error(std::string("device attr not found: ") + name);
+    char buf[64] = {};
+    const ssize_t r = iio_attr_read_raw(attr, buf, sizeof(buf) - 1);
+    if (r < 0) Fail(std::string("read ") + name, static_cast<int>(r));
+    return std::string(buf);
+}
 
 // axi_ad9361 コア（cf-ad9361-lpc）の overflow 監視。
 // cf_axi_adc の debugfs_reg_access はアドレスにこのマジックを立てると AXI コアレジスタを
@@ -94,7 +112,9 @@ constexpr int kFeTotal = 5617;
 constexpr int kFeCenter = 2808;
 constexpr int kFeEqWords = (kFeTotal * 3 + 3) / 4;   // 4213
 constexpr int kFeSettleBlocks = 8;          // raw でソフト AGC を走らせる時間（≈ 1.0 秒。AGC は 4 ブロックごとに 1 段動く。5 だと選局後の同期失敗が増えた）
-constexpr int kFeCfoFrames = 16;            // 整数 CFO 推定に使う同期 FFT の窓数
+constexpr int kFeCfoFrames = 128;           // 整数 CFO と窓開始の傾き（クロック偏差）の推定に使う同期 FFT の窓数（約 0.15 s）
+constexpr double kFeSymbolSamples = 9216.0; // 前段が前提とするシンボル長（Mode 3、GI 1/8）
+constexpr double kXoNominalHz = 40e6;       // Pluto の XO 公称
 constexpr int kFeCfoTimeoutBlocks = 40;     // モード 3 で窓が来ないときの諦め（≈ 5 秒 → raw へ戻してやり直す）
 constexpr int kFeWarmupSymbols = 1024;       // モード 4 に入ってから捨てるシンボル数（時間軸の立ち上がり 256 シンボルで B 層が崩れる）
 
@@ -131,6 +151,7 @@ struct SdrSource::Impl {
     iio_channel* phy_rx = nullptr;      // ad9361-phy voltage0 (input): rate/bw/gain
     iio_channel* phy_lo = nullptr;      // ad9361-phy altvoltage0 (output): RX LO
     iio_device* rxdev = nullptr;        // 非 const（iio_device_reg_read/write が要求）
+    iio_device* phy = nullptr;          // ad9361-phy（xo_correction）
     size_t block_samples = 0;
 };
 
@@ -188,10 +209,18 @@ void SdrSource::Connect() {
         iio_device* rxdev = iio_context_find_device(ctx, "cf-ad9361-lpc");
         if (!phy || !rxdev) throw std::runtime_error("ad9361-phy / cf-ad9361-lpc が見つからない（Pluto 系か確認）");
         im.rxdev = rxdev;
+        im.phy = phy;
 
         im.phy_rx = iio_device_find_channel(phy, "voltage0", false);
         im.phy_lo = iio_device_find_channel(phy, "altvoltage0", true);
         if (!im.phy_rx || !im.phy_lo) throw std::runtime_error("ad9361-phy のチャンネルが見つからない");
+        // XO 補正（固定値指定）。自動は同期で測ってから SuggestClockPpm / 前段のモード 3 で書く
+        xo_applied_ = false;
+        xo_ppm_ = 0.0;
+        if (cfg_.xo_mode == 1) {
+            std::lock_guard<std::mutex> lk(mu_);
+            ApplyXoPpmLocked(phy, cfg_.xo_ppm);
+        }
         WriteAttr(im.phy_rx, "sampling_frequency", FormatLL(cfg_.fs));
         WriteAttr(im.phy_rx, "rf_bandwidth", FormatLL(cfg_.bw));
         double freq;
@@ -292,6 +321,35 @@ void SdrSource::Teardown() {
     impl_->ctx = nullptr;
     impl_->phy_rx = impl_->phy_lo = nullptr;
     impl_->rxdev = nullptr;
+}
+
+bool SdrSource::ApplyXoPpmLocked(::iio_device* phy, double ppm) {
+    if (!phy) return false;
+    try {
+        const double cur = std::atof(ReadDevAttr(phy, "xo_correction").c_str());
+        const double base = (cur > 1e6) ? cur : kXoNominalHz;
+        const long long next = std::llround(base * (1.0 + ppm * 1e-6));
+        WriteDevAttr(phy, "xo_correction", std::to_string(next));
+        xo_ppm_ = (static_cast<double>(next) / kXoNominalHz - 1.0) * 1e6;
+        xo_applied_ = true;
+        std::fprintf(stderr, "sdr: xo_correction %lld -> %lld Hz (%+.2f ppm; measured %+.2f ppm)\n",
+                     static_cast<long long>(cur), next, xo_ppm_.load(), ppm);
+        return true;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "sdr: xo_correction failed: %s\n", e.what());
+        xo_applied_ = true;             // 二度と試さない（純正でない phy など）
+        return false;
+    }
+}
+
+bool SdrSource::SuggestClockPpm(double ppm) {
+    if (cfg_.xo_mode != -1 || xo_applied_) return false;
+    if (!(std::fabs(ppm) >= 1.0 && std::fabs(ppm) <= 100.0)) return false;    // 測定不良や NaN は無視
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!connected_ || !impl_) return false;
+    if (!ApplyXoPpmLocked(impl_->phy, ppm)) return false;
+    if (fpga_capable_) fe_restart_ = true;      // LO とレートが変わったので前段は raw からやり直す
+    return true;
 }
 
 void SdrSource::Retune(double freq_hz) {
@@ -407,6 +465,9 @@ void SdrSource::Run() {
     FeParser parser;
     std::vector<double> cfo_pow(static_cast<size_t>(kFeN), 0.0);
     int cfo_frames = 0;
+    std::vector<double> cfo_seq, cfo_start;     // モード 3 の窓ヘッダ（連番、窓開始）: 傾きからクロック偏差
+    uint32_t cfo_start_prev = 0;
+    uint64_t cfo_start_hi = 0;
     const bool fe_wanted = fpga_capable_ && cfg_.fpga_eq != 0 && on_symbol_;
     FILE* fe_dump = nullptr;            // 開発用: ISDBT_FE_DUMP=path で前段フレーム列をそのまま書く
     if (const char* dp = std::getenv("ISDBT_FE_DUMP")) fe_dump = std::fopen(dp, "wb");
@@ -498,7 +559,36 @@ void SdrSource::Run() {
                         const double bi = b[2 * i], bq = b[2 * i + 1];
                         cfo_pow[static_cast<size_t>(i)] += bi * bi + bq * bq;
                     }
+                    {
+                        const uint32_t lo = w[2];
+                        if (!cfo_seq.empty() && lo < cfo_start_prev && (cfo_start_prev - lo) > 0x80000000u) cfo_start_hi += 1;
+                        cfo_start_prev = lo;
+                        cfo_seq.push_back(static_cast<double>(w[4]));
+                        cfo_start.push_back(static_cast<double>((cfo_start_hi << 32) | lo));
+                    }
                     if (++cfo_frames >= kFeCfoFrames) {
+                        // 窓開始の連番に対する傾き = 実測シンボル長 → サンプルクロック偏差。|ppm| ≥ 1 なら XO を補正して
+                        // raw からやり直す（接続ごとに 1 回。SFO が残ると帯域端の ICI で B 層が頭打ちになる）
+                        if (cfg_.xo_mode == -1 && !xo_applied_ && cfo_seq.size() >= 32) {
+                            const size_t n = cfo_seq.size();
+                            double mx = 0.0, my = 0.0;
+                            for (size_t i = 0; i < n; ++i) { mx += cfo_seq[i]; my += cfo_start[i] - cfo_start[0]; }
+                            mx /= static_cast<double>(n); my /= static_cast<double>(n);
+                            double sxx = 0.0, sxy = 0.0;
+                            for (size_t i = 0; i < n; ++i) {
+                                const double dx = cfo_seq[i] - mx;
+                                sxx += dx * dx;
+                                sxy += dx * ((cfo_start[i] - cfo_start[0]) - my);
+                            }
+                            if (sxx > 0.0) {
+                                const double ppm = (sxy / sxx / kFeSymbolSamples - 1.0) * 1e6;
+                                if (SuggestClockPpm(ppm)) {
+                                    fe_restart_ = false;
+                                    fe_to_raw();
+                                    return;
+                                }
+                            }
+                        }
                         int best_d = 0;
                         double best_e = -1.0;
                         for (int d = -100; d <= 100; ++d) {
@@ -616,6 +706,9 @@ void SdrSource::Run() {
             parser.Reset();
             std::fill(cfo_pow.begin(), cfo_pow.end(), 0.0);
             cfo_frames = 0;
+            cfo_seq.clear();
+            cfo_start.clear();
+            cfo_start_hi = 0;
             fe_write(kRegDecim, 1);
             fe_write(kRegMode, 3);
             fe = Fe::kCfo;

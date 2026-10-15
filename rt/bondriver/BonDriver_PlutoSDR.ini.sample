@@ -34,6 +34,10 @@ Reconnect=1
 ; FPGA 前段（pluto-fw-isdbt v2 の同期・FFT・等化器）。auto = ファームにあれば使う（既定）、0 = 使わない
 ; （raw I/Q をホストで復調）、1 = 必須（無いファームでは開けない）。地デジのみ。CATV は常に raw
 FpgaEq=auto
+; XO（基準発振器）の周波数補正。auto: 選局後に同期で測ったサンプルクロック偏差を AD9361 の xo_correction に書く
+; （接続ごとに 1 回。LO のずれ = CFO とサンプルレートのずれ = SFO が同時に直り、FPGA 前段で B 層 MER が 3〜6 dB 上がる）。
+; 0: 書かない。数値: その ppm を接続時に書く（例 -16.1）
+XoPpm=auto
 ; 伝送モードと GI（日本の実運用は Mode 3 / GI 1/8 固定）
 Mode=3
 GI=1/8

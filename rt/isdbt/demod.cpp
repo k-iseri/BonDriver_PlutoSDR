@@ -65,14 +65,17 @@ inline float SliceLevel(float v, float max_level) {
 // 最近傍コンスタレーション点との誤差を積算する（MER 用）
 void AccumulateMer(const Mat<cfloat>& Xt, const std::vector<int>& rows,
                    const std::vector<int>& segments, Modulation mod, int dc,
-                   double* sig, double* err) {
+                   double* sig, double* err, const Mat<float>* W) {
     const float norm = ConstellationNorm(mod);
     const float max_level = MaxLevelOf(mod);
     for (int r : rows) {
         const cfloat* row = Xt[r];
+        const float* wrow = W ? (*W)[r] : nullptr;
         for (int s : segments) {
             const cfloat* p = row + static_cast<size_t>(s) * dc;
+            const float* w = wrow ? wrow + static_cast<size_t>(s) * dc : nullptr;
             for (int c = 0; c < dc; ++c) {
+                if (w && w[c] == 0.0f) continue;        // 消失扱い（干渉・DC スパー）のキャリアは MER に含めない
                 const float i = p[c].real() * norm;
                 const float q = p[c].imag() * norm;
                 const float si = SliceLevel(i, max_level), sq = SliceLevel(q, max_level);
@@ -167,7 +170,7 @@ FrameSyncInfo FrameSync(ISymbolSource* src, Mode mode) {
 void EqualizeAndDeinterleave(const Mat<cfloat>& Y, Mode mode, int frame_start,
                              const std::vector<RxLayer>& layers,
                              const std::vector<std::vector<int>>& groups,
-                             Mat<cfloat>* H_out, Mat<cfloat>* Xt, Mat<float>* Wt, bool fast) {
+                             Mat<cfloat>* H_out, Mat<cfloat>* Xt, Mat<float>* Wt, bool fast, int null_center) {
     static const bool profile = std::getenv("ISDBT_PROFILE") != nullptr;
     auto now = [] { return std::chrono::steady_clock::now(); };
     auto sec = [](auto a, auto b) { return std::chrono::duration<double>(b - a).count(); };
@@ -180,6 +183,13 @@ void EqualizeAndDeinterleave(const Mat<cfloat>& Y, Mode mode, int frame_start,
     Equalize(Y, H, &D, &csi);
     for (size_t r = 0; r < csi.rows; ++r) {     // バースト検出シンボルは消失扱い
         if (bad[r]) std::fill(csi[r], csi[r] + csi.cols, 0.0f);
+    }
+    if (null_center >= 0) {                     // 受信機の DC スパーが乗るキャリアとその周囲は消失扱い
+        const int k0 = std::max(0, null_center - kNullDcHalfWidth);
+        const int k1 = std::min(static_cast<int>(csi.cols) - 1, null_center + kNullDcHalfWidth);
+        for (size_t r = 0; r < csi.rows; ++r) {
+            for (int k = k0; k <= k1; ++k) csi[r][static_cast<size_t>(k)] = 0.0f;
+        }
     }
     if (H_out) *H_out = std::move(H);
     const auto t2 = now();
@@ -223,6 +233,7 @@ void AccumulateMerPacked(const Mat<uint32_t>& Xt, const std::vector<int>& rows,
         for (int s : segments) {
             const uint32_t* p = row + static_cast<size_t>(s) * dc;
             for (int c = 0; c < dc; ++c) {
+                if (((p[c] >> 16) & 0xFFu) == 0) continue;     // CSI 0（消失扱い）のキャリアは MER に含めない
                 const cfloat x = PackedIq(p[c]);
                 const float i = x.real() * norm, q = x.imag() * norm;
                 const float si = SliceLevel(i, max_level), sq = SliceLevel(q, max_level);
@@ -576,7 +587,8 @@ namespace {
 void DecodeSource(ISymbolSource* src, Mode mode, int block_frames,
                   FrameSyncInfo* fsi_out, std::map<std::string, LayerResult>* layers_out,
                   const Mat<float>* csi_full = nullptr, bool fast_fec = false, int first_fec_frame = 0,
-                  int* emit_first = nullptr, int* emit_end = nullptr) {
+                  int* emit_first = nullptr, int* emit_end = nullptr, bool null_dc = false) {
+    const int null_center = null_dc ? src->dc_carrier() : -1;
     *fsi_out = FrameSync(src, mode);
     const FrameSyncInfo& fsi = *fsi_out;
     const int f0 = fsi.frame_start;
@@ -618,7 +630,8 @@ void DecodeSource(ISymbolSource* src, Mode mode, int block_frames,
             DeinterleaveEqualized(Y, csi, mode, f0 - fe.s0, fsi.layers, fsi.groups, &fe.Xt, &fe.Wt);
         } else {
             // ライブ（fast_fec）は干渉検出も 1 パス版（FPGA 前段経路と同じ）
-            EqualizeAndDeinterleave(Y, mode, f0 - fe.s0, fsi.layers, fsi.groups, nullptr, &fe.Xt, &fe.Wt, fast_fec);
+            EqualizeAndDeinterleave(Y, mode, f0 - fe.s0, fsi.layers, fsi.groups, nullptr, &fe.Xt, &fe.Wt, fast_fec,
+                                    null_center);
         }
         return fe;
     };
@@ -667,7 +680,7 @@ void DecodeSource(ISymbolSource* src, Mode mode, int block_frames,
                         mrows.push_back((f0 - fe.s0) + r);
                     }
                     auto& acc = mer_acc[lyr.name];
-                    AccumulateMer(fe.Xt, mrows, lyr.segments, lyr.mod, dc, &acc.first, &acc.second);
+                    AccumulateMer(fe.Xt, mrows, lyr.segments, lyr.mod, dc, &acc.first, &acc.second, &fe.Wt);
                 }
                 std::vector<int8_t> qsoft = LayerSoftBitsQ(fe.Xt, fe.Wt, rows, lyr.segments, lyr.mod, mode, kViterbiSoftQ);
                 auto t2 = now();
@@ -704,7 +717,7 @@ void DecodeSource(ISymbolSource* src, Mode mode, int block_frames,
                     mrows.push_back((f0 - fe.s0) + r);
                 }
                 auto& acc = mer_acc[lyr.name];
-                AccumulateMer(fe.Xt, mrows, lyr.segments, lyr.mod, dc, &acc.first, &acc.second);
+                AccumulateMer(fe.Xt, mrows, lyr.segments, lyr.mod, dc, &acc.first, &acc.second, &fe.Wt);
             }
             std::vector<uint8_t> ts;
             std::vector<int> nerr;
@@ -815,7 +828,7 @@ void DecodeRange(const Mat<cfloat>& D, const Mat<float>& csi_full, Mode mode, in
             std::vector<int> mrows;
             for (int r = base + F0 * kSymbolsPerFrame; r < base + F1 * kSymbolsPerFrame; ++r) mrows.push_back(r);
             double sig = 0.0, err = 0.0;
-            AccumulateMer(Xt, mrows, lyr.segments, lyr.mod, dc, &sig, &err);
+            AccumulateMer(Xt, mrows, lyr.segments, lyr.mod, dc, &sig, &err, &Wt);
             if (err > 0.0) (*layers_out)[lyr.name].mer_db = 10.0 * std::log10(sig / err);
         }
         static const bool vcheck = std::getenv("ISDBT_VITERBI_CHECK") != nullptr;
@@ -846,7 +859,7 @@ namespace {
 
 void DecodeRangePacked(Mat<uint32_t>* P, Mode mode, int fec_frames,
                        FrameSyncInfo* fsi_out, std::map<std::string, LayerResult>* layers_out,
-                       int* emit_first, int* emit_end) {
+                       int* emit_first, int* emit_end, int null_center = -1) {
     PackedSource src(P);
     const auto tfs0 = std::chrono::steady_clock::now();
     *fsi_out = FrameSync(&src, mode);
@@ -879,6 +892,14 @@ void DecodeRangePacked(Mat<uint32_t>* P, Mode mode, int fec_frames,
     auto sec = [](auto a, auto b) { return std::chrono::duration<double>(b - a).count(); };
     const auto q0 = now();
     NullInterferedCarriersPacked(P, static_cast<size_t>(s0), static_cast<size_t>(s1), mode, f0, fsi.layers);
+    if (null_center >= 0) {                     // 受信機の DC スパー（中央 − δ）の周囲: CSI バイトを 0 に
+        const int k0 = std::max(0, null_center - kNullDcHalfWidth);
+        const int k1 = std::min(static_cast<int>(P->cols) - 1, null_center + kNullDcHalfWidth);
+        for (size_t r = static_cast<size_t>(s0); r < static_cast<size_t>(s1) && r < P->rows; ++r) {
+            uint32_t* row = (*P)[r];
+            for (int k = k0; k <= k1; ++k) row[k] &= 0xFF00FFFFu;
+        }
+    }
     const auto q1 = now();
     Mat<uint32_t> Yl = DataToLogicalDeintRange(*P, mode, f0, fsi.groups, static_cast<size_t>(s0), static_cast<size_t>(s1));
     const auto q2 = now();
@@ -923,12 +944,12 @@ void DecodeRangePacked(Mat<uint32_t>* P, Mode mode, int fec_frames,
 
 }  // namespace
 
-DemodResult DemodulateEqualizedPacked(Mat<uint32_t>* P, Mode mode, int fec_frames) {
+DemodResult DemodulateEqualizedPacked(Mat<uint32_t>* P, Mode mode, int fec_frames, int null_center) {
     DemodResult out;
     out.sync.gi_start0 = 0.0;
     out.sync.n_sym = static_cast<int>(P->rows);
     out.sync.fft_size = ModeParamsOf(mode).fft_size;
-    DecodeRangePacked(P, mode, fec_frames, &out.fsi, &out.layers, &out.emit_first, &out.emit_end);
+    DecodeRangePacked(P, mode, fec_frames, &out.fsi, &out.layers, &out.emit_first, &out.emit_end, null_center);
     return out;
 }
 
@@ -948,12 +969,12 @@ DemodResult DemodulateEqualized(const Mat<cfloat>& D, const Mat<float>& csi, Mod
 }
 
 DemodResult Demodulate(std::vector<cfloat> iq, double fs, Mode mode, Gi gi, int block_frames, bool fast_fec,
-                       int first_fec_frame) {
+                       int first_fec_frame, bool null_dc) {
     CarrierSource src(std::move(iq), fs, mode, gi);
     DemodResult out;
     out.sync = src.info();
     DecodeSource(&src, mode, block_frames, &out.fsi, &out.layers, nullptr, fast_fec, first_fec_frame,
-                 &out.emit_first, &out.emit_end);
+                 &out.emit_first, &out.emit_end, null_dc);
     return out;
 }
 

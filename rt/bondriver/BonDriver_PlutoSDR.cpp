@@ -93,6 +93,8 @@ struct Config {
 		double gainDb = 30.0;       // Gain=数値 → 手動固定 / ソフト AGC の初期値
 		double agcTargetDbfs = -24.0;
 		int fpgaEq = -1;            // FpgaEq= auto(-1) / 0 / 1（FPGA 前段。SdrConfig::fpga_eq）
+		int xoMode = -1;            // XoPpm= auto(-1) / 0 / 数値(1)（XO 補正。SdrConfig::xo_mode）
+		double xoPpm = 0.0;
 		bool reconnect = true;      // USB 瞬断などストリームエラー時の自動再接続
 		int mode = 3;
 		std::string gi = "1/8";
@@ -173,6 +175,12 @@ Config LoadConfig()
 	{
 		const std::wstring fe = ReadIniString(L"SDR", L"FpgaEq", L"auto", c.iniPath);
 		c.sdr.fpgaEq = (fe == L"0") ? 0 : (fe == L"1") ? 1 : -1;
+	}
+	{
+		const std::wstring xo = ReadIniString(L"SDR", L"XoPpm", L"auto", c.iniPath);
+		if (xo == L"auto" || xo.empty()) c.sdr.xoMode = -1;
+		else if (xo == L"0" || xo == L"off") c.sdr.xoMode = 0;
+		else { c.sdr.xoMode = 1; c.sdr.xoPpm = _wtof(xo.c_str()); }
 	}
 	c.sdr.mode = (int)GetPrivateProfileIntW(L"SDR", L"Mode", 3, c.iniPath.c_str());
 	c.sdr.gi = Narrow(ReadIniString(L"SDR", L"GI", L"1/8", c.iniPath));
@@ -590,6 +598,8 @@ BOOL CBonDriverPlutoSDR::OpenTunerSdr()
 		lp.sdr.agc_target_dbfs = m_cfg.sdr.agcTargetDbfs;
 		lp.sdr.reconnect = m_cfg.sdr.reconnect;
 		lp.sdr.fpga_eq = m_cfg.sdr.fpgaEq;
+		lp.sdr.xo_mode = m_cfg.sdr.xoMode;
+		lp.sdr.xo_ppm = m_cfg.sdr.xoPpm;
 		lp.sdr.freq_hz = isdbt::ChannelToHz(27);    // SetChannel までの仮周波数（isdbtd --sdr と同じ）
 		lp.mode = (isdbt::Mode)m_cfg.sdr.mode;
 		if (!isdbt::ParseGi(m_cfg.sdr.gi, &lp.gi)) {

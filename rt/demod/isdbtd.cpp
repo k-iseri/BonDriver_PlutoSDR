@@ -734,6 +734,8 @@ void Usage() {
         "  --gain F | hw       手動ゲイン dB / AD936x の slow_attack AGC。省略時はソフト AGC\n"
         "  --agc-target F      ソフト AGC の目標帯域内レベル dBFS (default -24)\n"
         "  --fpga-eq auto|0|1  FPGA 前段（pluto-fw-isdbt v2 の同期・FFT・等化）を使う (default auto)\n"
+        "  --xo-ppm auto|0|F   XO 補正: auto = 同期で測ったクロック偏差を AD9361 の xo_correction に書く（接続ごとに 1 回、\n"
+        "                      default）、0 = 書かない、F = この ppm を接続時に書く\n"
         "  --bw F              RF 帯域幅 Hz を固定（省略時は方式ごとの既定: 地デジ 5.6 MHz / ISDB-C 6 MHz）\n"
         "  --no-reconnect      ストリームエラー時に自動再接続しない（既定は再接続）\n"
         "  --win-frames N      ウィンドウの新規フレーム数 (default 8。選局後の遅延 vs CPU 効率)\n"
@@ -778,6 +780,12 @@ int main(int argc, char** argv) {
         }
         else if (a == "--agc-target") sdr_cfg.agc_target_dbfs = std::atof(next().c_str());
         else if (a == "--fpga-eq") { const std::string v = next(); sdr_cfg.fpga_eq = (v == "0") ? 0 : (v == "1") ? 1 : -1; }
+        else if (a == "--xo-ppm") {
+            const std::string v = next();
+            if (v == "auto") sdr_cfg.xo_mode = -1;
+            else if (v == "0" || v == "off") sdr_cfg.xo_mode = 0;
+            else { sdr_cfg.xo_mode = 1; sdr_cfg.xo_ppm = std::atof(v.c_str()); }
+        }
         else if (a == "--no-reconnect") sdr_cfg.reconnect = false;
         else if (a == "--dump-iq") dump_iq = next();
         else if (a == "--win-frames") win_frames = std::atoi(next().c_str());

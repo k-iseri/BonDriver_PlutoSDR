@@ -18,6 +18,8 @@
 #include <string>
 #include <thread>
 
+struct iio_device;     // libiio の不透明型（ad9361-phy。ヘッダは libiio に依存しない）
+
 namespace isdbt {
 
 struct SdrConfig {
@@ -51,6 +53,14 @@ struct SdrConfig {
     // 受け取る）。-1 = 自動（CAPS bit3 があれば使う）、0 = 使わない（raw I/Q）、1 = 必須（無ければ Start が失敗）。
     // 選局直後は raw I/Q でソフト AGC を約 1 秒走らせ、モード 3（同期 FFT）で整数 CFO を求めてからモード 4 へ移る
     int fpga_eq = -1;
+    // XO（基準発振器）の周波数補正。Pluto の XO は数十 ppm ずれていて、LO（CFO）とサンプルレート（SFO）が同じ
+    // 比率でずれる。SFO はホストの raw 経路では分数リサンプルで吸収するが FPGA 前段（等化モード）は補正しないので、
+    // 帯域端のキャリアほど ICI が増え、16 ppm で B 層の MER が約 24 dB に頭打ちになっていた（2026-10-16、ch27）。
+    // AD9361 の xo_correction にずれを書くと LO とサンプルレートの両方が直る。
+    //   xo_mode = -1: 自動（接続ごとに 1 回、同期で測ったクロック偏差を書く。|ppm| < 1 なら書かない）
+    //             0: 何もしない   1: xo_ppm の値を接続時に書く（測定済みの個体値を ini / 引数で与える）
+    int xo_mode = -1;
+    double xo_ppm = 0.0;
 };
 
 // FPGA 等化器の 1 シンボル（キャリア順）。I/Q は 1/64 単位の int8、CSI は 1/64 単位の uint8
@@ -119,6 +129,10 @@ public:
     long long fpga_timeouts() const { return fe_timeouts_; }
     uint64_t fpga_last_start() const { return fpga_last_start_; }   // 直近のシンボルの窓開始（64bit に伸ばした後）
     uint32_t fpga_last_start_hi() const { return fpga_last_start_hi_; }   // ファームが出した上位 32bit そのまま（v2.0.1 以降は非 0 になる）
+    // XO 補正: 復調側で測ったサンプルクロック偏差 [ppm]（受信が公称より遅ければ負）を伝える。自動モードで未適用なら
+    // xo_correction に書いて true（LO とサンプルレートが変わるので呼び手の同期はやり直しになる）。例外を投げない
+    bool SuggestClockPpm(double ppm);
+    double xo_ppm() const { return xo_ppm_; }               // 適用済みの XO 補正量 [ppm]（40 MHz 公称比）
 
 private:
     void Run();
@@ -155,6 +169,9 @@ private:
     std::atomic<uint64_t> fpga_last_start_{0};
     std::atomic<uint32_t> fpga_last_start_hi_{0};
     std::atomic<bool> fe_restart_{false};   // Retune: raw からやり直す（AGC → δ → モード 4）
+    std::atomic<double> xo_ppm_{0.0};
+    std::atomic<bool> xo_applied_{false};   // 接続ごとに 1 回だけ（再接続で false に戻す）
+    bool ApplyXoPpmLocked(::iio_device* phy, double ppm);   // mu_ を持って呼ぶ
     std::atomic<bool> fe_enabled_{true};    // EnableFpgaFrontEnd（false の間は raw のまま）
     std::atomic<bool> muted_{false};        // 周波数設定の失敗中: ブロックもシンボルも渡さない
     uint32_t fe_start_lo_ = 0;              // 前段ヘッダの窓開始（下位 32bit）の前回値と、2^32 の周回数（受信スレッドだけが触る）

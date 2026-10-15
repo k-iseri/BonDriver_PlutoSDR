@@ -57,8 +57,12 @@ struct DemodResult {
 // first_fec_frame: この受信フレームから FEC を始める（前段・時間デインターリーブの履歴はその前から取る）。
 // ライブのウィンドウは先頭の文脈フレームが前のウィンドウで排出済みなので、そこの FEC を省く
 inline constexpr int kDefaultBlockFrames = 6;
+// null_dc: 受信機の DC（LO リーク）が乗るキャリア（中央 − 整数 CFO）とその両隣 kNullDcHalfWidth 本を消失扱いにする
+// （ライブ受信用。AD9363 では DC スパーが中央キャリアに乗り、そこが SP でもあるので周囲の等化も崩れて
+//   A 層 MER が 3〜4 dB 落ちていた。2026-10-16）。ref/ との一致テストでは使わない
 DemodResult Demodulate(std::vector<cfloat> iq, double fs, Mode mode, Gi gi, int block_frames = kDefaultBlockFrames,
-                       bool fast_fec = false, int first_fec_frame = 0);
+                       bool fast_fec = false, int first_fec_frame = 0, bool null_dc = false);
+inline constexpr int kNullDcHalfWidth = 3;
 
 // 追従型（長時間・クロックドリフト・瞬断向け）: ロック区間ごとにフレーム同期からやり直す
 struct TrackedSegment {
@@ -82,7 +86,8 @@ TrackedResult DemodulateTracked(std::vector<cfloat> iq, double fs, Mode mode, Gi
 void EqualizeAndDeinterleave(const Mat<cfloat>& Y, Mode mode, int frame_start,
                              const std::vector<RxLayer>& layers,
                              const std::vector<std::vector<int>>& groups,
-                             Mat<cfloat>* H_out, Mat<cfloat>* Xt, Mat<float>* Wt, bool fast = false);
+                             Mat<cfloat>* H_out, Mat<cfloat>* Xt, Mat<float>* Wt, bool fast = false,
+                             int null_center = -1);
 
 // 等化済みキャリア（D = Y/H と CSI）からデインターリーブ以降。FPGA 等化器（pluto-fw-isdbt モード 4）の
 // 出力をホスト後段に渡す入口。EqualizeAndDeinterleave の等化部分を飛ばしたもの
@@ -113,7 +118,7 @@ DemodResult DemodulateEqualized(const Mat<cfloat>& D, const Mat<float>& csi, Mod
 // FPGA 前段の等化済みキャリアを {I8, Q8, CSI8, 0}（下位バイトから）の 32bit に詰めたまま後段を通す範囲復号
 // （ライブ用）。I/Q は 1/64 単位の int8、CSI は 1/64 単位の uint8。cfloat/float の行列を作らないので、
 // デインターリーブのメモリ往復が 3 分の 1 になる。結果は DemodulateEqualized の範囲復号と同じ形式
-DemodResult DemodulateEqualizedPacked(Mat<uint32_t>* P, Mode mode, int fec_frames);
+DemodResult DemodulateEqualizedPacked(Mat<uint32_t>* P, Mode mode, int fec_frames, int null_center = -1);
 // 範囲復号の助走。先頭はバイトデインターリーブの履歴 11 TSP + ビタビの立ち上がりを含み、どの階層でも
 // TSP 境界に揃うシンボル数（102 = 51 × 2: TSP/フレーム が 4 の倍数なら 102 × tpf / 204 は整数）
 inline constexpr int kFecHeadSymbols = 102;
