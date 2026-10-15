@@ -7,9 +7,30 @@ isdbtd の `--stdout` モードは recpt1 などと同じ「選局して TS を�
 
 ## 準備
 
-1. libiio 1.x（`--sdr` に必要）。macOS は `brew install libiio`、Ubuntu / Raspberry Pi OS は
-   [libiio](https://github.com/analogdevicesinc/libiio) v1 をソースからビルド（`cmake -DWITH_USB_BACKEND=ON`）。
-   0.x 系（apt の libiio-dev）は API が違うので使えない。
+1. libiio 1.x（`--sdr` に必要）。Homebrew に formula は無く、apt の libiio-dev は 0.x 系で API が
+   違うので使えない。macOS / Ubuntu / Raspberry Pi OS とも
+   [libiio](https://github.com/analogdevicesinc/libiio) v1 をソースからビルドする（macOS の依存は
+   `brew install cmake pkgconf libusb zstd`、Ubuntu は `apt install cmake pkg-config libusb-1.0-0-dev
+   libxml2-dev libzstd-dev`）:
+   ```
+   git clone --depth 1 https://github.com/analogdevicesinc/libiio.git && cd libiio
+   cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/opt/homebrew \
+         -DOSX_FRAMEWORK=OFF -DOSX_PACKAGE=OFF -DWITH_USB_BACKEND=ON -DWITH_NETWORK_BACKEND=ON \
+         -DWITH_SERIAL_BACKEND=OFF -DWITH_IIOD=OFF -DWITH_EXAMPLES=OFF -DWITH_TESTS=OFF
+   cmake --build build -j && cmake --install build      # Linux は PREFIX を /usr/local にして sudo
+   iio_info --version                                   # "Libiio version: 1.x ... backends: ip usb xml"
+   ```
+   `-DWITH_TESTS=ON`（libiio 自身の単体テスト）は macOS で `ar` が失敗するので付けない。
+   macOS では dylib の install_name が `@rpath/libiio.1.dylib`、実行ファイルの rpath が framework
+   配置向けのままで `iio_info` が `Library not loaded: @rpath/libiio.1.dylib` で落ちる。絶対パスに直す:
+   ```
+   install_name_tool -id /opt/homebrew/lib/libiio.1.dylib /opt/homebrew/lib/libiio.1.0.0.dylib
+   codesign -f -s - /opt/homebrew/lib/libiio.1.0.0.dylib
+   for b in /opt/homebrew/bin/iio_*; do
+     install_name_tool -change @rpath/libiio.1.dylib /opt/homebrew/lib/libiio.1.dylib "$b"; codesign -f -s - "$b"
+   done
+   ```
+   以降にリンクする isdbtd には絶対パスが記録されるので、この手当ては一度で済む。
 2. `make rt` で `rt/build/rt-native/isdbtd` を作り、PATH の通る場所に置く。
 3. Pluto を USB で繋ぎ、`iio_info -u usb:` で見えることを確認（Linux は udev ルールで一般ユーザーに許可）。
 4. 動作確認（TS がファイルに出て、Ctrl-C で止まる）:
