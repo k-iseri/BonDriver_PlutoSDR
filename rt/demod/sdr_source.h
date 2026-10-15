@@ -151,6 +151,9 @@ private:
     std::atomic<bool> fe_restart_{false};   // Retune: raw からやり直す（AGC → δ → モード 4）
     std::atomic<bool> fe_enabled_{true};    // EnableFpgaFrontEnd（false の間は raw のまま）
     std::atomic<bool> muted_{false};        // 周波数設定の失敗中: ブロックもシンボルも渡さない
+    uint32_t fe_start_lo_ = 0;              // 前段ヘッダの窓開始（下位 32bit）の前回値と、2^32 の周回数（受信スレッドだけが触る）
+    uint64_t fe_start_hi_ = 0;
+    bool fe_start_init_ = false;
     volatile long long blocks_ = 0;
     std::string desc_;
 };

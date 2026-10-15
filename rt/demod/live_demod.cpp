@@ -125,6 +125,7 @@ std::string LiveDemod::StatusJson() {
     s += ", \"fpga_delta\": " + std::to_string(sdr_->fpga_delta());
     s += ", \"fpga_symbols\": " + std::to_string(sdr_->fpga_symbols());
     s += ", \"fpga_symbol_gaps\": " + std::to_string(sym_gaps_.load());
+    s += ", \"splice_resets\": " + std::to_string(splice_resets_);
     s += ", \"sdr_connected\": " + std::string(sdr_->connected() ? "true" : "false");
     s += ", \"sdr_reconnects\": " + std::to_string(sdr_->reconnects());
     s += ", \"hw_ovf\": " + std::to_string(sdr_->hw_ovf());
@@ -512,6 +513,14 @@ void LiveDemod::Emit(const DemodResult& res, long long abs0) {
                 F = anchor_f_;
             } else {
                 F = anchor_f_ + llround((s_f - anchor_t_) / frame_samples_);
+                // 安全弁: 継ぎ位置が大きく戻る／飛ぶ（サンプル番号の周回など）ときは、黙って捨て続けずに
+                // 継ぎ目を仕切り直す（frames_lost に 1 つ分だけ出る）
+                if (F < last_emitted_ - 100 || F > last_emitted_ + 100000) {
+                    ++splice_resets_;
+                    anchor_t_ = s_f;
+                    anchor_f_ = last_emitted_ + 2;
+                    F = anchor_f_;
+                }
             }
             if (F <= last_emitted_) continue;
             if (first_F < 0) first_F = F;

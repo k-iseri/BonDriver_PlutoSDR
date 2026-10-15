@@ -417,6 +417,8 @@ void SdrSource::Run() {
         fe_blocks = 0;
         fpga_eq_ = false;
         parser.Reset();
+        fe_start_init_ = false;
+        fe_start_hi_ = 0;
     };
     auto fe_car0 = [&]() { return (kFeCenter - fpga_delta_ + kFeTotal) % kFeTotal; };
     while (!stop_) {
@@ -510,7 +512,16 @@ void SdrSource::Run() {
                     }
                 } else if (fe == Fe::kEq && fmt == 2) {
                     EqSymbol sym;
-                    sym.start = static_cast<uint64_t>(w[2]) | (static_cast<uint64_t>(w[3]) << 32);
+                    // 窓開始サンプル番号: ヘッダは 64bit だが v2.0.0 までのファームは下位 32bit しか入れていない
+                    // （8.127 MSPS では 528 秒で一周し、継ぎ合わせのフレーム番号が戻って TS が止まった、2026-10-15）。
+                    // 下位 32bit だけを見て周回をホストで数える（上位ワードが正しいファームでも同じ結果になる）
+                    {
+                        const uint32_t lo = w[2];
+                        if (fe_start_init_ && lo < fe_start_lo_ && (fe_start_lo_ - lo) > 0x80000000u) fe_start_hi_ += 1;
+                        fe_start_lo_ = lo;
+                        fe_start_init_ = true;
+                        sym.start = (fe_start_hi_ << 32) | lo;
+                    }
                     sym.seq = w[4];
                     sym.delta_q = static_cast<int32_t>(w[5]);
                     sym.status = w[7];
