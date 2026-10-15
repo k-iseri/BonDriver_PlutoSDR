@@ -77,10 +77,11 @@ void EqualizeAndDeinterleave(const Mat<cfloat>& Y, Mode mode, int frame_start,
 
 // 等化済みキャリア（D = Y/H と CSI）からデインターリーブ以降。FPGA 等化器（pluto-fw-isdbt モード 4）の
 // 出力をホスト後段に渡す入口。EqualizeAndDeinterleave の等化部分を飛ばしたもの
+// fast_null: 干渉キャリア検出を行優先の 1 パス版（前半/後半平均の小さい方）にする（ライブの範囲復号用）
 void DeinterleaveEqualized(const Mat<cfloat>& D, const Mat<float>& csi, Mode mode, int frame_start,
                            const std::vector<RxLayer>& layers,
                            const std::vector<std::vector<int>>& groups,
-                           Mat<cfloat>* Xt, Mat<float>* Wt);
+                           Mat<cfloat>* Xt, Mat<float>* Wt, bool fast_null = false);
 
 // 行列をそのまま返す ISymbolSource（等化済みキャリア行列のフレーム同期・復号用）
 class MatSource : public ISymbolSource {

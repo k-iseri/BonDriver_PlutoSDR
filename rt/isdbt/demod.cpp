@@ -180,15 +180,100 @@ void EqualizeAndDeinterleave(const Mat<cfloat>& Y, Mode mode, int frame_start,
     DeinterleaveEqualized(D, csi, mode, frame_start, layers, groups, Xt, Wt);
 }
 
+// NullInterferedCarriers の速い版（ライブの範囲復号用）: 行優先の 1 パスで、キャリアごとの誤差を行の前半と後半で
+// 別々に平均し、小さい方を統計量にする（バーストで片方が汚れても引きずられない）。中央値版は列方向アクセス +
+// nth_element で 2,100 行 × 5,617 キャリアに 0.15 s かかっていた（2026-10-15）
+int NullInterferedCarriersFast(const Mat<cfloat>& D, Mat<float>* csi, Mode mode, int frame_start,
+                               const std::vector<RxLayer>& layers) {
+    const Layout& lo = LayoutOf(mode);
+    const ModeParams& mp = ModeParamsOf(mode);
+    const int dc = lo.dc;
+    const int total = mp.total_carriers;
+    Modulation mod_of[kNSegments];
+    bool has_mod[kNSegments] = {};
+    for (const RxLayer& lyr : layers) {
+        for (int s : lyr.segments) {
+            mod_of[kSegmentFreqIndex[s]] = lyr.mod;
+            has_mod[kSegmentFreqIndex[s]] = true;
+        }
+    }
+    int nulled = 0;
+    std::vector<int> rows;
+    std::vector<float> acc1(static_cast<size_t>(total)), acc2(static_cast<size_t>(total));
+    std::vector<double> stat(static_cast<size_t>(total));
+    for (int p = 0; p < kSpSymbolPeriod; ++p) {
+        rows.clear();
+        for (int r = 0; r < static_cast<int>(D.rows); ++r) {
+            int ph = (r - frame_start) % kSpSymbolPeriod;
+            if (ph < 0) ph += kSpSymbolPeriod;
+            if (ph == p) rows.push_back(r);
+        }
+        if (rows.size() < 8) continue;
+        std::fill(acc1.begin(), acc1.end(), 0.0f);
+        std::fill(acc2.begin(), acc2.end(), 0.0f);
+        const size_t half = rows.size() / 2;
+        for (size_t ri = 0; ri < rows.size(); ++ri) {
+            const cfloat* dr = D[rows[ri]];
+            float* a = (ri < half) ? acc1.data() : acc2.data();
+            for (int f = 0; f < kNSegments; ++f) {
+                if (!has_mod[f]) continue;
+                const float norm = ConstellationNorm(mod_of[f]);
+                const float max_level = MaxLevelOf(mod_of[f]);
+                const int* kp = &lo.dpos4[p][static_cast<size_t>(f) * dc];
+                for (int c = 0; c < dc; ++c) {
+                    const int k = kp[c];
+                    const float i = dr[k].real() * norm;
+                    const float q = dr[k].imag() * norm;
+                    const float si = SliceLevel(i, max_level), sq = SliceLevel(q, max_level);
+                    a[k] += (i - si) * (i - si) + (q - sq) * (q - sq);
+                }
+            }
+        }
+        std::fill(stat.begin(), stat.end(), -1.0);
+        std::vector<double> valid;
+        valid.reserve(static_cast<size_t>(total));
+        for (int f = 0; f < kNSegments; ++f) {
+            if (!has_mod[f]) continue;
+            const int* kp = &lo.dpos4[p][static_cast<size_t>(f) * dc];
+            for (int c = 0; c < dc; ++c) {
+                const int k = kp[c];
+                const double m1 = acc1[static_cast<size_t>(k)] / static_cast<double>(half);
+                const double m2 = acc2[static_cast<size_t>(k)] / static_cast<double>(rows.size() - half);
+                stat[static_cast<size_t>(k)] = std::min(m1, m2);
+                valid.push_back(stat[static_cast<size_t>(k)]);
+            }
+        }
+        if (valid.empty()) continue;
+        std::nth_element(valid.begin(), valid.begin() + valid.size() / 2, valid.end());
+        const double med = valid[valid.size() / 2];
+        for (int k = 0; k < total; ++k) {
+            if (stat[static_cast<size_t>(k)] > 10.0 * med) {
+                for (int r : rows) (*csi)[r][k] = 0.0f;
+                ++nulled;
+            }
+        }
+    }
+    return nulled;
+}
+
 void DeinterleaveEqualized(const Mat<cfloat>& D, const Mat<float>& csi_in, Mode mode, int frame_start,
                            const std::vector<RxLayer>& layers,
                            const std::vector<std::vector<int>>& groups,
-                           Mat<cfloat>* Xt, Mat<float>* Wt) {
+                           Mat<cfloat>* Xt, Mat<float>* Wt, bool fast_null) {
+    static const bool profile = std::getenv("ISDBT_PROFILE") != nullptr;
+    auto pnow = [] { return std::chrono::steady_clock::now(); };
+    const auto q0 = pnow();
     Mat<float> csi = csi_in;
-    NullInterferedCarriers(D, &csi, mode, frame_start, layers);
+    if (fast_null) {
+        NullInterferedCarriersFast(D, &csi, mode, frame_start, layers);
+    } else {
+        NullInterferedCarriers(D, &csi, mode, frame_start, layers);
+    }
+    const auto q1 = pnow();
 
     Mat<cfloat> Yl = DataToLogical(D, mode, frame_start);
     Mat<float> Wl = DataToLogical(csi, mode, frame_start);
+    const auto q2 = pnow();
     int I_seg[kNSegments] = {};
     for (const RxLayer& lyr : layers) {
         for (int s : lyr.segments) I_seg[s] = lyr.I;
@@ -198,8 +283,15 @@ void DeinterleaveEqualized(const Mat<cfloat>& D, const Mat<float>& csi_in, Mode 
     // 2026-10-10 実放送で検証）。
     IntersegmentDeinterleave(&Yl, mode, groups);
     IntersegmentDeinterleave(&Wl, mode, groups);
+    const auto q3 = pnow();
     *Xt = TimeDeinterleave(Yl, mode, I_seg);
     *Wt = TimeDeinterleave(Wl, mode, I_seg);
+    const auto q4 = pnow();
+    if (profile && D.rows > 1000) {
+        auto sec = [](auto a, auto b) { return std::chrono::duration<double>(b - a).count(); };
+        std::fprintf(stderr, "[profile] deint %zu rows: null %.3f logical %.3f interseg %.3f time %.3f\n",
+                     D.rows, sec(q0, q1), sec(q1, q2), sec(q2, q3), sec(q3, q4));
+    }
 }
 
 Mat<cfloat> MatSource::Symbols(int i0, int i1) {
@@ -410,7 +502,9 @@ void DecodeRange(const Mat<cfloat>& D, const Mat<float>& csi_full, Mode mode, in
                  FrameSyncInfo* fsi_out, std::map<std::string, LayerResult>* layers_out,
                  int* emit_first, int* emit_end) {
     MatSource src(&D);
+    const auto tfs0 = std::chrono::steady_clock::now();
     *fsi_out = FrameSync(&src, mode);
+    const double t_fs = std::chrono::duration<double>(std::chrono::steady_clock::now() - tfs0).count();
     const FrameSyncInfo& fsi = *fsi_out;
     const int f0 = fsi.frame_start;
     const int n_sym = static_cast<int>(D.rows);
@@ -436,7 +530,9 @@ void DecodeRange(const Mat<cfloat>& D, const Mat<float>& csi_full, Mode mode, in
     std::copy(csi_full[s0], csi_full[s1 - 1] + csi_full.cols, csi.data());
     Mat<cfloat> Xt;
     Mat<float> Wt;
-    DeinterleaveEqualized(Y, csi, mode, f0 - s0, fsi.layers, fsi.groups, &Xt, &Wt);
+    const auto tfe0 = std::chrono::steady_clock::now();
+    DeinterleaveEqualized(Y, csi, mode, f0 - s0, fsi.layers, fsi.groups, &Xt, &Wt, true);
+    const double t_fe = std::chrono::duration<double>(std::chrono::steady_clock::now() - tfe0).count();
 
     const bool profile = std::getenv("ISDBT_PROFILE") != nullptr;
     const int dc = ModeParamsOf(mode).data_carriers_per_segment;
@@ -477,7 +573,8 @@ void DecodeRange(const Mat<cfloat>& D, const Mat<float>& csi_full, Mode mode, in
     *emit_first = F0;
     *emit_end = F1;
     if (profile) {
-        std::fprintf(stderr, "[profile] range frames %d..%d of %d: soft=%.2fs fec=%.2fs\n", F0, F1, fsi.n_frames, t_soft, t_fec);
+        std::fprintf(stderr, "[profile] range frames %d..%d of %d: framesync=%.3fs deint=%.3fs (rows %d) soft=%.2fs fec=%.2fs\n",
+                     F0, F1, fsi.n_frames, t_fs, t_fe, s1 - s0, t_soft, t_fec);
     }
 }
 
