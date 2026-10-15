@@ -65,6 +65,8 @@ jobs:
           export PKG_CONFIG_PATH="$PWD/iio-prefix/lib/pkgconfig"
           cmake -S rt -B rt/build/rt-dist -G Ninja -DCMAKE_BUILD_TYPE=Release -DISDBT_BUNDLE_RPATH=ON
           cmake --build rt/build/rt-dist
+          # 配布用 rpath（隣の lib/）なのでビルド場所では環境変数で libiio を指す
+          export LD_LIBRARY_PATH="$PWD/iio-prefix/lib" DYLD_LIBRARY_PATH="$PWD/iio-prefix/lib"
           rt/build/rt-dist/recpluto --help
           if rt/build/rt-dist/recpluto 99 - -; then echo "bad channel accepted"; exit 1; fi
 
@@ -72,6 +74,10 @@ jobs:
         run: |
           VER="${TAG}"; case "$VER" in v*) ;; *) VER="dev-$(git rev-parse --short HEAD)";; esac
           bash tools/package_recpluto.sh "$VER" "${{ matrix.label }}" rt/build/rt-dist "$PWD/iio-prefix"
+          # 展開先から（同梱の lib/ だけで）動くこと
+          D=$(ls -d dist/recpluto-*/ | head -1)
+          "$D/recpluto" --help
+          if "$D/recpluto" --quiet 27 1 -; then echo "should fail without a device"; exit 1; fi
 
       - uses: actions/upload-artifact@v4
         with:
