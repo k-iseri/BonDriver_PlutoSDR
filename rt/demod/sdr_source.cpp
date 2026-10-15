@@ -112,9 +112,11 @@ constexpr int kFeTotal = 5617;
 constexpr int kFeCenter = 2808;
 constexpr int kFeEqWords = (kFeTotal * 3 + 3) / 4;   // 4213
 constexpr int kFeSettleBlocks = 8;          // raw でソフト AGC を走らせる時間（≈ 1.0 秒。AGC は 4 ブロックごとに 1 段動く。5 だと選局後の同期失敗が増えた）
-constexpr int kFeCfoFrames = 128;           // 整数 CFO と窓開始の傾き（クロック偏差）の推定に使う同期 FFT の窓数（約 0.15 s）
+constexpr int kFeCfoFrames = 64;            // 整数 CFO 推定に使う同期 FFT の窓数（約 70 ms）
+constexpr int kFeClockFrames = 1024;        // XO 補正用のクロック偏差推定に使う窓数（約 1.2 s。接続後の最初の 1 回だけ）
 constexpr double kFeSymbolSamples = 9216.0; // 前段が前提とするシンボル長（Mode 3、GI 1/8）
 constexpr double kXoNominalHz = 40e6;       // Pluto の XO 公称
+constexpr int kXoMaxTries = 3;              // 接続ごとの xo_correction 書き込み回数の上限（1 回目の測定が粗くても |ppm| ≥ 1 なら詰め直す）
 constexpr int kFeCfoTimeoutBlocks = 40;     // モード 3 で窓が来ないときの諦め（≈ 5 秒 → raw へ戻してやり直す）
 constexpr int kFeWarmupSymbols = 1024;       // モード 4 に入ってから捨てるシンボル数（時間軸の立ち上がり 256 シンボルで B 層が崩れる）
 
@@ -216,10 +218,23 @@ void SdrSource::Connect() {
         if (!im.phy_rx || !im.phy_lo) throw std::runtime_error("ad9361-phy のチャンネルが見つからない");
         // XO 補正（固定値指定）。自動は同期で測ってから SuggestClockPpm / 前段のモード 3 で書く
         xo_applied_ = false;
+        xo_tries_ = 0;
         xo_ppm_ = 0.0;
         if (cfg_.xo_mode == 1) {
             std::lock_guard<std::mutex> lk(mu_);
             ApplyXoPpmLocked(phy, cfg_.xo_ppm);
+        } else if (cfg_.xo_mode == -1) {
+            // 前のセッションが書いた値は再起動まで残る。公称から 1 ppm 以上ずれていれば補正済みとみなして測定を省く
+            // （接続後の最初の選局が約 1.2 秒短くなる）。raw 経路の同期が 1 ppm 以上のずれを見れば改めて書く
+            try {
+                const double cur = std::atof(ReadDevAttr(phy, "xo_correction").c_str());
+                if (cur > 1e6 && std::fabs(cur - kXoNominalHz) >= kXoNominalHz * 1e-6) {
+                    xo_ppm_ = (cur / kXoNominalHz - 1.0) * 1e6;
+                    xo_tries_ = 1;
+                    std::fprintf(stderr, "sdr: xo_correction already %lld Hz (%+.2f ppm); keeping\n",
+                                 static_cast<long long>(cur), xo_ppm_.load());
+                }
+            } catch (const std::exception&) {}
         }
         WriteAttr(im.phy_rx, "sampling_frequency", FormatLL(cfg_.fs));
         WriteAttr(im.phy_rx, "rf_bandwidth", FormatLL(cfg_.bw));
@@ -332,18 +347,20 @@ bool SdrSource::ApplyXoPpmLocked(::iio_device* phy, double ppm) {
         WriteDevAttr(phy, "xo_correction", std::to_string(next));
         xo_ppm_ = (static_cast<double>(next) / kXoNominalHz - 1.0) * 1e6;
         xo_applied_ = true;
+        ++xo_tries_;
         std::fprintf(stderr, "sdr: xo_correction %lld -> %lld Hz (%+.2f ppm; measured %+.2f ppm)\n",
                      static_cast<long long>(cur), next, xo_ppm_.load(), ppm);
         return true;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "sdr: xo_correction failed: %s\n", e.what());
         xo_applied_ = true;             // 二度と試さない（純正でない phy など）
+        xo_tries_ = kXoMaxTries;
         return false;
     }
 }
 
 bool SdrSource::SuggestClockPpm(double ppm) {
-    if (cfg_.xo_mode != -1 || xo_applied_) return false;
+    if (cfg_.xo_mode != -1 || xo_tries_ >= kXoMaxTries) return false;
     if (!(std::fabs(ppm) >= 1.0 && std::fabs(ppm) <= 100.0)) return false;    // 測定不良や NaN は無視
     std::lock_guard<std::mutex> lk(mu_);
     if (!connected_ || !impl_) return false;
@@ -566,25 +583,39 @@ void SdrSource::Run() {
                         cfo_seq.push_back(static_cast<double>(w[4]));
                         cfo_start.push_back(static_cast<double>((cfo_start_hi << 32) | lo));
                     }
-                    if (++cfo_frames >= kFeCfoFrames) {
+                    // XO 未補正の最初の 1 回だけ長く（kFeClockFrames 窓 ≈ 1.2 s）取って窓開始の傾きからクロック偏差を出す。
+                    // 256 窓だと追従ループの収束の残りで ±1.5 ppm ばらついた（2026-10-16）
+                    const bool need_clock = (cfg_.xo_mode == -1 && xo_tries_ == 0);
+                    if (++cfo_frames >= (need_clock ? kFeClockFrames : kFeCfoFrames)) {
                         // 窓開始の連番に対する傾き = 実測シンボル長 → サンプルクロック偏差。|ppm| ≥ 1 なら XO を補正して
                         // raw からやり直す（接続ごとに 1 回。SFO が残ると帯域端の ICI で B 層が頭打ちになる）
-                        if (cfg_.xo_mode == -1 && !xo_applied_ && cfo_seq.size() >= 32) {
-                            const size_t n = cfo_seq.size();
+                        // 先頭 1/4 は追従ループの立ち上がり（pred の収束）で傾きが偏るので捨てる。フィット残差が大きい
+                        // （再捕捉で窓開始が飛んだ等）ときは書かず、次の機会（再選局）に任せる
+                        if (need_clock && cfo_seq.size() >= 96) {
+                            const size_t i0 = cfo_seq.size() / 4, n = cfo_seq.size() - i0;
                             double mx = 0.0, my = 0.0;
-                            for (size_t i = 0; i < n; ++i) { mx += cfo_seq[i]; my += cfo_start[i] - cfo_start[0]; }
+                            for (size_t i = i0; i < cfo_seq.size(); ++i) { mx += cfo_seq[i]; my += cfo_start[i] - cfo_start[0]; }
                             mx /= static_cast<double>(n); my /= static_cast<double>(n);
                             double sxx = 0.0, sxy = 0.0;
-                            for (size_t i = 0; i < n; ++i) {
+                            for (size_t i = i0; i < cfo_seq.size(); ++i) {
                                 const double dx = cfo_seq[i] - mx;
                                 sxx += dx * dx;
                                 sxy += dx * ((cfo_start[i] - cfo_start[0]) - my);
                             }
                             if (sxx > 0.0) {
-                                const double ppm = (sxy / sxx / kFeSymbolSamples - 1.0) * 1e6;
-                                if (SuggestClockPpm(ppm)) {
+                                const double slope = sxy / sxx;
+                                double max_dev = 0.0;
+                                for (size_t i = i0; i < cfo_seq.size(); ++i) {
+                                    const double fit = my + slope * (cfo_seq[i] - mx);
+                                    max_dev = std::max(max_dev, std::fabs((cfo_start[i] - cfo_start[0]) - fit));
+                                }
+                                const double ppm = (slope / kFeSymbolSamples - 1.0) * 1e6;
+                                if (max_dev > 6.0) {
+                                    std::fprintf(stderr, "sdr: clock fit unreliable (max dev %.1f samples, %+.2f ppm); skipping xo\n", max_dev, ppm);
+                                } else if (SuggestClockPpm(ppm)) {
                                     fe_restart_ = false;
                                     fe_to_raw();
+                                    fe_blocks = kFeSettleBlocks - 2;    // ゲインは変わらないので AGC 待ちは短く（約 0.25 s）
                                     return;
                                 }
                             }

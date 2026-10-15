@@ -170,7 +170,8 @@ private:
     std::atomic<uint32_t> fpga_last_start_hi_{0};
     std::atomic<bool> fe_restart_{false};   // Retune: raw からやり直す（AGC → δ → モード 4）
     std::atomic<double> xo_ppm_{0.0};
-    std::atomic<bool> xo_applied_{false};   // 接続ごとに 1 回だけ（再接続で false に戻す）
+    std::atomic<bool> xo_applied_{false};   // 何か書いた（再接続で false に戻す）
+    std::atomic<int> xo_tries_{0};          // 接続ごとの書き込み回数（上限 kXoMaxTries。測定が |ppm| < 1 になれば止まる）
     bool ApplyXoPpmLocked(::iio_device* phy, double ppm);   // mu_ を持って呼ぶ
     std::atomic<bool> fe_enabled_{true};    // EnableFpgaFrontEnd（false の間は raw のまま）
     std::atomic<bool> muted_{false};        // 周波数設定の失敗中: ブロックもシンボルも渡さない

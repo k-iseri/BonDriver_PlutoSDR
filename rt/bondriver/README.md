@@ -134,7 +134,8 @@ copy ..\..\..\bondriver\BonDriver_PlutoSDR.ini.sample BonDriver_PlutoSDR_T.ini  
   （docs/hw-setup.md「受信ゲイン」）。
 - `[SDR] XoPpm=auto`（既定）: 選局後に同期で測ったサンプルクロック偏差を AD9361 の `xo_correction` に書いて LO と
   サンプルレートのずれを直す（接続ごとに 1 回）。FPGA 前段ではサンプルレートのずれが帯域端の ICI になり B 層 MER が
-  頭打ちになる（docs/hw-setup.md「XO の補正」）。`0` で無効、数値（例 `-16.1`）で固定値。
+  頭打ちになる（docs/hw-setup.md「XO の補正」）。測定は接続後の最初の選局で約 1.2 秒。`0` で無効、数値（例 `-16.1`）で
+  固定値（ログ `sdr: xo_correction ...` の値。測定を省ける）。
 - 周波数が LO の範囲外（AD9363 は 325 MHz〜。CATV 空間の VHF 1〜12ch）で設定できないときは、有効な周波数が
   来るまで I/Q を止めて無信号として報告する（TVTest のスキャンで直前の局が並ばないように）。
 - `_TC` 版の `[CATV] Ts=` で TSMF の相対 TS 番号を固定できる（既定は自動 = 有効 TS の最小番号、
