@@ -439,9 +439,10 @@ private:
         const double chunk_s = kChunkPackets * kTsPacket * 8 / src_.bitrate;
         auto t_next = std::chrono::steady_clock::now();
         while (!stop_) {
-            std::vector<uint8_t> chunk;
-            std::vector<std::shared_ptr<ClientQueue>> clients;
             {
+                // 切り出しから各クライアントへの積み込みまで mu_ を持ったまま行う。離すと Tune（pos_ = 0 と
+                // キューのクリア）が割り込み、選局前のチャンクが選局後の先頭の後ろに積まれて順序が崩れる
+                // （macOS の CI で test_isdbtd_stream が落ちた。2026-10-16）
                 std::lock_guard<std::mutex> lock(mu_);
                 if (pos_ >= total) {
                     if (!loop_) ended_ = true;
@@ -449,20 +450,17 @@ private:
                 }
                 if (!ended_) {
                     const size_t n = std::min(kChunkPackets * kTsPacket, total - pos_);
-                    chunk.assign(src_.packets.begin() + pos_, src_.packets.begin() + pos_ + n);
+                    std::vector<uint8_t> chunk(src_.packets.begin() + pos_, src_.packets.begin() + pos_ + n);
                     pos_ += n;
-                    clients = clients_;
-                }
-            }
-            if (!chunk.empty()) {
-                ts_packets_ += chunk.size() / kTsPacket;
-                for (auto& q : clients) {
-                    std::lock_guard<std::mutex> ql(q->mu);
-                    if (q->chunks.size() >= kQueueMaxChunks) {
-                        dropped_ += chunk.size() / kTsPacket;
-                    } else {
-                        q->chunks.push_back(chunk);
-                        q->cv.notify_one();
+                    ts_packets_ += n / kTsPacket;
+                    for (auto& q : clients_) {
+                        std::lock_guard<std::mutex> ql(q->mu);
+                        if (q->chunks.size() >= kQueueMaxChunks) {
+                            dropped_ += n / kTsPacket;
+                        } else {
+                            q->chunks.push_back(chunk);
+                            q->cv.notify_one();
+                        }
                     }
                 }
             }

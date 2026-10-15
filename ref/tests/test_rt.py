@@ -158,7 +158,10 @@ def test_isdbtd_stream(daemon):
     data = np.frombuffer(bytes(buf[: n * 188]), dtype=np.uint8).reshape(-1, 188)
     assert np.all(data[:, 0] == 0x47)
     idx = (data[:, 4].astype(int) << 8) | data[:, 5]
-    assert np.all(np.diff(idx) % 5000 == 1), "TSP の順序が崩れている"
+    # 順序は連続（5000 で一周）。stream の直後の tune より前にクライアントへ渡り切っていたチャンクが
+    # 1 つ混ざることはあるので、不連続は「先頭（0）へ戻る」1 回までを許す
+    jumps = np.where(np.diff(idx) % 5000 != 1)[0]
+    assert len(jumps) <= 1 and all(idx[j + 1] == 0 for j in jumps), f"TSP の順序が崩れている: {jumps}"
     assert 0 in idx            # 選局後は先頭から流れ直す
 
     r = _cmd(fc, {"cmd": "status"})
