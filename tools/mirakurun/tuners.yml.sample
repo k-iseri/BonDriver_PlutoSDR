@@ -1,0 +1,14 @@
+# Mirakurun 4.x の tuners.yml（recpluto を使う。docs/mirakurun.md）
+# Pluto は 1 台で 1 チャンネルなので、地デジ（GR）とケーブル TV の BS/CS 再送信（ISDB-C）を 1 本の tuner にする。
+# <channel> には channels.yml の channel がそのまま入る: 地デジは物理 ch（'27'）、CATV は 'C56' のように C 付き。
+- name: PlutoSDR
+  types:
+    - GR
+    - BS
+    - CS
+  command: recpluto <channel> - -
+  # Pluto+ / LibreSDR を LAN で使う場合（"ip:" を含むので引用符が要る）:
+  # command: "recpluto --device ip:192.168.2.1 <channel> - -"
+  # ファーム pluto-fw-isdbt v2.0.1 以前（FPGA 前段の GI 相関器にオフセット）なら --fpga-eq 0 を足す
+  decoder: arib-b25-stream-test     # スクランブル解除は本リポジトリの範囲外。要らなければ省略
+  isDisabled: false

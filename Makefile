@@ -13,7 +13,7 @@ PIP = $(BIN)/pip
 PYTEST = $(BIN)/pytest
 VPY = $(BIN)/python
 
-.PHONY: setup test test-fast lint synth bondriver rt rt-vectors rt-test libiio-fetch clean
+.PHONY: setup test test-fast lint synth bondriver rt rt-vectors rt-test install-rt libiio-fetch clean
 
 setup:
 	$(PY) -m venv $(VENV)
@@ -42,9 +42,13 @@ rt:
 	powershell -NoProfile -ExecutionPolicy Bypass -File rt/build.ps1
 else
   RT_TEST = rt/build/rt-native/rt_test
+  PREFIX ?= /usr/local
 rt:
 	cmake -S rt -B rt/build/rt-native -DCMAKE_BUILD_TYPE=Release
 	cmake --build rt/build/rt-native -j
+# recpluto（Mirakurun のチューナーコマンド）と isdbtd を $(PREFIX)/bin に置く（Linux は sudo、macOS は PREFIX=/opt/homebrew）
+install-rt: rt
+	cmake --install rt/build/rt-native --prefix $(PREFIX)
 endif
 
 rt-vectors:

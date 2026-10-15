@@ -67,8 +67,9 @@ rt/build/rt-native/isdbtd --sdr usb: --ch 24                                 # P
 ```
 GitHub Actions（`.github/workflows/ci.yml`）が ubuntu と macOS（arm64）で rt_test と isdbtd の
 プロトコル試験を回す。Raspberry Pi（arm64 Linux）は同じ手順でビルドできる想定だが実機未確認。
-Mirakurun からは `isdbtd --sdr usb: --ch N --stdout` をチューナーコマンドにする（`docs/mirakurun.md`。
-MacBook Air M5 + Pluto で Mirakurun 4.x との結合まで確認済み、Raspberry Pi は未確認）。
+Mirakurun からは専用チューナーコマンド `recpluto`（recpt1 互換の引数、`make install-rt` で配置。雛形は
+`tools/mirakurun/`）を使う（`docs/mirakurun.md`。MacBook Air M5 + Pluto で Mirakurun 4.x からのストリームまで
+確認済み、Raspberry Pi は未確認）。
 
 ## ケーブルテレビの BS/CS（トランスモジュレーション、ISDB-C）
 ケーブル TV の宅内端子に来ている BS/CS 再送信（64QAM、5.274 Mbaud、TSMF 多重）は

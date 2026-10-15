@@ -1,10 +1,13 @@
 # Mirakurun から使う（Linux / macOS / Raspberry Pi）
 
-isdbtd の `--stdout` モードは recpt1 などと同じ「選局して TS を標準出力に流し、SIGTERM で止まる」
-チューナーコマンドなので、Mirakurun の `tuners.yml` にそのまま書ける。BonDriver（Windows / TVTest）とは
-独立で、同じ復調コアを使う。状態: 2026-10-15 に Windows と WSL（Ubuntu 22.04）で録音ファイル
-（`--sigmf`）からの動作を確認し、同日 MacBook Air（M5）で Pluto 実機からの `--sdr` 受信と Mirakurun 4.x
-（下記の直接起動）の結合・チャンネル走査まで確認。Raspberry Pi は未確認。
+Mirakurun にはドライバ API が無く、「選局して TS を標準出力に流し、SIGTERM で止まる」コマンドがチューナー
+ドライバに相当する。このリポジトリの専用コマンドが `recpluto`（`rt/mirakurun/recpluto.cpp`、recpt1 と同じ
+引数 `<channel> <rectime> <destfile>`）で、Pluto SDR を開いて BonDriver / isdbtd と同じ復調パイプライン
+（`rt/demod/live_switch`）で地デジとケーブル TV の BS/CS 再送信（ISDB-C）を受ける。`isdbtd --stdout` でも
+同じことができるが、Mirakurun からは recpluto を使う。
+状態: 2026-10-15〜16 に MacBook Air（M5）+ Pluto で recpluto の録画・stdout（SIGTERM で終了）・走査と、Mirakurun
+4.1.5 からのストリーム取得まで確認。Windows と WSL（Ubuntu 22.04）は isdbtd の録音ファイル再生のみ確認。
+Raspberry Pi は未確認。
 
 ## 準備
 
@@ -32,46 +35,53 @@ isdbtd の `--stdout` モードは recpt1 などと同じ「選局して TS を�
    done
    ```
    以降にリンクする isdbtd には絶対パスが記録されるので、この手当ては一度で済む。
-2. `make rt` で `rt/build/rt-native/isdbtd` を作り、PATH の通る場所に置く。
-3. Pluto を USB で繋ぎ、`iio_info -u usb:` で見えることを確認（Linux は udev ルールで一般ユーザーに許可）。
-4. 動作確認（TS がファイルに出て、Ctrl-C で止まる）:
+2. `make rt` で `rt/build/rt-native/recpluto`（と isdbtd）を作り、`make install-rt`（Linux は `sudo`、macOS は
+   `PREFIX=/opt/homebrew`）で PATH に置く。
+3. Pluto を USB で繋ぎ、`iio_info -u usb:` で見えることを確認。Linux は `tools/mirakurun/99-plutosdr.rules` を
+   /etc/udev/rules.d/ に置いて一般ユーザー（Mirakurun の実行ユーザー）から開けるようにする。
+4. 動作確認（TS がファイルに出る。`-` は止めるまで / 標準出力）:
    ```
-   isdbtd --sdr usb: --ch 24 --stdout > ch24.ts          # 地デジ UHF 24ch
-   isdbtd --sdr usb: --system isdbc --ch 55 --stdout > catv.ts   # CATV トラモジ（BonDriver_BDA の通し番号 55 = 56ch）
+   recpluto 24 10 ch24.ts             # 地デジ UHF 24ch を 10 秒
+   recpluto C56 - - > catv.ts         # CATV トラモジ C56（BS/CS 再送信）、Ctrl-C で止める
+   recpluto --scan gr:13-52           # 受信できるチャンネルを channels.yml の形で出す（catv / all も可、1 ch 約 5 秒）
    ```
-   `--quiet` を付けないと 10 秒ごとに status（JSON）が stderr に出る。`--sigmf` / `--ts` の再生は `--loop` 無しなら
-   末尾まで出して終了する。
+   `--quiet` を付けないと 10 秒ごとに status（JSON）が stderr に出る。recpt1 の `--b25` `--strip` `--sid` などは
+   受け付けて無視する（スクランブル解除は Mirakurun の decoder に任せる）。`--device ip:192.168.2.1` で
+   Pluto+ / LibreSDR の LAN、`--fpga-eq` `--gain` `--agc-target` `--tsmf` は isdbtd と同じ。
+   isdbtd 自体も `--sdr usb: --ch 24 --stdout` で同じ TS を出す（`--sigmf` / `--ts` の再生は `--loop` 無しなら
+   末尾まで出して終了する）。
 
 ## tuners.yml / channels.yml（Mirakurun 4.0 以降）
 
 Pluto は 1 台で 1 チャンネルなので、地デジと CATV を同じ 1 本の tuner にする（Mirakurun は tuner ごとに
-同時 1 プロセス）。方式の切り替えは channels.yml の `commandVars`（4.0 で追加。`<name>` が command の
-同名プレースホルダに入る）で渡す。`<channel>` は channels.yml の `channel` がそのまま入る。
+同時 1 プロセス）。`<channel>` は channels.yml の `channel` がそのまま入り、recpluto は数字なら地デジの物理 ch、
+`C` 付きなら CATV の物理 ch と解釈するので、方式の指定は要らない。雛形は `tools/mirakurun/` にある。
 
 ```yaml
-# tuners.yml
+# tuners.yml（tools/mirakurun/tuners.yml.sample）
 - name: PlutoSDR
   types: [GR, BS, CS]
-  command: "isdbtd --sdr usb: --system <system> --ch <channel> --stdout --quiet"   # "usb:" を含むので引用符必須
+  command: recpluto <channel> - -
   decoder: arib-b25-stream-test     # スクランブル解除は本リポジトリの範囲外。要らなければ省略
   isDisabled: false
 ```
 ```yaml
-# channels.yml（commandVars.system は全チャンネルに書く）
+# channels.yml（tools/mirakurun/channels.yml.sample）
 - name: NHK総合
   type: GR
-  channel: '27'          # UHF 物理チャンネル
-  commandVars: { system: isdbt }
+  channel: '27'          # UHF 物理チャンネル。Mirakurun の走査 API で作れる
 - name: NHK BS
   type: BS
-  channel: '55'          # CATV トラモジ。BonDriver_BDA の TransModulation と同じ通し番号（0〜112）
+  channel: 'C56'         # CATV の物理チャンネル C13〜C63（BS/CS 再送信）。`recpluto --scan catv` で調べる
   serviceId: 101
-  commandVars: { system: isdbc }
 ```
+`--device ip:...` のように `:` を含む引数を command に書くときは行全体を引用符で囲む（js-yaml が mapping と
+解釈して起動に失敗する）。isdbtd を使う場合は `"isdbtd --sdr usb: --system <system> --ch <channel> --stdout --quiet"`
+と channels.yml の `commandVars: { system: isdbt | isdbc }`（CATV の ch は BonDriver_BDA と同じ通し番号 0〜112）。
 
 ファーム pluto-fw-isdbt v2.0.1 以前では弱い入力で FPGA 前段の MER が raw より落ちる（相関器のオフセット。
 v2.0.2 で修正）ので、その場合は command に `--fpga-eq 0`（raw 経路で復調）を足す。
-CPU は Apple M5（NEON、2026-10-15）で FPGA 前段約 0.2 コア、raw 経路（`--fpga-eq 0`）約 0.5 コア（isdbtd を top で実測）。
+CPU は Apple M5（NEON、2026-10-15）で FPGA 前段約 0.2 コア、raw 経路（`--fpga-eq 0`）約 0.5 コア（top で実測。recpluto も同じ）。
 
 CATV は 1 周波数に複数 TS が多重（TSMF）されている局がある。isdbtd は既定で最小番号の TS を選んで
 188 バイト TS にして出す。Mirakurun 側の `tsmfRelTs`（1〜15）で選ばせたい場合は command に

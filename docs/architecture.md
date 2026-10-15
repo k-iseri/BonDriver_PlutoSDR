@@ -72,6 +72,9 @@ I/Q (任意 fs)
 - `rt/demod/isdbtd.exe` が docs/daemon-protocol.md v2 のデーモン。--ts / --sigmf の再生（demod_server.py と
   同機能）に加え、`--sdr` で実機（libiio）からのライブ受信と逐次復調（長時間再追従込み）を行う
   （docs/hw-setup.md「SDR ライブ受信」）。
+- `rt/mirakurun/recpluto` が Mirakurun 用のチューナーコマンド（recpt1 互換の `<channel> <rectime> <destfile>`、
+  `--scan`）。isdbtd --sdr と同じ `rt/demod/live_switch` を使い、数字の ch は地デジ、`C` 付きは CATV（ISDB-C）
+  と解釈する（docs/mirakurun.md）。
 - ビルドは `make rt`（Windows: rt/build.ps1 → vswhere で CMake/MSVC を探す。出力は
   rt/build/rt-x64/Release/ の rt_test.exe / isdbtd.exe。Linux / macOS: CMake 直接、出力は rt/build/rt-native/）。
   SIMD は x86-64 の AVX2 と arm64 の NEON（`rt/isdbt/simd.h`。float ビタビ・8bit ビタビ・RS シンドロームの 3 カーネル、
