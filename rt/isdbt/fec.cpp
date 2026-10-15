@@ -411,6 +411,7 @@ private:
 std::vector<uint8_t> ViterbiDecodeQ(const int8_t* qs, size_t n, CodeRate rate) {
     const PuncturePattern* pat = FindPuncture(rate);
     assert(pat);
+    (void)pat;
 #ifdef __AVX2__
     std::vector<uint8_t> bits;
     ViterbiU8 dec;
@@ -428,6 +429,7 @@ std::vector<uint8_t> ViterbiDecodeQ(const int8_t* qs, size_t n, CodeRate rate) {
 std::vector<uint8_t> ViterbiDecodeSoft(const float* soft, size_t n, CodeRate rate) {
     const PuncturePattern* pat = FindPuncture(rate);
     assert(pat);
+    (void)pat;
 #ifdef __AVX2__
     std::vector<uint8_t> bits;
     ViterbiU8 dec;

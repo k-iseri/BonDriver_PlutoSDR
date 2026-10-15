@@ -9,11 +9,28 @@
 // 使い方例:
 //   isdbtd --ts C:/rec/ch27.ts --loop
 //   isdbtd --sigmf testdata/synthetic/std_mode3_gi8_clean.sigmf-meta --loop
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#pragma comment(lib, "ws2_32.lib")
+using socket_t = SOCKET;
+inline void CloseSocket(socket_t s) { closesocket(s); }
+#else
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <signal.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <unistd.h>
+using socket_t = int;
+constexpr socket_t INVALID_SOCKET = -1;
+inline void CloseSocket(socket_t s) { close(s); }
+#endif
 
 #include <algorithm>
+#include <cstdarg>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -35,8 +52,6 @@
 #include "live_demod.h"
 #include "live_switch.h"
 #include "sdr_source.h"
-
-#pragma comment(lib, "ws2_32.lib")
 
 using namespace isdbt;
 
@@ -479,9 +494,9 @@ public:
         listen_ = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
-        addr.sin_port = htons(static_cast<u_short>(port));
+        addr.sin_port = htons(static_cast<uint16_t>(port));
         inet_pton(AF_INET, host.c_str(), &addr.sin_addr);
-        BOOL yes = TRUE;
+        int yes = 1;
         setsockopt(listen_, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&yes), sizeof(yes));
         if (bind(listen_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 ||
             listen(listen_, 8) != 0) {
@@ -497,13 +512,13 @@ public:
             FD_ZERO(&rd);
             FD_SET(listen_, &rd);
             timeval tv{0, 200'000};
-            const int r = select(0, &rd, nullptr, nullptr, &tv);
+            const int r = select(static_cast<int>(listen_) + 1, &rd, nullptr, nullptr, &tv);    // 第 1 引数は Windows では無視される
             if (r <= 0) continue;
-            SOCKET c = accept(listen_, nullptr, nullptr);
+            socket_t c = accept(listen_, nullptr, nullptr);
             if (c == INVALID_SOCKET) continue;
             std::thread(&Server::Handle, this, c).detach();
         }
-        closesocket(listen_);
+        CloseSocket(listen_);
     }
 
 private:
@@ -516,9 +531,9 @@ private:
         va_end(ap);
     }
 
-    static bool SendAll(SOCKET s, const char* data, size_t n) {
+    static bool SendAll(socket_t s, const char* data, size_t n) {
         while (n > 0) {
-            const int r = send(s, data, static_cast<int>(std::min<size_t>(n, 1 << 20)), 0);
+            const int r = static_cast<int>(send(s, data, static_cast<int>(std::min<size_t>(n, 1 << 20)), 0));
             if (r <= 0) return false;
             data += r;
             n -= static_cast<size_t>(r);
@@ -526,18 +541,18 @@ private:
         return true;
     }
 
-    static bool SendLine(SOCKET s, const std::string& json) {
+    static bool SendLine(socket_t s, const std::string& json) {
         std::string line = json + "\n";
         return SendAll(s, line.data(), line.size());
     }
 
-    void Handle(SOCKET c) {
+    void Handle(socket_t c) {
         std::string buf;
         char tmp[4096];
         while (!stopping_) {
             size_t nl = buf.find('\n');
             if (nl == std::string::npos) {
-                const int r = recv(c, tmp, sizeof(tmp), 0);
+                const int r = static_cast<int>(recv(c, tmp, sizeof(tmp), 0));
                 if (r <= 0) break;
                 buf.append(tmp, static_cast<size_t>(r));
                 continue;
@@ -613,13 +628,13 @@ private:
                 SendLine(c, "{\"ok\": false, \"error\": \"unknown cmd '" + cmd + "'\"}");
             }
         }
-        closesocket(c);
+        CloseSocket(c);
     }
 
-    void Stream(SOCKET c) {
+    void Stream(socket_t c) {
         auto q = rp_->AddClient();
         Log("stream client connected");
-        BOOL yes = TRUE;
+        int yes = 1;
         setsockopt(c, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&yes), sizeof(yes));
         while (!stopping_) {
             std::vector<uint8_t> chunk;
@@ -641,7 +656,7 @@ private:
     LiveSwitch* live_;
     bool allow_quit_;
     bool verbose_;
-    SOCKET listen_;
+    socket_t listen_;
     std::atomic<bool> stopping_{false};
 };
 
@@ -741,8 +756,12 @@ int main(int argc, char** argv) {
         return 2;
     }
 
+#ifdef _WIN32
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
+#else
+    signal(SIGPIPE, SIG_IGN);    // クライアントが切れたときの send() は戻り値で扱う
+#endif
     try {
         Gi gi{8};
         if (!ParseGi(gi_str, &gi)) throw std::runtime_error("bad --gi: " + gi_str);
@@ -797,9 +816,13 @@ int main(int argc, char** argv) {
         }
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
+#ifdef _WIN32
         WSACleanup();
+#endif
         return 1;
     }
+#ifdef _WIN32
     WSACleanup();
+#endif
     return 0;
 }
