@@ -50,7 +50,7 @@ Pluto は 1 台で 1 チャンネルなので、地デジと CATV を同じ 1 �
 # tuners.yml
 - name: PlutoSDR
   types: [GR, BS, CS]
-  command: isdbtd --sdr usb: --system <system> --ch <channel> --stdout --quiet
+  command: "isdbtd --sdr usb: --system <system> --ch <channel> --stdout --quiet"   # "usb:" を含むので引用符必須
   decoder: arib-b25-stream-test     # スクランブル解除は本リポジトリの範囲外。要らなければ省略
   isDisabled: false
 ```
