@@ -29,7 +29,13 @@ constexpr socket_t INVALID_SOCKET = -1;
 inline void CloseSocket(socket_t s) { close(s); }
 #endif
 
+#ifdef _WIN32
+#include <corecrt_io.h>     // _setmode（<io.h> は rt/isdbt/io.h と名前が衝突する）
+#include <fcntl.h>
+#endif
+
 #include <algorithm>
+#include <csignal>
 #include <cstdarg>
 #include <atomic>
 #include <chrono>
@@ -660,6 +666,44 @@ private:
     std::atomic<bool> stopping_{false};
 };
 
+// --stdout: TCP サーバを立てず、TS を標準出力に流す（Mirakurun / recpt1 相当のチューナーコマンド用）。
+// SIGTERM / SIGINT（Mirakurun はチャンネル切替・停止でプロセスを止める）か、stdout が閉じたら終わる
+std::atomic<bool> g_stop{false};
+void OnSignal(int) { g_stop = true; }
+
+int StreamToStdout(IFeed* feed, bool verbose) {
+#ifdef _WIN32
+    _setmode(_fileno(stdout), _O_BINARY);
+#endif
+    std::signal(SIGINT, OnSignal);
+    std::signal(SIGTERM, OnSignal);
+    auto q = feed->AddClient();
+    auto last_status = std::chrono::steady_clock::now();
+    long long bytes = 0;
+    while (!g_stop) {
+        const auto now = std::chrono::steady_clock::now();
+        if (verbose && now - last_status >= std::chrono::seconds(10)) {
+            std::fprintf(stderr, "%s\n", feed->StatusJson().c_str());
+            last_status = now;
+        }
+        std::vector<uint8_t> chunk;
+        {
+            std::unique_lock<std::mutex> lock(q->mu);
+            if (!q->cv.wait_for(lock, std::chrono::milliseconds(500), [&] { return !q->chunks.empty(); })) continue;
+            chunk = std::move(q->chunks.front());
+            q->chunks.pop_front();
+        }
+        if (std::fwrite(chunk.data(), 1, chunk.size(), stdout) != chunk.size() || std::fflush(stdout) != 0) {
+            if (verbose) std::fprintf(stderr, "stdout closed after %lld bytes\n", bytes);
+            break;
+        }
+        bytes += static_cast<long long>(chunk.size());
+    }
+    feed->RemoveClient(q);
+    if (verbose) std::fprintf(stderr, "stdout stream end (%lld bytes%s)\n", bytes, g_stop ? ", signal" : "");
+    return 0;
+}
+
 void Usage() {
     std::fprintf(stderr,
         "usage: isdbtd (--ts <file> | --sigmf <file> | --sdr [uri]) [options]\n"
@@ -674,6 +718,8 @@ void Usage() {
         "  --tsmf N | all      ISDB-C: TSMF の相対 TS 番号（既定は自動、all = 全スロット通過）\n"
         "  --host H --port N   (default 127.0.0.1:47188)\n"
         "  --no-quit           quit コマンドを受け付けない\n"
+        "  --stdout            TCP サーバを立てず TS を標準出力へ（Mirakurun 等のチューナーコマンド用。\n"
+        "                      --sdr では --ch か --freq が必須。SIGTERM / SIGINT か stdout が閉じると終了）\n"
         "  --quiet\n"
         "SDR ライブ受信（--sdr。uri 省略時 usb:）:\n"
         "  --ch N | --freq F   初期チャンネル/周波数（省略時は tune 待ち。isdbc の N は 0..112 の通し番号）\n"
@@ -696,7 +742,7 @@ int main(int argc, char** argv) {
     std::string ts_path, sigmf_path, host = "127.0.0.1", gi_str = "1/8";
     int mode_i = 3, port = kDefaultPort;
     double max_seconds = 0, bitrate = 0, signal_db = 30.0;
-    bool loop = false, no_quit = false, quiet = false, track = false;
+    bool loop = false, no_quit = false, quiet = false, track = false, to_stdout = false;
     bool sdr = false;
     SdrConfig sdr_cfg;
     std::string dump_iq, system_str;
@@ -748,6 +794,7 @@ int main(int argc, char** argv) {
         else if (a == "--port") port = std::atoi(next().c_str());
         else if (a == "--no-quit") no_quit = true;
         else if (a == "--quiet") quiet = true;
+        else if (a == "--stdout") to_stdout = true;
         else { Usage(); return 2; }
     }
     const int n_sources = (!ts_path.empty()) + (!sigmf_path.empty()) + (sdr ? 1 : 0);
@@ -790,15 +837,23 @@ int main(int argc, char** argv) {
             lp.select = ts_sel;
             lp.verbose = !quiet;
             if (!ParseFirstBurst(first_burst_str, &lp.first_burst)) throw std::runtime_error("bad --first-burst: " + first_burst_str);
+            if (to_stdout && !init_ch && sdr_cfg.freq_hz <= 0) throw std::runtime_error("--stdout with --sdr needs --ch or --freq");
             LiveSwitch live(lp);
             live.Start(system);
             if (init_ch) live.TuneSystem(system, true, init_ch, init_freq);
-            std::fprintf(stderr, "live demod (%s, %s, win=%d+%d frames, %d workers) on %s:%d\n",
-                         sdr_cfg.uri.c_str(), SystemName(system), ctx_frames, win_frames, workers,
-                         host.c_str(), port);
-            Server server(&live, &live, host, port, !no_quit, !quiet);
-            server.Serve();
-            live.Stop();
+            if (to_stdout) {
+                std::fprintf(stderr, "live demod (%s, %s, win=%d+%d frames, %d workers) -> stdout\n",
+                             sdr_cfg.uri.c_str(), SystemName(system), ctx_frames, win_frames, workers);
+                StreamToStdout(&live, !quiet);
+                live.Stop();
+            } else {
+                std::fprintf(stderr, "live demod (%s, %s, win=%d+%d frames, %d workers) on %s:%d\n",
+                             sdr_cfg.uri.c_str(), SystemName(system), ctx_frames, win_frames, workers,
+                             host.c_str(), port);
+                Server server(&live, &live, host, port, !no_quit, !quiet);
+                server.Serve();
+                live.Stop();
+            }
         } else {
             Source src = !ts_path.empty() ? LoadTsFile(ts_path, bitrate)
                          : (system == System::kIsdbc
@@ -809,10 +864,16 @@ int main(int argc, char** argv) {
                          n_tsp, n_tsp * kTsPacket * 8 / src.bitrate, src.bitrate / 1e6, loop ? 1 : 0,
                          host.c_str(), port, src.source_desc.c_str());
             Replayer rp(std::move(src), loop, signal_db);
-            Server server(&rp, nullptr, host, port, !no_quit, !quiet);
-            rp.Start();
-            server.Serve();
-            rp.Stop();
+            if (to_stdout) {
+                rp.Start();
+                StreamToStdout(&rp, !quiet);
+                rp.Stop();
+            } else {
+                Server server(&rp, nullptr, host, port, !no_quit, !quiet);
+                rp.Start();
+                server.Serve();
+                rp.Stop();
+            }
         }
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
