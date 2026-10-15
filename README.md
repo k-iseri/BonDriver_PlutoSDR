@@ -23,7 +23,8 @@ make test-fast    #                             .\dev.ps1 test-fast
 make synth        # 合成試験信号を testdata/synthetic/ に生成（約 10 秒）
 python tools/demod_sigmf.py testdata/synthetic/std_mode3_gi8_clean.sigmf-meta --out out/   # 復調して TS を得る
 ```
-Python 3.11 以上。Windows ネイティブ環境を前提にしている。
+Python 3.11 以上。開発は Windows ネイティブ環境で行っているが、`ref/` と `rt/`（復調コア・isdbtd）は
+Linux / macOS でもビルド・実行できる（下記「Linux / macOS」）。TVTest 用 BonDriver だけが Windows 専用。
 `make test`（ループバック・BER 曲線を含む slow テスト）は 10 分程度かかる。
 ref/ の復調は 6 フレーム単位のブロック処理で、速度は実時間の約 14 倍遅、メモリは録音データ
 （complex64、30 秒で約 2 GB）+ 数百 MB。C++ 版（`make rt` → isdbtd.exe）はライブ受信で CPU 約 2.7 コア
@@ -51,6 +52,38 @@ rt\build\bondriver-x64\Release\bontest.exe rt\build\bondriver-x64\Release\BonDri
 DLL と同名の ini（`.ini.sample` を編集）を TVTest の BonDriver フォルダへ置く。
 視聴までの一般ユーザー向け手順は `docs/setup-tvtest.md`。
 詳細は `rt/bondriver/README.md`、プロトコルは `docs/daemon-protocol.md`。
+
+## Linux / macOS（Apple Silicon 含む）
+`rt/` は CMake だけでビルドできる（C++17、g++ 11 / clang 15 以降）。AVX2 は x86-64 で自動で付き、
+arm64 は NEON 版（ビタビ・RS。結果は同じ）になる。SDR ライブ受信には libiio 1.x が要る（Homebrew / apt には
+1.x が無いのでソースからビルドする。手順は `docs/mirakurun.md`。無ければ `--sdr` だけ使えないままビルドは通る）。
+`make setup` には Python 3.11 以上の `python3` が必要（`python3 --version` で確認）。
+```
+make setup && make test-fast            # ref/ のテスト
+make rt                                 # rt/build/rt-native/{rt_test, isdbtd, recpluto}
+make rt-vectors && make rt-test         # ref/ とのビット一致（46 項目）
+rt/build/rt-native/isdbtd --sigmf testdata/captured/ch25.sigmf-meta --loop   # 録音の復調（TCP 47188 に TS）
+rt/build/rt-native/isdbtd --sdr usb: --ch 24                                 # Pluto ライブ受信
+```
+GitHub Actions（`.github/workflows/ci.yml`）が ubuntu と macOS（arm64）で rt_test と isdbtd の
+プロトコル試験を回す。Raspberry Pi（arm64 Linux）は同じ手順でビルドできる想定だが実機未確認。
+
+## Mirakurun で使う（Linux / macOS / Raspberry Pi）
+Mirakurun にはドライバ API が無く、recpt1 のような「選局して TS を標準出力に流すコマンド」がチューナーに
+なる。このリポジトリでは `recpluto`（recpt1 互換の引数 `<channel> <rectime> <destfile>`）がそれで、地デジと
+ケーブル TV の BS/CS 再送信（ISDB-C）を 1 本の tuner として扱える。詳細と Mirakurun 本体の起動方法は
+`docs/mirakurun.md`、雛形は `tools/mirakurun/`。
+1. libiio 1.x をソースからビルド（`docs/mirakurun.md`「準備」）、`make rt`、`make install-rt`
+   （Linux は `sudo make install-rt`、macOS は `make install-rt PREFIX=/opt/homebrew`）
+2. Linux は `tools/mirakurun/99-plutosdr.rules` を /etc/udev/rules.d/ に置いて Pluto の USB を一般ユーザーに許可
+3. 動作確認: `recpluto 27 10 test.ts`（10 秒録画）、`recpluto --scan gr:13-52`（受信できる局を channels.yml の形で表示）
+4. tuners.yml に 1 行（`command: recpluto --type=<type> --tsid=<tsid> <channel> - -`。`tools/mirakurun/tuners.yml.sample`）。
+   channels.yml は地デジなら Mirakurun の走査 API、CATV（BS/CS 再送信）なら BonDriver_BDA の .ch2 を
+   `tools/mirakurun/ch2_to_channels.py` で変換するか `recpluto --scan catv` で探す
+5. Mirakurun を起動（4.x は Docker 無しでも `lib/server.js` を直接起動できる。手順と常駐の雛形は `docs/mirakurun.md`）
+
+MacBook Air M5 + Pluto で Mirakurun 4.1.5 からの地デジの視聴・EPG 取得と、ケーブル端子からの BS 再送信の
+ストリーム取得まで確認済み（CPU は FPGA 前段で約 0.2 コア）。Raspberry Pi は未確認。
 
 ## ケーブルテレビの BS/CS（トランスモジュレーション、ISDB-C）
 ケーブル TV の宅内端子に来ている BS/CS 再送信（64QAM、5.274 Mbaud、TSMF 多重）は

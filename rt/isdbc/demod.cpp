@@ -10,12 +10,26 @@
 #ifdef __AVX2__
 #include <immintrin.h>
 #endif
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+#include <intrin.h>
+#elif defined(__x86_64__) || defined(__i386__)
+#include <x86intrin.h>
+#endif
 
 #include "../isdbt/fft.h"
 
 namespace isdbc {
 
 namespace {
+
+// プロファイル用のカウンタ（ISDBT_PROFILE=1 の cycles/symbol）。x86 は TSC、それ以外（arm64 など）は ns
+inline unsigned long long Cycles() {
+#if (defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))) || defined(__x86_64__) || defined(__i386__)
+    return __rdtsc();
+#else
+    return static_cast<unsigned long long>(std::chrono::steady_clock::now().time_since_epoch().count());
+#endif
+}
 
 constexpr double kPi = 3.14159265358979323846;
 constexpr size_t kAcqSamples = 1 << 19;             // 取得バッファ（7.1 MSPS で 74 ms）
@@ -525,21 +539,21 @@ bool IsdbcDemod::TrackStep() {
     }
     int n = nb;
     while (n > 1 && !AvailAt(next_pos_ + (n - 1) * sym_period_, x_abs0_, x_.size(), kTaps)) --n;
-    const unsigned long long c0 = __rdtsc();
+    const unsigned long long c0 = Cycles();
     cfloat z[B];
     double pos = next_pos_;
     for (int k = 0; k < n; ++k) {
         z[k] = Interp(pos);
         pos += sym_period_;
     }
-    const unsigned long long c1 = __rdtsc();
+    const unsigned long long c1 = Cycles();
     next_pos_ = pos;
     sym_count_ += n;
     for (int k = 0; k < n; ++k) {
         ++track_symbols_;
         OnSymbol(z[k]);
     }
-    const unsigned long long c2 = __rdtsc();
+    const unsigned long long c2 = Cycles();
     prof_cyc_interp_ += c1 - c0;
     prof_cyc_symbol_ += c2 - c1;
     prof_symbols_ += n;
@@ -636,8 +650,8 @@ void IsdbcDemod::UpdateTapArrays() {
 }
 
 void IsdbcDemod::FinishPhaseBlock() {
-    const unsigned long long cb0 = __rdtsc();
-    struct CycAcc { unsigned long long& acc; unsigned long long c0; ~CycAcc() { acc += __rdtsc() - c0; } } cyc{prof_cyc_block_, cb0};
+    const unsigned long long cb0 = Cycles();
+    struct CycAcc { unsigned long long& acc; unsigned long long c0; ~CycAcc() { acc += Cycles() - c0; } } cyc{prof_cyc_block_, cb0};
     const cfloat* C = Constellation();
     double theta = Wrap(theta_ + theta_rate_);
     if (blocks_done_ < kInitialPhaseBlocks) {
@@ -771,6 +785,7 @@ void IsdbcDemod::FinishPhaseBlock() {
     {
         constexpr int NP = 64;                          // 8 の倍数に 0 詰め（N ≤ 64）
         const int nv = (N + 7) / 8;
+        (void)nv;    // AVX2 無しでは未使用
         std::vector<float> Rr(static_cast<size_t>(N) * NP, 0.0f), Ri(static_cast<size_t>(N) * NP, 0.0f);
         alignas(32) float zr[NP] = {}, zi[NP] = {};
         for (size_t i = 0; i < zblk_idx_.size(); ++i) {

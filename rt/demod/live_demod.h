@@ -63,6 +63,8 @@ public:
     virtual void Tune(bool has_ch, int ch, double freq) = 0;
     virtual std::string StatusJson() = 0;
     virtual const std::string& source_desc() const = 0;
+    // 供給が終わった（ファイル再生が --loop 無しで末尾まで来た）。ライブ受信は終わらない
+    virtual bool Ended() const { return false; }
 };
 
 // 選局直後の最初の（短い）ウィンドウの出し方。連続再生できる量が溜まる前に出すものを決める:

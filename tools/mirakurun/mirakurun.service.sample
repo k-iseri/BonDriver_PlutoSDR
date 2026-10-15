@@ -1,0 +1,24 @@
+# Linux / Raspberry Pi OS で Mirakurun 4.x を Docker 無しに直接起動する systemd ユニットの雛形（未検証。
+# docs/mirakurun.md「Mirakurun 本体を動かす」と同じ環境変数）。
+# /etc/systemd/system/mirakurun.service に置き、User と WorkingDirectory を合わせて
+# `sudo systemctl daemon-reload && sudo systemctl enable --now mirakurun`。
+# recpluto は PATH（/usr/local/bin、make install-rt）に、Pluto の USB は 99-plutosdr.rules で許可しておく。
+[Unit]
+Description=Mirakurun (direct start, PlutoSDR via recpluto)
+After=network.target
+
+[Service]
+User=mirakurun
+WorkingDirectory=/home/mirakurun/mirakurun/node_modules/mirakurun
+Environment=SERVER_CONFIG_PATH=/home/mirakurun/mirakurun/config/server.yml
+Environment=TUNERS_CONFIG_PATH=/home/mirakurun/mirakurun/config/tuners.yml
+Environment=CHANNELS_CONFIG_PATH=/home/mirakurun/mirakurun/config/channels.yml
+Environment=SERVICES_DB_PATH=/home/mirakurun/mirakurun/data/services.json
+Environment=PROGRAMS_DB_PATH=/home/mirakurun/mirakurun/data/programs.json
+Environment=LOGO_DATA_DIR_PATH=/home/mirakurun/mirakurun/data/logo-data
+ExecStart=/usr/bin/node --max-semi-space-size=64 -r source-map-support/register lib/server.js
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

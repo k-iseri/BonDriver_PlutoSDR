@@ -61,6 +61,8 @@ make rt
 # ライブ受信デーモン（アンテナ → 復調 → BonDriver/TVTest）
 rt\build\rt-x64\Release\isdbtd.exe --sdr usb: --ch 24 --no-quit
 ```
+- `--stdout` を付けると TCP サーバを立てず TS を標準出力へ流す（Mirakurun などのチューナーコマンド用。
+  SIGTERM / Ctrl-C で終了。`docs/mirakurun.md`）。
 - デーモンを手動で常駐させる場合は **--no-quit を付け、BonDriver_PlutoSDR_T.ini は Spawn=0** にする。
   Spawn=1 のままだと TVTest 終了時に BonDriver が quit を送ってデーモンごと落とす
   （Spawn=1 は録画 TS 再生デーモンを DLL に起動させる開発用の設定）。
@@ -106,6 +108,11 @@ AD936x 内蔵の slow_attack AGC は帯域内レベルを約 −11 dBFS に保�
 `SdrConfig::agc_target_dbfs`）になっている。録音ツールで同じ条件にするには `--gain 30` 程度を指定する
 （`tools/iq_record.py`）。弱い空中線では目標に届かずゲインが上限（73 dB）まで上がるので、
 ソフト AGC は従来の AGC の上位互換になる。
+
+**FPGA 前段（等化モード）が弱い入力で raw 経路より落ちる問題はファーム v2.0.2 で修正**（2026-10-15）。原因は
+ファームの GI 相関器の移動和に起動後ずっと残る固定オフセットで、信号が弱いほど CFO 推定が傾いて残留 CFO の ICI に
+なっていた（27ch ゲイン 24 dB で raw B 25〜26 dB に対し v2.0.1 は 17.8〜20.8 dB）。v2.0.1 以前のファームでは
+`--fpga-eq 0` か `--agc-target -18` で回避する。 修正版の実機（27ch）: ゲイン 24 dB で CFO 推定 +83 → +41 Hz、B 層 MER raw 25.3 / FPGA 24.0 dB（差 4.3 → 1.3 dB）、A 層は FPGA 28.4 / raw 24.4 dB。
 
 ## 未検証のまま残っているもの
 - `--bits 8`（tezuka_fw の complex 8bit モード）: 本機は独自ビルド v0.39 のため

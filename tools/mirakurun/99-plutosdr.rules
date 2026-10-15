@@ -1,0 +1,4 @@
+# Linux / Raspberry Pi OS: 一般ユーザー（Mirakurun の実行ユーザー）から Pluto SDR の USB を開けるようにする。
+# /etc/udev/rules.d/ に置いて `sudo udevadm control --reload && sudo udevadm trigger`。
+# idVendor 0456 = Analog Devices、idProduct b673 = PlutoSDR（USB 複合デバイス）
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0456", ATTRS{idProduct}=="b673", MODE="0666", TAG+="uaccess"

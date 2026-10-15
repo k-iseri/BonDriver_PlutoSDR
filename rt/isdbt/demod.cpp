@@ -167,9 +167,14 @@ FrameSyncInfo FrameSync(ISymbolSource* src, Mode mode) {
 void EqualizeAndDeinterleave(const Mat<cfloat>& Y, Mode mode, int frame_start,
                              const std::vector<RxLayer>& layers,
                              const std::vector<std::vector<int>>& groups,
-                             Mat<cfloat>* H_out, Mat<cfloat>* Xt, Mat<float>* Wt) {
+                             Mat<cfloat>* H_out, Mat<cfloat>* Xt, Mat<float>* Wt, bool fast) {
+    static const bool profile = std::getenv("ISDBT_PROFILE") != nullptr;
+    auto now = [] { return std::chrono::steady_clock::now(); };
+    auto sec = [](auto a, auto b) { return std::chrono::duration<double>(b - a).count(); };
+    const auto t0 = now();
     std::vector<char> bad;
     Mat<cfloat> H = ChannelEstimate(Y, mode, frame_start, 8, &bad);
+    const auto t1 = now();
     Mat<cfloat> D;
     Mat<float> csi;
     Equalize(Y, H, &D, &csi);
@@ -177,7 +182,11 @@ void EqualizeAndDeinterleave(const Mat<cfloat>& Y, Mode mode, int frame_start,
         if (bad[r]) std::fill(csi[r], csi[r] + csi.cols, 0.0f);
     }
     if (H_out) *H_out = std::move(H);
-    DeinterleaveEqualized(D, csi, mode, frame_start, layers, groups, Xt, Wt);
+    const auto t2 = now();
+    DeinterleaveEqualized(D, csi, mode, frame_start, layers, groups, Xt, Wt, fast);
+    if (profile) {
+        std::fprintf(stderr, "[profile] eq %zu rows: chest %.3f equalize %.3f deint %.3f\n", Y.rows, sec(t0, t1), sec(t1, t2), sec(t2, now()));
+    }
 }
 
 // {I8, Q8, CSI8} 詰め行列用の補助
@@ -445,12 +454,10 @@ int LayerFirstFrame(const RxLayer& lyr, int frame_start) {
     return CeilDiv(need, kSymbolsPerFrame);
 }
 
-void DecodeSoftBits(const Mat<float>& soft, const RxLayer& lyr, Mode mode,
-                    std::vector<uint8_t>* ts, std::vector<int>* nerr) {
-    std::vector<float> pairs;
-    const size_t steps = Depuncture(soft.data(), soft.size(), lyr.rate, &pairs);
-    std::vector<uint8_t> bits = ViterbiDecode(pairs.data(), steps);
-
+namespace {
+// ビタビ後の硬判定ビット列 → パック → バイトデインターリーブ → 逆拡散 → RS → TS（DecodeSoftBits の共通部）
+void DecodeBitsToTs(const std::vector<uint8_t>& bits, const RxLayer& lyr, Mode mode,
+                    std::vector<uint8_t>* ts, std::vector<int>* nerr, double* t_rs) {
     const size_t n_bytes = bits.size() / 8;
     std::vector<uint8_t> onair(n_bytes);
     PackBits(bits.data(), n_bytes * 8, onair.data());
@@ -462,12 +469,50 @@ void DecodeSoftBits(const Mat<float>& soft, const RxLayer& lyr, Mode mode,
     std::vector<uint8_t> tsps(T * kRsN);
     EnergyDescrambleLayer(deint.data(), T, tsp_pf, tsps.data());
     nerr->resize(T);
+    const auto tr0 = std::chrono::steady_clock::now();
     RsDecode(tsps.data(), T, nerr->data());
+    *t_rs = std::chrono::duration<double>(std::chrono::steady_clock::now() - tr0).count();
 
     ts->resize(T * kTsPacket);
     for (size_t t = 0; t < T; ++t) {
         std::copy(tsps.begin() + t * kRsN, tsps.begin() + t * kRsN + kTsPacket,
                   ts->begin() + t * kTsPacket);
+    }
+}
+}  // namespace
+
+void DecodeSoftBits(const Mat<float>& soft, const RxLayer& lyr, Mode mode,
+                    std::vector<uint8_t>* ts, std::vector<int>* nerr) {
+    static const bool profile = std::getenv("ISDBT_PROFILE") != nullptr;
+    auto now = [] { return std::chrono::steady_clock::now(); };
+    auto sec = [](auto a, auto b) { return std::chrono::duration<double>(b - a).count(); };
+    const auto tp0 = now();
+    std::vector<float> pairs;
+    const size_t steps = Depuncture(soft.data(), soft.size(), lyr.rate, &pairs);
+    const auto tp1 = now();
+    std::vector<uint8_t> bits = ViterbiDecode(pairs.data(), steps);
+    const auto tp2 = now();
+    double t_rs = 0.0;
+    DecodeBitsToTs(bits, lyr, mode, ts, nerr, &t_rs);
+    if (profile) {
+        std::fprintf(stderr, "[profile] %s: depunct %.3f viterbi %.3f (%zu steps) pack+deint+descr+rs %.3f (rs %.3f, %zu tsp)\n",
+                     lyr.name.c_str(), sec(tp0, tp1), sec(tp1, tp2), steps, sec(tp2, now()), t_rs, nerr->size());
+    }
+}
+
+void DecodeSoftBitsQ(const std::vector<int8_t>& qsoft, const RxLayer& lyr, Mode mode,
+                     std::vector<uint8_t>* ts, std::vector<int>* nerr) {
+    static const bool profile = std::getenv("ISDBT_PROFILE") != nullptr;
+    auto now = [] { return std::chrono::steady_clock::now(); };
+    auto sec = [](auto a, auto b) { return std::chrono::duration<double>(b - a).count(); };
+    const auto tp0 = now();
+    std::vector<uint8_t> bits = ViterbiDecodeQ(qsoft.data(), qsoft.size(), lyr.rate);
+    const auto tp1 = now();
+    double t_rs = 0.0;
+    DecodeBitsToTs(bits, lyr, mode, ts, nerr, &t_rs);
+    if (profile) {
+        std::fprintf(stderr, "[profile] %s: viterbi8 %.3f (%zu steps) pack+deint+descr+rs %.3f (rs %.3f, %zu tsp)\n",
+                     lyr.name.c_str(), sec(tp0, tp1), bits.size(), sec(tp1, now()), t_rs, nerr->size());
     }
 }
 
@@ -530,7 +575,8 @@ namespace {
 // csi_full が非 null なら src は等化済み D を返すものとして、等化を飛ばしてデインターリーブだけ行う
 void DecodeSource(ISymbolSource* src, Mode mode, int block_frames,
                   FrameSyncInfo* fsi_out, std::map<std::string, LayerResult>* layers_out,
-                  const Mat<float>* csi_full = nullptr) {
+                  const Mat<float>* csi_full = nullptr, bool fast_fec = false, int first_fec_frame = 0,
+                  int* emit_first = nullptr, int* emit_end = nullptr) {
     *fsi_out = FrameSync(src, mode);
     const FrameSyncInfo& fsi = *fsi_out;
     const int f0 = fsi.frame_start;
@@ -557,14 +603,22 @@ void DecodeSource(ISymbolSource* src, Mode mode, int block_frames,
         fe.b1 = std::min(n_frames, b0 + step);
         const int fa = std::max(0, b0 - 1);             // Viterbi/バイト履歴の立ち上がり用に 1 フレーム重ねる
         fe.s0 = std::max(0, f0 + (fa - hist) * kSymbolsPerFrame - kEqContextSymbols);
-        const int s1 = std::min(src->n_sym(), f0 + fe.b1 * kSymbolsPerFrame + kEqContextSymbols);
+        // fast_fec の範囲復号はブロック末尾の後ろに kFecTailSymbols 行が要る
+        const int s1 = std::min(src->n_sym(), f0 + fe.b1 * kSymbolsPerFrame + std::max(kEqContextSymbols, kFecTailSymbols));
+        static const bool profile_fe = std::getenv("ISDBT_PROFILE") != nullptr;
+        const auto ts0 = std::chrono::steady_clock::now();
         Mat<cfloat> Y = src->Symbols(fe.s0, s1);
+        if (profile_fe) {
+            std::fprintf(stderr, "[profile] symbols %d rows: %.3f\n", s1 - fe.s0,
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() - ts0).count());
+        }
         if (csi_full) {
             Mat<float> csi(static_cast<size_t>(s1 - fe.s0), csi_full->cols);
             std::copy((*csi_full)[fe.s0], (*csi_full)[s1 - 1] + csi_full->cols, csi.data());
             DeinterleaveEqualized(Y, csi, mode, f0 - fe.s0, fsi.layers, fsi.groups, &fe.Xt, &fe.Wt);
         } else {
-            EqualizeAndDeinterleave(Y, mode, f0 - fe.s0, fsi.layers, fsi.groups, nullptr, &fe.Xt, &fe.Wt);
+            // ライブ（fast_fec）は干渉検出も 1 パス版（FPGA 前段経路と同じ）
+            EqualizeAndDeinterleave(Y, mode, f0 - fe.s0, fsi.layers, fsi.groups, nullptr, &fe.Xt, &fe.Wt, fast_fec);
         }
         return fe;
     };
@@ -576,13 +630,63 @@ void DecodeSource(ISymbolSource* src, Mode mode, int block_frames,
     auto now = [] { return std::chrono::steady_clock::now(); };
     auto sec = [](auto a, auto b) { return std::chrono::duration<double>(b - a).count(); };
 
+    const int b_first = std::max(0, first_fec_frame);
+    int reliable_first = b_first;               // fast_fec: 全層が完全なフレームの範囲 [reliable_first, complete_end)
+    int complete_end = n_frames;
     std::future<BlockFE> pending;
-    if (n_frames > 0) pending = std::async(std::launch::async, front_end, 0);
-    for (int b0 = 0; b0 < n_frames; b0 += step) {
+    if (b_first < n_frames) pending = std::async(std::launch::async, front_end, b_first);
+    for (int b0 = b_first; b0 < n_frames; b0 += step) {
         auto t0 = now();
         BlockFE fe = pending.get();
         t_front += sec(t0, now());      // 復号側から見た前段の待ち時間（重なった分は見えない）
         if (b0 + step < n_frames) pending = std::async(std::launch::async, front_end, b0 + step);
+        if (fast_fec) {
+            // 範囲復号（DecodeRange と同じ）: ブロックのフレーム [bstart, b1) の前後に助走（kFecHeadSymbols /
+            // kFecTailSymbols）だけ付けて復号し、ブロック内の全フレームを完全な形で出す（1 フレームの重ねや
+            // 末尾フレームの捨てが無いぶん、ライブのウィンドウでは FEC が約 2 割減る）
+            for (const RxLayer& lyr : fsi.layers) {
+                const int bstart = std::max(b0, fstart[lyr.name]);
+                if (bstart >= fe.b1) continue;
+                const int tsp_pf = TspPerFrame(mode, lyr.mod, lyr.rate, static_cast<int>(lyr.segments.size()));
+                const int avail = static_cast<int>(fe.Xt.rows) - (f0 - fe.s0);     // 受信フレーム 0 からの行数
+                int head_rows = kFecHeadSymbols;
+                int r0 = bstart * kSymbolsPerFrame - head_rows;
+                if (r0 < 0) {              // 先頭に助走が無い: 最初のフレームは Emit から外す（emit_first で）
+                    head_rows = 0;
+                    r0 = 0;
+                }
+                const int r1 = std::min(avail, fe.b1 * kSymbolsPerFrame + kFecTailSymbols);
+                if (r1 <= r0) continue;
+                std::vector<int> rows;
+                rows.reserve(static_cast<size_t>(r1 - r0));
+                for (int r = r0; r < r1; ++r) rows.push_back((f0 - fe.s0) + r);
+                auto t1 = now();
+                {
+                    std::vector<int> mrows;
+                    for (int r = bstart * kSymbolsPerFrame; r < std::min(avail, fe.b1 * kSymbolsPerFrame); ++r) {
+                        mrows.push_back((f0 - fe.s0) + r);
+                    }
+                    auto& acc = mer_acc[lyr.name];
+                    AccumulateMer(fe.Xt, mrows, lyr.segments, lyr.mod, dc, &acc.first, &acc.second);
+                }
+                std::vector<int8_t> qsoft = LayerSoftBitsQ(fe.Xt, fe.Wt, rows, lyr.segments, lyr.mod, mode, kViterbiSoftQ);
+                auto t2 = now();
+                std::vector<uint8_t> ts;
+                std::vector<int> nerr;
+                const int head_tsp = head_rows * tsp_pf / kSymbolsPerFrame;
+                DecodeSoftBitsRangeQ(qsoft, lyr, mode, head_tsp, fe.b1 - bstart, &ts, &nerr, nullptr);
+                t_soft += sec(t1, t2);
+                t_fec += sec(t2, now());
+                LayerResult& lr = (*layers_out)[lyr.name];
+                if (lr.first_frame < 0) {
+                    lr.first_frame = bstart;
+                    reliable_first = std::max(reliable_first, bstart + (head_rows == 0 ? 1 : 0));
+                }
+                lr.ts.insert(lr.ts.end(), ts.begin(), ts.end());
+                lr.rs_err.insert(lr.rs_err.end(), nerr.begin(), nerr.end());
+            }
+            continue;
+        }
         const int fa = std::max(0, b0 - 1);
         for (const RxLayer& lyr : fsi.layers) {
             const int fa_l = std::max(fa, fstart[lyr.name]);
@@ -602,11 +706,18 @@ void DecodeSource(ISymbolSource* src, Mode mode, int block_frames,
                 auto& acc = mer_acc[lyr.name];
                 AccumulateMer(fe.Xt, mrows, lyr.segments, lyr.mod, dc, &acc.first, &acc.second);
             }
-            Mat<float> soft = LayerSoftBits(fe.Xt, fe.Wt, rows, lyr.segments, lyr.mod, mode);
-            auto t2 = now();
             std::vector<uint8_t> ts;
             std::vector<int> nerr;
-            DecodeSoftBits(soft, lyr, mode, &ts, &nerr);
+            std::chrono::steady_clock::time_point t2;
+            if (fast_fec) {
+                std::vector<int8_t> qsoft = LayerSoftBitsQ(fe.Xt, fe.Wt, rows, lyr.segments, lyr.mod, mode, kViterbiSoftQ);
+                t2 = now();
+                DecodeSoftBitsQ(qsoft, lyr, mode, &ts, &nerr);
+            } else {
+                Mat<float> soft = LayerSoftBits(fe.Xt, fe.Wt, rows, lyr.segments, lyr.mod, mode);
+                t2 = now();
+                DecodeSoftBits(soft, lyr, mode, &ts, &nerr);
+            }
             t_soft += sec(t1, t2);
             t_fec += sec(t2, now());
             const int tsp_pf = TspPerFrame(mode, lyr.mod, lyr.rate, static_cast<int>(lyr.segments.size()));
@@ -623,6 +734,17 @@ void DecodeSource(ISymbolSource* src, Mode mode, int block_frames,
         if (acc.second > 0.0) {
             (*layers_out)[name].mer_db = 10.0 * std::log10(acc.first / acc.second);
         }
+    }
+    if (fast_fec && emit_first && emit_end) {
+        // 全層が完全なフレームの範囲（末尾は tail の助走が足りず短くなった層に合わせる）
+        for (const RxLayer& lyr : fsi.layers) {
+            const LayerResult& lr = (*layers_out)[lyr.name];
+            if (lr.first_frame < 0) continue;
+            const int tsp_pf = TspPerFrame(mode, lyr.mod, lyr.rate, static_cast<int>(lyr.segments.size()));
+            complete_end = std::min(complete_end, lr.first_frame + static_cast<int>(lr.rs_err.size()) / tsp_pf);
+        }
+        *emit_first = reliable_first;
+        *emit_end = std::max(reliable_first, complete_end);
     }
     if (profile) {
         std::fprintf(stderr, "[profile] front(wait)=%.2fs soft=%.2fs fec=%.2fs\n", t_front, t_soft, t_fec);
@@ -825,11 +947,13 @@ DemodResult DemodulateEqualized(const Mat<cfloat>& D, const Mat<float>& csi, Mod
     return out;
 }
 
-DemodResult Demodulate(std::vector<cfloat> iq, double fs, Mode mode, Gi gi, int block_frames) {
+DemodResult Demodulate(std::vector<cfloat> iq, double fs, Mode mode, Gi gi, int block_frames, bool fast_fec,
+                       int first_fec_frame) {
     CarrierSource src(std::move(iq), fs, mode, gi);
     DemodResult out;
     out.sync = src.info();
-    DecodeSource(&src, mode, block_frames, &out.fsi, &out.layers);
+    DecodeSource(&src, mode, block_frames, &out.fsi, &out.layers, nullptr, fast_fec, first_fec_frame,
+                 &out.emit_first, &out.emit_end);
     return out;
 }
 

@@ -9,11 +9,34 @@
 // 使い方例:
 //   isdbtd --ts C:/rec/ch27.ts --loop
 //   isdbtd --sigmf testdata/synthetic/std_mode3_gi8_clean.sigmf-meta --loop
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#pragma comment(lib, "ws2_32.lib")
+using socket_t = SOCKET;
+inline void CloseSocket(socket_t s) { closesocket(s); }
+#else
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <signal.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <unistd.h>
+using socket_t = int;
+constexpr socket_t INVALID_SOCKET = -1;
+inline void CloseSocket(socket_t s) { close(s); }
+#endif
+
+#ifdef _WIN32
+#include <corecrt_io.h>     // _setmode（<io.h> は rt/isdbt/io.h と名前が衝突する）
+#include <fcntl.h>
+#endif
 
 #include <algorithm>
+#include <csignal>
+#include <cstdarg>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -35,8 +58,6 @@
 #include "live_demod.h"
 #include "live_switch.h"
 #include "sdr_source.h"
-
-#pragma comment(lib, "ws2_32.lib")
 
 using namespace isdbt;
 
@@ -202,7 +223,7 @@ std::vector<uint8_t> MergeLayersByFrame(const DemodResult& res, Mode mode) {
 }
 
 Source LoadSigmf(const std::string& path, Mode mode, Gi gi, double max_seconds, double bitrate_opt,
-                 bool track) {
+                 bool track, bool fast_fec) {
     SigmfMeta meta;
     std::vector<cfloat> iq = ReadSigmf(path, &meta);
     if (max_seconds > 0) {
@@ -252,7 +273,7 @@ Source LoadSigmf(const std::string& path, Mode mode, Gi gi, double max_seconds, 
         s.source_desc = "sigmf:" + path;
         return s;
     }
-    res = Demodulate(std::move(iq), meta.sample_rate, mode, gi);
+    res = Demodulate(std::move(iq), meta.sample_rate, mode, gi, kDefaultBlockFrames, fast_fec);
     const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     std::fprintf(stderr, "done in %.1f s\n", sec);
     std::fprintf(stderr,
@@ -351,22 +372,22 @@ public:
         if (thread_.joinable()) thread_.join();
     }
 
-    std::shared_ptr<ClientQueue> AddClient() {
+    std::shared_ptr<ClientQueue> AddClient() override {
         auto q = std::make_shared<ClientQueue>();
         std::lock_guard<std::mutex> lock(mu_);
         clients_.push_back(q);
         return q;
     }
-    void AttachClient(const std::shared_ptr<ClientQueue>& q) {
+    void AttachClient(const std::shared_ptr<ClientQueue>& q) override {
         std::lock_guard<std::mutex> lock(mu_);
         clients_.push_back(q);
     }
-    void RemoveClient(const std::shared_ptr<ClientQueue>& q) {
+    void RemoveClient(const std::shared_ptr<ClientQueue>& q) override {
         std::lock_guard<std::mutex> lock(mu_);
         clients_.erase(std::remove(clients_.begin(), clients_.end(), q), clients_.end());
     }
 
-    void Tune(bool has_ch, int ch, double freq) {
+    void Tune(bool has_ch, int ch, double freq) override {
         std::lock_guard<std::mutex> lock(mu_);
         has_channel_ = has_ch;
         channel_ = ch;
@@ -380,7 +401,7 @@ public:
         }
     }
 
-    std::string StatusJson() {
+    std::string StatusJson() override {
         std::lock_guard<std::mutex> lock(mu_);
         std::string s = "{\"ok\": true";
         s += ", \"locked\": " + std::string(src_.locked && !ended_ ? "true" : "false");
@@ -406,7 +427,11 @@ public:
         return s;
     }
 
-    const std::string& source_desc() const { return src_.source_desc; }
+    const std::string& source_desc() const override { return src_.source_desc; }
+    bool Ended() const override {
+        std::lock_guard<std::mutex> lock(mu_);
+        return ended_;
+    }
 
 private:
     void Run() {
@@ -455,7 +480,7 @@ private:
     Source src_;
     bool loop_;
     double signal_db_;
-    std::mutex mu_;
+    mutable std::mutex mu_;                 // Ended() は const
     std::vector<std::shared_ptr<ClientQueue>> clients_;
     size_t pos_ = 0;
     bool ended_ = false;
@@ -479,9 +504,9 @@ public:
         listen_ = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
-        addr.sin_port = htons(static_cast<u_short>(port));
+        addr.sin_port = htons(static_cast<uint16_t>(port));
         inet_pton(AF_INET, host.c_str(), &addr.sin_addr);
-        BOOL yes = TRUE;
+        int yes = 1;
         setsockopt(listen_, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&yes), sizeof(yes));
         if (bind(listen_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 ||
             listen(listen_, 8) != 0) {
@@ -497,13 +522,13 @@ public:
             FD_ZERO(&rd);
             FD_SET(listen_, &rd);
             timeval tv{0, 200'000};
-            const int r = select(0, &rd, nullptr, nullptr, &tv);
+            const int r = select(static_cast<int>(listen_) + 1, &rd, nullptr, nullptr, &tv);    // 第 1 引数は Windows では無視される
             if (r <= 0) continue;
-            SOCKET c = accept(listen_, nullptr, nullptr);
+            socket_t c = accept(listen_, nullptr, nullptr);
             if (c == INVALID_SOCKET) continue;
             std::thread(&Server::Handle, this, c).detach();
         }
-        closesocket(listen_);
+        CloseSocket(listen_);
     }
 
 private:
@@ -516,9 +541,9 @@ private:
         va_end(ap);
     }
 
-    static bool SendAll(SOCKET s, const char* data, size_t n) {
+    static bool SendAll(socket_t s, const char* data, size_t n) {
         while (n > 0) {
-            const int r = send(s, data, static_cast<int>(std::min<size_t>(n, 1 << 20)), 0);
+            const int r = static_cast<int>(send(s, data, static_cast<int>(std::min<size_t>(n, 1 << 20)), 0));
             if (r <= 0) return false;
             data += r;
             n -= static_cast<size_t>(r);
@@ -526,18 +551,18 @@ private:
         return true;
     }
 
-    static bool SendLine(SOCKET s, const std::string& json) {
+    static bool SendLine(socket_t s, const std::string& json) {
         std::string line = json + "\n";
         return SendAll(s, line.data(), line.size());
     }
 
-    void Handle(SOCKET c) {
+    void Handle(socket_t c) {
         std::string buf;
         char tmp[4096];
         while (!stopping_) {
             size_t nl = buf.find('\n');
             if (nl == std::string::npos) {
-                const int r = recv(c, tmp, sizeof(tmp), 0);
+                const int r = static_cast<int>(recv(c, tmp, sizeof(tmp), 0));
                 if (r <= 0) break;
                 buf.append(tmp, static_cast<size_t>(r));
                 continue;
@@ -613,13 +638,13 @@ private:
                 SendLine(c, "{\"ok\": false, \"error\": \"unknown cmd '" + cmd + "'\"}");
             }
         }
-        closesocket(c);
+        CloseSocket(c);
     }
 
-    void Stream(SOCKET c) {
+    void Stream(socket_t c) {
         auto q = rp_->AddClient();
         Log("stream client connected");
-        BOOL yes = TRUE;
+        int yes = 1;
         setsockopt(c, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&yes), sizeof(yes));
         while (!stopping_) {
             std::vector<uint8_t> chunk;
@@ -641,9 +666,50 @@ private:
     LiveSwitch* live_;
     bool allow_quit_;
     bool verbose_;
-    SOCKET listen_;
+    socket_t listen_;
     std::atomic<bool> stopping_{false};
 };
+
+// --stdout: TCP サーバを立てず、TS を標準出力に流す（Mirakurun / recpt1 相当のチューナーコマンド用）。
+// SIGTERM / SIGINT（Mirakurun はチャンネル切替・停止でプロセスを止める）か、stdout が閉じたら終わる
+std::atomic<bool> g_stop{false};
+void OnSignal(int) { g_stop = true; }
+
+int StreamToStdout(IFeed* feed, bool verbose) {
+#ifdef _WIN32
+    _setmode(_fileno(stdout), _O_BINARY);
+#endif
+    std::signal(SIGINT, OnSignal);
+    std::signal(SIGTERM, OnSignal);
+    auto q = feed->AddClient();
+    auto last_status = std::chrono::steady_clock::now();
+    long long bytes = 0;
+    while (!g_stop) {
+        const auto now = std::chrono::steady_clock::now();
+        if (verbose && now - last_status >= std::chrono::seconds(10)) {
+            std::fprintf(stderr, "%s\n", feed->StatusJson().c_str());
+            last_status = now;
+        }
+        std::vector<uint8_t> chunk;
+        {
+            std::unique_lock<std::mutex> lock(q->mu);
+            if (!q->cv.wait_for(lock, std::chrono::milliseconds(500), [&] { return !q->chunks.empty(); })) {
+                if (feed->Ended()) break;       // ファイル再生（--loop 無し）の末尾: 出し切ったら終わる
+                continue;
+            }
+            chunk = std::move(q->chunks.front());
+            q->chunks.pop_front();
+        }
+        if (std::fwrite(chunk.data(), 1, chunk.size(), stdout) != chunk.size() || std::fflush(stdout) != 0) {
+            if (verbose) std::fprintf(stderr, "stdout closed after %lld bytes\n", bytes);
+            break;
+        }
+        bytes += static_cast<long long>(chunk.size());
+    }
+    feed->RemoveClient(q);
+    if (verbose) std::fprintf(stderr, "stdout stream end (%lld bytes%s)\n", bytes, g_stop ? ", signal" : "");
+    return 0;
+}
 
 void Usage() {
     std::fprintf(stderr,
@@ -655,10 +721,13 @@ void Usage() {
         "  --bitrate F         再生ビットレート [bit/s]\n"
         "  --loop              末尾まで来たら先頭に戻る\n"
         "  --track             追従復調（長時間・ドリフト・瞬断のある録音向け）\n"
+        "  --fast-fec          --sigmf でもライブ受信と同じ 8bit ビタビを使う（float 版との比較用）\n"
         "  --signal-db F       status.signal_db に返す固定値 (default 30)\n"
         "  --tsmf N | all      ISDB-C: TSMF の相対 TS 番号（既定は自動、all = 全スロット通過）\n"
         "  --host H --port N   (default 127.0.0.1:47188)\n"
         "  --no-quit           quit コマンドを受け付けない\n"
+        "  --stdout            TCP サーバを立てず TS を標準出力へ（Mirakurun 等のチューナーコマンド用。\n"
+        "                      --sdr では --ch か --freq が必須。SIGTERM / SIGINT か stdout が閉じると終了）\n"
         "  --quiet\n"
         "SDR ライブ受信（--sdr。uri 省略時 usb:）:\n"
         "  --ch N | --freq F   初期チャンネル/周波数（省略時は tune 待ち。isdbc の N は 0..112 の通し番号）\n"
@@ -681,7 +750,7 @@ int main(int argc, char** argv) {
     std::string ts_path, sigmf_path, host = "127.0.0.1", gi_str = "1/8";
     int mode_i = 3, port = kDefaultPort;
     double max_seconds = 0, bitrate = 0, signal_db = 30.0;
-    bool loop = false, no_quit = false, quiet = false, track = false;
+    bool loop = false, no_quit = false, quiet = false, track = false, to_stdout = false, fast_fec = false;
     bool sdr = false;
     SdrConfig sdr_cfg;
     std::string dump_iq, system_str;
@@ -723,6 +792,7 @@ int main(int argc, char** argv) {
         else if (a == "--bitrate") bitrate = std::atof(next().c_str());
         else if (a == "--loop") loop = true;
         else if (a == "--track") track = true;
+        else if (a == "--fast-fec") fast_fec = true;
         else if (a == "--signal-db") signal_db = std::atof(next().c_str());
         else if (a == "--tsmf" || a == "--rel-ts") {
             const std::string v = next();
@@ -733,6 +803,7 @@ int main(int argc, char** argv) {
         else if (a == "--port") port = std::atoi(next().c_str());
         else if (a == "--no-quit") no_quit = true;
         else if (a == "--quiet") quiet = true;
+        else if (a == "--stdout") to_stdout = true;
         else { Usage(); return 2; }
     }
     const int n_sources = (!ts_path.empty()) + (!sigmf_path.empty()) + (sdr ? 1 : 0);
@@ -741,8 +812,12 @@ int main(int argc, char** argv) {
         return 2;
     }
 
+#ifdef _WIN32
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
+#else
+    signal(SIGPIPE, SIG_IGN);    // クライアントが切れたときの send() は戻り値で扱う
+#endif
     try {
         Gi gi{8};
         if (!ParseGi(gi_str, &gi)) throw std::runtime_error("bad --gi: " + gi_str);
@@ -771,35 +846,53 @@ int main(int argc, char** argv) {
             lp.select = ts_sel;
             lp.verbose = !quiet;
             if (!ParseFirstBurst(first_burst_str, &lp.first_burst)) throw std::runtime_error("bad --first-burst: " + first_burst_str);
+            if (to_stdout && !init_ch && sdr_cfg.freq_hz <= 0) throw std::runtime_error("--stdout with --sdr needs --ch or --freq");
             LiveSwitch live(lp);
             live.Start(system);
             if (init_ch) live.TuneSystem(system, true, init_ch, init_freq);
-            std::fprintf(stderr, "live demod (%s, %s, win=%d+%d frames, %d workers) on %s:%d\n",
-                         sdr_cfg.uri.c_str(), SystemName(system), ctx_frames, win_frames, workers,
-                         host.c_str(), port);
-            Server server(&live, &live, host, port, !no_quit, !quiet);
-            server.Serve();
-            live.Stop();
+            if (to_stdout) {
+                std::fprintf(stderr, "live demod (%s, %s, win=%d+%d frames, %d workers) -> stdout\n",
+                             sdr_cfg.uri.c_str(), SystemName(system), ctx_frames, win_frames, workers);
+                StreamToStdout(&live, !quiet);
+                live.Stop();
+            } else {
+                std::fprintf(stderr, "live demod (%s, %s, win=%d+%d frames, %d workers) on %s:%d\n",
+                             sdr_cfg.uri.c_str(), SystemName(system), ctx_frames, win_frames, workers,
+                             host.c_str(), port);
+                Server server(&live, &live, host, port, !no_quit, !quiet);
+                server.Serve();
+                live.Stop();
+            }
         } else {
             Source src = !ts_path.empty() ? LoadTsFile(ts_path, bitrate)
                          : (system == System::kIsdbc
                                 ? LoadSigmfIsdbc(sigmf_path, max_seconds, bitrate, ts_sel)
-                                : LoadSigmf(sigmf_path, static_cast<Mode>(mode_i), gi, max_seconds, bitrate, track));
+                                : LoadSigmf(sigmf_path, static_cast<Mode>(mode_i), gi, max_seconds, bitrate, track, fast_fec));
             const size_t n_tsp = src.packets.size() / kTsPacket;
             std::fprintf(stderr, "serving %zu TSP (%.1f s at %.3f Mbps, loop=%d) on %s:%d  source=%s\n",
                          n_tsp, n_tsp * kTsPacket * 8 / src.bitrate, src.bitrate / 1e6, loop ? 1 : 0,
                          host.c_str(), port, src.source_desc.c_str());
             Replayer rp(std::move(src), loop, signal_db);
-            Server server(&rp, nullptr, host, port, !no_quit, !quiet);
-            rp.Start();
-            server.Serve();
-            rp.Stop();
+            if (to_stdout) {
+                rp.Start();
+                StreamToStdout(&rp, !quiet);
+                rp.Stop();
+            } else {
+                Server server(&rp, nullptr, host, port, !no_quit, !quiet);
+                rp.Start();
+                server.Serve();
+                rp.Stop();
+            }
         }
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
+#ifdef _WIN32
         WSACleanup();
+#endif
         return 1;
     }
+#ifdef _WIN32
     WSACleanup();
+#endif
     return 0;
 }

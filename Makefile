@@ -1,9 +1,11 @@
-PY ?= python
 VENV ?= .venv
 ifeq ($(OS),Windows_NT)
+  PY ?= python
   BIN = $(VENV)/Scripts
   RM = powershell -NoProfile -Command Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 else
+  # macOS / Ubuntu は python3 だけで python が無い
+  PY ?= python3
   BIN = $(VENV)/bin
   RM = rm -rf
 endif
@@ -11,7 +13,7 @@ PIP = $(BIN)/pip
 PYTEST = $(BIN)/pytest
 VPY = $(BIN)/python
 
-.PHONY: setup test test-fast lint synth bondriver rt rt-vectors rt-test libiio-fetch clean
+.PHONY: setup test test-fast lint synth bondriver rt rt-vectors rt-test install-rt libiio-fetch clean
 
 setup:
 	$(PY) -m venv $(VENV)
@@ -33,14 +35,27 @@ synth:
 bondriver:
 	powershell -NoProfile -ExecutionPolicy Bypass -File rt/bondriver/build.ps1
 
+# rt/: Windows は build.ps1（vswhere で MSVC を探す）、Linux / macOS は CMake を直接
+ifeq ($(OS),Windows_NT)
+  RT_TEST = rt/build/rt-x64/Release/rt_test.exe
 rt:
 	powershell -NoProfile -ExecutionPolicy Bypass -File rt/build.ps1
+else
+  RT_TEST = rt/build/rt-native/rt_test
+  PREFIX ?= /usr/local
+rt:
+	cmake -S rt -B rt/build/rt-native -DCMAKE_BUILD_TYPE=Release
+	cmake --build rt/build/rt-native -j
+# recpluto（Mirakurun のチューナーコマンド）と isdbtd を $(PREFIX)/bin に置く（Linux は sudo、macOS は PREFIX=/opt/homebrew）
+install-rt: rt
+	cmake --install rt/build/rt-native --prefix $(PREFIX)
+endif
 
 rt-vectors:
 	$(VPY) tools/gen_rt_vectors.py --out testdata/rt_vectors
 
 rt-test:
-	rt/build/rt-x64/Release/rt_test.exe testdata/rt_vectors
+	$(RT_TEST) testdata/rt_vectors
 
 libiio-fetch:
 	powershell -ExecutionPolicy Bypass -File rt/third_party/fetch_libiio.ps1

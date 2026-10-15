@@ -128,11 +128,17 @@ Mat<cfloat> ChannelEstimate(const Mat<cfloat>& Y, Mode mode, int frame_start, in
             prev_known = known[j];
             flat[j] = hg;
         }
-        // バルク遅延（格子 1 点 = 3 キャリアあたりの位相回転）を除く
+        // バルク遅延（格子 1 点 = 3 キャリアあたりの位相回転）を除く。回転子は格子ごとの cos/sin ではなく
+        // double の複素乗算で進め、256 点ごとに正確な位相から取り直す（差は double の丸め程度）
         const double dphi = std::arg(slope_acc);
-        for (int j = 0; j < M; ++j) {
-            const double a2 = -dphi * j;
-            flat[j] *= std::complex<double>(std::cos(a2), std::sin(a2));
+        {
+            const std::complex<double> step = std::polar(1.0, -dphi);
+            std::complex<double> rot;
+            for (int j = 0; j < M; ++j) {
+                if (j % 256 == 0) rot = std::polar(1.0, -dphi * j);
+                flat[j] *= rot;
+                rot *= step;
+            }
         }
         // 既知でない格子点を線形補間（端は端の値）
         if (n_known < M && n_known >= 2) {
@@ -158,22 +164,24 @@ Mat<cfloat> ChannelEstimate(const Mat<cfloat>& Y, Mode mode, int frame_start, in
                 }
             }
         }
-        // キャリア方向の線形補間（格子 3j の間）と傾斜の復元
+        // キャリア方向の線形補間（格子 3j の間）と傾斜の復元（回転子 exp(i dphi k / 3) も同じく漸化式）
         cfloat* Hr = H[r];
-        for (int j = 0; j < M - 1; ++j) {
-            const std::complex<double> f0 = flat[j];
-            const std::complex<double> df = (flat[j + 1] - flat[j]) / 3.0;
-            for (int d = 0; d < 3; ++d) {
-                const int k = 3 * j + d;
-                const std::complex<double> v = f0 + df * static_cast<double>(d);
-                const double ph = dphi * k / 3.0;
-                Hr[k] = static_cast<cfloat>(v * std::complex<double>(std::cos(ph), std::sin(ph)));
-            }
-        }
         {
+            const std::complex<double> step = std::polar(1.0, dphi / 3.0);
+            std::complex<double> rot;
+            for (int j = 0; j < M - 1; ++j) {
+                const std::complex<double> f0 = flat[j];
+                const std::complex<double> df = (flat[j + 1] - flat[j]) / 3.0;
+                for (int d = 0; d < 3; ++d) {
+                    const int k = 3 * j + d;
+                    if (k % 768 == 0) rot = std::polar(1.0, dphi * k / 3.0);
+                    const std::complex<double> v = f0 + df * static_cast<double>(d);
+                    Hr[k] = static_cast<cfloat>(v * rot);
+                    rot *= step;
+                }
+            }
             const int k = K - 1;
-            const double ph = dphi * k / 3.0;
-            Hr[k] = static_cast<cfloat>(flat[M - 1] * std::complex<double>(std::cos(ph), std::sin(ph)));
+            Hr[k] = static_cast<cfloat>(flat[M - 1] * std::polar(1.0, dphi * k / 3.0));
         }
     }
 
@@ -205,10 +213,14 @@ void Equalize(const Mat<cfloat>& Y, const Mat<cfloat>& H, Mat<cfloat>* D, Mat<fl
         float* w = (*csi)[r];
         double sum = 0.0;
         for (size_t k = 0; k < K; ++k) {
-            // H = 0（瞬断などで推定不能）は D も CSI も 0（NaN を残すと Viterbi 全体を汚染する）
-            const float hn = std::norm(h[k]);
+            // H = 0（瞬断などで推定不能）は D も CSI も 0（NaN を残すと Viterbi 全体を汚染する）。
+            // 除算は y·conj(h) / |h|² で書く（std::complex の operator/ はスケーリング付きで数倍遅い）
+            const float hr = h[k].real(), hi = h[k].imag();
+            const float hn = hr * hr + hi * hi;
             if (hn > 0.0f && std::isfinite(hn)) {
-                d[k] = y[k] / h[k];
+                const float yr = y[k].real(), yi = y[k].imag();
+                const float inv = 1.0f / hn;
+                d[k] = cfloat((yr * hr + yi * hi) * inv, (yi * hr - yr * hi) * inv);
                 w[k] = hn;
             } else {
                 d[k] = cfloat(0.0f, 0.0f);

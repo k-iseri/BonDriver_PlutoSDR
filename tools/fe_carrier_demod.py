@@ -101,6 +101,7 @@ def main():
     ap.add_argument("--rf", action="store_true", help="RX 端子の実波を使う（--ch / --freq、ソフト AGC）")
     ap.add_argument("--ch", type=int, default=24)
     ap.add_argument("--freq", type=float, default=None)
+    ap.add_argument("--gain", type=float, default=26.0, help="--rf の手動ゲイン dB（レベル依存の切り分け用）")
     ap.add_argument("--sec", type=float, default=2.0, help="取り込む秒数")
     ap.add_argument("--settle", type=float, default=2.0)
     ap.add_argument("--ts-ref", default=str(ROOT / "testdata" / "synthetic" / "std_mode3_gi8_layerB.ts"))
@@ -145,7 +146,7 @@ def main():
         freq = args.freq if args.freq else 473_142_857.0 + 6_000_000.0 * (args.ch - 13)
         phy.find_channel("altvoltage0", True).attrs["frequency"].value = str(int(freq))
         rxch.attrs["gain_control_mode"].value = "manual"
-        rxch.attrs["hardwaregain"].value = "26"
+        rxch.attrs["hardwaregain"].value = str(int(round(args.gain)))
         phy.debug_attrs["loopback"].value = "0"
     time.sleep(0.3)
 
@@ -198,6 +199,10 @@ def analyze(frames, args):
     locks = np.array([(h["status"] >> 16) & 1 for h, _ in frames])
     gaps = np.where(np.diff(seqs) != 1)[0]
     print(f"seq gaps: {len(gaps)} (USB 取りこぼし), start diffs: {np.unique(np.diff(starts))[:6].tolist()}, locked {locks.mean():.2f}")
+    be = np.array([h["blk_exp"] for h, _ in frames])
+    yb = np.array([y[N // 2 - 2808:N // 2 + 2809] for _, y in frames[:200]]) / (2.0 ** be[:200, None])
+    print(f"blk_exp {be.min()}..{be.max()}, FFT 出力ビン（12bit 単位、有効キャリア）: rms {np.sqrt(np.mean(np.abs(yb) ** 2) / 2):.1f} LSB/成分, "
+          f"max |re| {np.abs(yb.real).max():.0f}, |re| < 8 の割合 {np.mean(np.abs(yb.real) < 8):.3f}")
     # 最長の連続区間
     bounds = np.concatenate([[0], gaps + 1, [len(frames)]])
     runs = [(bounds[i], bounds[i + 1]) for i in range(len(bounds) - 1)]

@@ -1,0 +1,44 @@
+# rt/（復調コア + isdbtd）が Linux と macOS（Apple Silicon）でビルドでき、ref/ とのベクタ一致
+# （rt_test）と isdbtd のプロトコル試験が通ることを確認する。Windows の DLL ビルドは release.yml。
+# Raspberry Pi（arm64 Linux）の実機は無いので、arm64 は macOS ランナーで代替している。
+name: ci
+
+on:
+  push:
+    branches: ["main", "portable-rt"]
+    paths: ["rt/**", "ref/**", "tools/gen_rt_vectors.py", "pyproject.toml", ".github/workflows/ci.yml"]
+  pull_request:
+    paths: ["rt/**", "ref/**", "tools/gen_rt_vectors.py", "pyproject.toml", ".github/workflows/ci.yml"]
+  workflow_dispatch:
+
+jobs:
+  rt:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ref/ (numpy, scipy, pytest)
+        run: python -m pip install -e ".[dev]"
+
+      - name: Configure and build rt/
+        run: |
+          cmake -S rt -B rt/build/rt-native -DCMAKE_BUILD_TYPE=Release
+          cmake --build rt/build/rt-native -j 4
+
+      - name: Generate vectors and run rt_test + isdbtd protocol tests
+        run: python -m pytest ref/tests/test_rt.py -q -p no:cacheprovider
+
+      # Mirakurun 用チューナーコマンド。ランナーに libiio は無いので、引数の解釈と「libiio 無し」の終了だけ確かめる
+      - name: recpluto smoke test (no libiio)
+        run: |
+          rt/build/rt-native/recpluto --help
+          if rt/build/rt-native/recpluto 99 - -; then echo "bad channel accepted"; exit 1; fi
+          if rt/build/rt-native/recpluto --quiet 27 1 -; then echo "should fail without libiio"; exit 1; fi

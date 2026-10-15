@@ -49,8 +49,16 @@ struct DemodResult {
 };
 
 // I/Q（サンプルレート fs）→ 階層ごとの TS。block_frames フレームずつ処理する。
-// ブロックの前段（FFT〜デインターリーブ）と復号（Viterbi〜RS）はスレッドでパイプライン化される
-DemodResult Demodulate(std::vector<cfloat> iq, double fs, Mode mode, Gi gi, int block_frames = 6);
+// ブロックの前段（FFT〜デインターリーブ）と復号（Viterbi〜RS）はスレッドでパイプライン化される。
+// fast_fec はビタビを 8bit 量子化版（ViterbiDecodeQ。AVX2 / NEON）にし、ブロックを範囲復号（助走付き、
+// DecodeRange と同じ）にして DemodResult の emit_first / emit_end を埋める。ライブ受信用で、float 版より
+// 2〜2.5 倍速い代わりに判定が極まれに（数千万ビットに数十）変わりうる。RS 訂正後の TS は同じ
+// （decisions 2026-10-15）。既定の float 版は ref/ との一致テストと録音ファイルの復調に使う
+// first_fec_frame: この受信フレームから FEC を始める（前段・時間デインターリーブの履歴はその前から取る）。
+// ライブのウィンドウは先頭の文脈フレームが前のウィンドウで排出済みなので、そこの FEC を省く
+inline constexpr int kDefaultBlockFrames = 6;
+DemodResult Demodulate(std::vector<cfloat> iq, double fs, Mode mode, Gi gi, int block_frames = kDefaultBlockFrames,
+                       bool fast_fec = false, int first_fec_frame = 0);
 
 // 追従型（長時間・クロックドリフト・瞬断向け）: ロック区間ごとにフレーム同期からやり直す
 struct TrackedSegment {
@@ -70,10 +78,11 @@ TrackedResult DemodulateTracked(std::vector<cfloat> iq, double fs, Mode mode, Gi
 // --- 個別の段（テストとデーモンが使う） ---
 
 // 等化 → 論理キャリア → 時間 → セグメント間デインターリーブ。H は不要なら nullptr
+// fast: デインターリーブを DeinterleaveEqualized の fast_null 版（ライブ用）で行う
 void EqualizeAndDeinterleave(const Mat<cfloat>& Y, Mode mode, int frame_start,
                              const std::vector<RxLayer>& layers,
                              const std::vector<std::vector<int>>& groups,
-                             Mat<cfloat>* H_out, Mat<cfloat>* Xt, Mat<float>* Wt);
+                             Mat<cfloat>* H_out, Mat<cfloat>* Xt, Mat<float>* Wt, bool fast = false);
 
 // 等化済みキャリア（D = Y/H と CSI）からデインターリーブ以降。FPGA 等化器（pluto-fw-isdbt モード 4）の
 // 出力をホスト後段に渡す入口。EqualizeAndDeinterleave の等化部分を飛ばしたもの
@@ -116,6 +125,9 @@ int LayerFirstFrame(const RxLayer& lyr, int frame_start);
 // ビットデインターリーブ後の軟判定 (n_slots, bps) → TS パケット列・RS 統計
 void DecodeSoftBits(const Mat<float>& soft, const RxLayer& lyr, Mode mode,
                     std::vector<uint8_t>* ts, std::vector<int>* nerr);
+// 同上、量子化済み軟値（LayerSoftBitsQ）を 8bit ビタビで（Demodulate の fast_fec）
+void DecodeSoftBitsQ(const std::vector<int8_t>& qsoft, const RxLayer& lyr, Mode mode,
+                     std::vector<uint8_t>* ts, std::vector<int>* nerr);
 // 同上、範囲復号用: 先頭 head_tsp 個の TSP（助走）を捨て、そこがフレーム先頭として n_frames フレーム分だけ
 // エネルギー逆拡散・RS をかける（入力が足りなければ揃うフレームまで）
 void DecodeSoftBitsRangeQ(const std::vector<int8_t>& qsoft, const RxLayer& lyr, Mode mode, int head_tsp, int n_frames,
