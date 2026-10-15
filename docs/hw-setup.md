@@ -66,6 +66,7 @@ rt\build\rt-x64\Release\isdbtd.exe --sdr usb: --ch 24 --no-quit
   （Spawn=1 は録画 TS 再生デーモンを DLL に起動させる開発用の設定）。
 - 取り込みは既定 7,111,111 Hz（公称の 7/8）。16bit×公称レートは USB 2.0 の実効上限
   （実測 ~31.3 MB/s）を超えるため。品質劣化はない（同時刻の公称レート録音と MER 一致）。
+  pluto-fw-isdbt（8bit 転送）を書いた Pluto では申告を見て公称 8.127 MSPS でそのまま取り込む。
 - 復調は重複ウィンドウ（文脈 4 + 新規 8 フレーム、選局直後の 1 本だけ文脈 2 + 新規 4）× ワーカー 3 並列（ini `Workers`）。選局から TS まで約 5 秒、連続再生の安定まで約 10 秒（WinFrames=16 なら raw 経路の CPU は軽いが約 13 秒）。
   pluto-fw-isdbt v2 のファームなら同期・FFT・等化を FPGA が行い、ホストは約 0.3 コア（docs/architecture.md「FPGA 前段経路」）。
 - 実測: 2.5 分以上連続でフレーム欠落ゼロ、ワンセグ映像 PID は 75 秒ストリームで連続性ジャンプ 0。
