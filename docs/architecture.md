@@ -53,12 +53,12 @@ I/Q (任意 fs)
   アルゴリズムは ref/ と同一で、`tools/gen_rt_vectors.py` + `rt/tests/rt_test.cpp` が段ごとに
   一致を検証する（検証方針は docs/decisions.md 2026-10-10 の行を参照）。
 - Viterbi は AVX2（8 状態 × 8 ベクトル、枝メトリックは ±X±Y）+ 窓付きトレースバック。
-  復調全体で 2.1 s の I/Q を 2.0 s（1 コア、Release /arch:AVX2）。実時間比 ~1 倍なので、
-  ストリーミング化の際に前段（FFT〜デインターリーブ）と復号（Viterbi〜RS）を
-  スレッドでパイプライン化して余裕を作る（TODO）。
-- `rt/demod/isdbtd.exe` が docs/daemon-protocol.md v1 のデーモン。現状は --ts / --sigmf の
-  再生（demod_server.py と同機能）。実機ソース（libiio）と逐次復調は、長時間再追従
-  （sync の閉ループ化）と合わせて入れる。
+  復調全体で 2.1 s の I/Q を 2.0 s（1 コア、Release /arch:AVX2）。実時間比 ~1 倍だったため、
+  ライブ受信では重複ウィンドウをワーカースレッド（既定 3）で並列に復調して余裕を作っている
+  （下の「TVTest / EDCB 連携」「FPGA 前段経路」参照。raw 経路で約 2.7 コア、FPGA 前段で約 0.3 コア）。
+- `rt/demod/isdbtd.exe` が docs/daemon-protocol.md v2 のデーモン。--ts / --sigmf の再生（demod_server.py と
+  同機能）に加え、`--sdr` で実機（libiio）からのライブ受信と逐次復調（長時間再追従込み）を行う
+  （docs/hw-setup.md「SDR ライブ受信」）。
 - ビルドは `make rt`（rt/build.ps1 → vswhere で CMake/MSVC を探す）。出力は
   rt/build/rt-x64/Release/ の rt_test.exe / isdbtd.exe。
 

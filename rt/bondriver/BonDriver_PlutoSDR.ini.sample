@@ -39,8 +39,9 @@ Mode=3
 GI=1/8
 ; ウィンドウ並列復調のパラメータ（isdbtd --win-frames / --ctx-frames / --workers と同じ。地デジのみ）。
 ; WinFrames は 1 ウィンドウの新規フレーム数。小さいほど選局後の映像が早く安定する（8: 約 9 秒で安定、
-; CPU は約 1.5 コア、Workers=3 が必要）。CPU が足りずログに pace_starved / underruns が増える PC では
-; WinFrames=16 / Workers=2 に戻す（約 1.2 コア、安定まで約 13 秒）
+; raw I/Q 復調で CPU は約 1.5 コア、Workers=3 が必要）。CPU が足りずログに pace_starved / underruns が増える PC では
+; WinFrames=16 / Workers=2 に戻す（約 1.2 コア、安定まで約 13 秒）。pluto-fw-isdbt v2 の FPGA 前段では
+; 重なり分を復号し直さないので WinFrames による CPU の差は小さく、8 で約 0.3 コア
 WinFrames=8
 CtxFrames=4
 Workers=3
