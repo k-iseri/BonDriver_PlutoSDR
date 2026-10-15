@@ -171,7 +171,48 @@ void IsdbcDemod::Rotate(const cfloat* x, size_t n) {
     std::complex<double> rot = std::polar(1.0, nco_phase_);
     const std::complex<double> step = std::polar(1.0, dphi);
     double lacc = 0.0;
-    for (size_t i = 0; i < n; ++i) {
+    size_t i = 0;
+#ifdef __AVX2__
+    {
+        // 8 サンプル分の回転子 rot·step^k（k = 0..7）を float で作り、交互配置の複素乗算で回す。
+        // rot は 8 サンプルごとに double で進め、256 サンプルごとに正規化する
+        const std::complex<double> step8 = std::pow(step, 8);
+        alignas(32) float sk_re[8], sk_im[8];
+        {
+            std::complex<double> t = 1.0;
+            for (int k = 0; k < 8; ++k) { sk_re[k] = static_cast<float>(t.real()); sk_im[k] = static_cast<float>(t.imag()); t *= step; }
+        }
+        const __m256 skr = _mm256_load_ps(sk_re), ski = _mm256_load_ps(sk_im);
+        for (; i + 8 <= n; i += 8) {
+            const float rr = static_cast<float>(rot.real()), ri = static_cast<float>(rot.imag());
+            // c_k = rot·step^k
+            const __m256 cr = _mm256_fmsub_ps(_mm256_set1_ps(rr), skr, _mm256_mul_ps(_mm256_set1_ps(ri), ski));
+            const __m256 ci = _mm256_fmadd_ps(_mm256_set1_ps(rr), ski, _mm256_mul_ps(_mm256_set1_ps(ri), skr));
+            // 交互配置 [cr0 ci0 cr1 ci1 ...] に並べる（4 複素 × 2 レーン）
+            const __m256 c_lo = _mm256_unpacklo_ps(cr, ci);           // [cr0 ci0 cr1 ci1 | cr4 ci4 cr5 ci5]
+            const __m256 c_hi = _mm256_unpackhi_ps(cr, ci);           // [cr2 ci2 cr3 ci3 | cr6 ci6 cr7 ci7]
+            const __m256 c0 = _mm256_permute2f128_ps(c_lo, c_hi, 0x20);   // 複素 0..3
+            const __m256 c1 = _mm256_permute2f128_ps(c_lo, c_hi, 0x31);   // 複素 4..7
+            const float* xp = reinterpret_cast<const float*>(x + i);
+            float* op = reinterpret_cast<float*>(&x_[base + i]);
+            for (int h = 0; h < 2; ++h) {
+                const __m256 u = _mm256_loadu_ps(xp + 8 * h);
+                const __m256 c = h ? c1 : c0;
+                const __m256 c_re = _mm256_moveldup_ps(c);                 // [cr cr ...]
+                const __m256 c_im = _mm256_movehdup_ps(c);                 // [ci ci ...]
+                const __m256 u_sw = _mm256_permute_ps(u, 0xB1);            // [ui ur ...]
+                // (ur + j ui)(cr + j ci) = (ur cr − ui ci) + j (ui cr + ur ci)
+                _mm256_storeu_ps(op + 8 * h, _mm256_addsub_ps(_mm256_mul_ps(u, c_re), _mm256_mul_ps(u_sw, c_im)));
+            }
+            rot *= step8;
+            if ((i & 255) == 0) {
+                rot /= std::abs(rot);
+                lacc += std::norm(std::complex<double>(x[i].real(), x[i].imag()));
+            }
+        }
+    }
+#endif
+    for (; i < n; ++i) {
         const std::complex<double> v(x[i].real(), x[i].imag());
         x_[base + i] = static_cast<cfloat>(v * rot);
         rot *= step;
@@ -598,10 +639,44 @@ void IsdbcDemod::FinishPhaseBlock() {
     for (int it = 0; it < 2; ++it) {
         std::complex<double> acc = 0.0;
         const std::complex<float> r = static_cast<cfloat>(std::polar(1.0, -theta));
+#ifdef __AVX2__
+        // 最近傍点は正方格子（レベル ±1..±7）のスライスで求まる（C[DemapHard(v)] と同じ点）。
+        // 8 シンボル（交互配置 16 float）ずつ: v = u·r、s = slice(v)、acc += v·conj(s)
+        {
+            const __m256 rr = _mm256_set1_ps(r.real()), ri = _mm256_set1_ps(r.imag());
+            const __m256 half = _mm256_set1_ps(0.5f), one = _mm256_set1_ps(1.0f), two = _mm256_set1_ps(2.0f);
+            const __m256 lim = _mm256_set1_ps(7.0f), nlim = _mm256_set1_ps(-7.0f);
+            __m256 P = _mm256_setzero_ps(), Q = _mm256_setzero_ps();
+            const float* up = reinterpret_cast<const float*>(ublk_.data());
+            const size_t n2 = ublk_.size() / 8 * 8;
+            for (size_t k = 0; k < n2; k += 8) {
+                for (int h = 0; h < 2; ++h) {
+                    const __m256 u = _mm256_loadu_ps(up + 2 * k + 8 * h);
+                    const __m256 v = _mm256_addsub_ps(_mm256_mul_ps(u, rr), _mm256_mul_ps(_mm256_permute_ps(u, 0xB1), ri));
+                    __m256 sl = _mm256_fmadd_ps(_mm256_floor_ps(_mm256_mul_ps(v, half)), two, one);
+                    sl = _mm256_min_ps(_mm256_max_ps(sl, nlim), lim);
+                    P = _mm256_fmadd_ps(v, sl, P);                                    // [vr·sr, vi·si]
+                    Q = _mm256_fmadd_ps(_mm256_permute_ps(v, 0xB1), sl, Q);           // [vi·sr, vr·si]
+                }
+            }
+            alignas(32) float pa[8], qa[8];
+            _mm256_store_ps(pa, P);
+            _mm256_store_ps(qa, Q);
+            double re = 0.0, im = 0.0;
+            for (int k = 0; k < 8; k += 2) { re += pa[k] + pa[k + 1]; im += qa[k] - qa[k + 1]; }
+            for (size_t k = n2; k < ublk_.size(); ++k) {
+                const cfloat v = ublk_[k] * r;
+                const std::complex<double> t = std::complex<double>(v * std::conj(C[DemapHard(v)]));
+                re += t.real(); im += t.imag();
+            }
+            acc = std::complex<double>(re, im);
+        }
+#else
         for (const cfloat& u : ublk_) {
             const cfloat v = u * r;
             acc += std::complex<double>(v * std::conj(C[DemapHard(v)]));
         }
+#endif
         theta = Wrap(theta + std::arg(acc));
     }
     const double advance = Wrap(theta - theta_);
