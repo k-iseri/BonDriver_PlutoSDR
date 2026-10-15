@@ -80,9 +80,9 @@ int Scan(LiveSwitch* live, const std::vector<ScanTarget>& targets, double wait_s
     int found = 0;
     for (const ScanTarget& t : targets) {
         if (g_stop) break;
-        System sys;
-        int ch;
-        double freq;
+        System sys = System::kIsdbt;
+        int ch = 0;
+        double freq = 0.0;             // 初期化は MSVC の C4701（ParseChannel が失敗時に触らない）対策
         if (!ParseChannel(t.channel, t.hint, &sys, &ch, &freq)) continue;
         live->TuneSystem(sys, true, ch, freq);
         double sig = 0.0;
