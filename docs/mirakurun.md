@@ -6,8 +6,16 @@ Mirakurun にはドライバ API が無く、「選局して TS を標準出力�
 （`rt/demod/live_switch`）で地デジとケーブル TV の BS/CS 再送信（ISDB-C）を受ける。`isdbtd --stdout` でも
 同じことができるが、Mirakurun からは recpluto を使う。
 状態: 2026-10-15〜16 に MacBook Air（M5）+ Pluto で recpluto の録画・stdout（SIGTERM で終了）・走査と、Mirakurun
-4.1.5 からのストリーム取得まで確認。Windows と WSL（Ubuntu 22.04）は isdbtd の録音ファイル再生のみ確認。
-Raspberry Pi は未確認。
+4.1.5 からのストリーム取得・視聴・EPG 取得まで確認。Windows は BonDriver / TVTest（docs/setup-tvtest.md）で別途
+確認済み（Mirakurun は Windows 非対応）。WSL（Ubuntu 22.04）は isdbtd の録音ファイル再生のみ確認。Raspberry Pi は未確認。
+
+最短手順（それぞれの詳細は下の節）:
+1. libiio 1.x をソースからビルド → `make rt` → `make install-rt`（Linux は sudo、macOS は `PREFIX=/opt/homebrew`）
+2. Linux は udev ルール（`tools/mirakurun/99-plutosdr.rules`）、`iio_info -u usb:` で Pluto が見えることを確認
+3. `recpluto 27 10 test.ts` で TS が出ることを確認、`recpluto --scan gr:13-52` で受信できる局を調べる
+4. tuners.yml（`tools/mirakurun/tuners.yml.sample`）と channels.yml（`tools/mirakurun/channels.yml.sample`）を書く
+5. Mirakurun を起動して `curl http://127.0.0.1:40772/api/channels/GR/27/stream?decode=0 | head -c 1000000 > /dev/null`
+   などでストリームが取れることを確認。EPG は起動後に自動で集まる
 
 ## 準備
 
