@@ -6,7 +6,11 @@
 - name: NHK総合
   type: GR
   channel: '27'          # UHF 物理チャンネル
+  commandVars: { tsmf: 0 }   # 地デジでは使わない（command に <tsmf> を書くなら 0 = 自動を付けておく）
+# CATV の 1 周波数には複数の TS が多重（TSMF）されていることがある。TS ごとに 1 項目書き、tuners.yml の
+# command を `recpluto --tsmf <tsmf> <channel> - -` にして相対 TS 番号（1〜15、0 = 自動）を渡す。
+# 乗っている TS（rel / tsid / onid: 4 = BS、6・7 = CS110）は `recpluto C56 25 /dev/null` の status で分かる。
 - name: NHK BS
   type: BS
   channel: 'C56'         # ケーブル TV の物理チャンネル（C13〜C63）。BS/CS 再送信（ISDB-C トラモジ）
-  serviceId: 101
+  commandVars: { tsmf: 1 }

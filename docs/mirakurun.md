@@ -91,10 +91,56 @@ Pluto は 1 台で 1 チャンネルなので、地デジと CATV を同じ 1 �
 v2.0.2 で修正）ので、その場合は command に `--fpga-eq 0`（raw 経路で復調）を足す。
 CPU は Apple M5（NEON、2026-10-15）で FPGA 前段約 0.2 コア、raw 経路（`--fpga-eq 0`）約 0.5 コア（top で実測。recpluto も同じ）。
 
-CATV は 1 周波数に複数 TS が多重（TSMF）されている局がある。isdbtd は既定で最小番号の TS を選んで
-188 バイト TS にして出す。Mirakurun 側の `tsmfRelTs`（1〜15）で選ばせたい場合は command に
-`--tsmf all` を足して全スロットを通す（どちらか一方で選ぶ）。VHF 1〜12ch は AD9363 の LO 範囲外で
-受信できない。
+## CATV（ケーブルの BS/CS 再送信、ISDB-C）を見る
+
+地デジと同じ recpluto で、チャンネルを `C` 付き（物理チャンネル C13〜C63）で書くと ISDB-C として受ける。
+recpluto の CATV 経路は isdbtd `--system isdbc` / BonDriver_PlutoSDR_TC.dll と同じパイプラインだが、
+Mirakurun 経由での実放送の確認はまだ（2026-10-16 時点。ケーブル端子のある環境で確認したら更新する）。
+
+1. **配線とゲイン**: Pluto の RX をケーブル TV の宅内端子につなぐ。ゲインは既定のソフト AGC（帯域内 −24 dBFS）
+   のまま。ケーブルは全チャンネルが強く、`--gain hw`（AD936x の AGC）ではフロントエンドが圧縮して MER が
+   20 dB に張り付く（docs/hw-setup.md）。受信できるのは C23（225 MHz）以上。C13〜C22（111〜165 MHz）は
+   AD9363 の LO 範囲より下で未確認。
+2. **受信できるチャンネルを探す**: `recpluto --scan catv:C23-C63`。ロックしたチャンネルが channels.yml の形で出る
+   （1 チャンネル約 5〜8 秒）。
+3. **何の TS が乗っているか調べる**: CATV は 1 周波数に複数の TS が多重（TSMF）されている。`--quiet` 無しで
+   数十秒受けると 10 秒ごとの status（JSON）の `streams` に `rel`（相対 TS 番号 1〜15）・`tsid`・`onid` が並ぶ:
+   ```
+   recpluto C56 25 /dev/null
+   ```
+   onid 4 が BS、6 と 7 が CS110。これで channels.yml の type（BS / CS）と選ぶ TS が決まる。
+4. **tuners.yml**: types に BS / CS を足し、TS の選択を channels.yml から渡す。BS/CS はスクランブルされているので
+   decoder が要る（スクランブル解除は本リポジトリの範囲外）:
+   ```yaml
+   - name: PlutoSDR
+     types: [GR, BS, CS]
+     command: recpluto --tsmf <tsmf> <channel> - -
+     decoder: arib-b25-stream-test
+     isDisabled: false
+   ```
+5. **channels.yml**: TS ごとに 1 項目。地デジにも `tsmf: 0`（自動 = 最小番号の TS）を付けておく。serviceId は
+   書かなくてよく、Mirakurun が起動時にそのチャンネルを選局してサービスを拾う:
+   ```yaml
+   - name: NHK総合
+     type: GR
+     channel: '27'
+     commandVars: { tsmf: 0 }
+   - name: BS (C56 TS1)
+     type: BS
+     channel: 'C56'
+     commandVars: { tsmf: 1 }
+   - name: CS (C58 TS2)
+     type: CS
+     channel: 'C58'
+     commandVars: { tsmf: 2 }
+   ```
+   別の書き方として、command を `recpluto --tsmf all <channel> - -` にして全スロット（TSMF ヘッダ含む）を通し、
+   channels.yml の `tsmfRelTs: 1` で Mirakurun に選ばせることもできる。どちらか一方にする。
+6. **確認**: Mirakurun を再起動し、サービス走査が終わったら
+   `curl -s "http://127.0.0.1:40772/api/channels/BS/C56/stream?decode=1" | head -c 5000000 > test.ts`
+   で TS が取れればよい。あとは EPGStation などから普通に選べる。
+
+VHF 1〜12ch（地デジ以前の帯域）は AD9363 の LO 範囲外で受信できない。
 
 ## Mirakurun 本体を動かす（Docker / PM2 無し。macOS / Linux / Raspberry Pi）
 
