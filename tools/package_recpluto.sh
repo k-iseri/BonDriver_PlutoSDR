@@ -18,15 +18,15 @@ cp "$REPO/docs/mirakurun.md" "$STAGE/"
 
 OS=$(uname -s)
 if [ "$OS" = Darwin ]; then
-  # libiio の dylib と、それが依存する Homebrew の libusb を同梱し、参照を相対にする
+  # libiio の dylib と、それが依存する Homebrew のライブラリ（libusb、libzstd）を同梱し、参照を相対にする
   LIBIIO=$(ls "$PREFIX"/lib/libiio.*.dylib | grep -v '\.1\.dylib$' | head -1)   # libiio.1.0.0.dylib
   cp "$LIBIIO" "$STAGE/lib/libiio.1.dylib"
-  LIBUSB=$(otool -L "$STAGE/lib/libiio.1.dylib" | awk '/libusb-1.0/ {print $1}' | head -1)
-  if [ -n "$LIBUSB" ]; then
-    cp "$(readlink -f "$LIBUSB")" "$STAGE/lib/libusb-1.0.0.dylib"
-    install_name_tool -id @rpath/libusb-1.0.0.dylib "$STAGE/lib/libusb-1.0.0.dylib"
-    install_name_tool -change "$LIBUSB" @loader_path/libusb-1.0.0.dylib "$STAGE/lib/libiio.1.dylib"
-  fi
+  for dep in $(otool -L "$STAGE/lib/libiio.1.dylib" | awk 'NR > 1 {print $1}' | grep -E '^/(opt/homebrew|usr/local)/'); do
+    base=$(basename "$dep")
+    cp "$(readlink -f "$dep")" "$STAGE/lib/$base"
+    install_name_tool -id "@rpath/$base" "$STAGE/lib/$base"
+    install_name_tool -change "$dep" "@loader_path/$base" "$STAGE/lib/libiio.1.dylib"
+  done
   install_name_tool -id @rpath/libiio.1.dylib "$STAGE/lib/libiio.1.dylib"
   for f in "$STAGE"/lib/*.dylib "$STAGE/recpluto" "$STAGE/isdbtd"; do codesign -f -s - "$f"; done
   otool -L "$STAGE/recpluto" | sed 's/^/  /'
@@ -49,12 +49,12 @@ isdbtd は同じ復調器の TCP デーモン版（録音ファイルの再生�
   tuners.yml: command: "recpluto --type=<type> --tsid=<tsid> <channel> - -"（mirakurun/ の雛形）
 
 必要なもの:
-  - Linux: libusb-1.0-0 と libxml2（通常は入っている）。Pluto の USB を一般ユーザーに許可するには
+  - Linux: libusb-1.0-0、libxml2、libzstd1（通常は入っている）。Pluto の USB を一般ユーザーに許可するには
     mirakurun/99-plutosdr.rules を /etc/udev/rules.d/ にコピーして udevadm control --reload
   - macOS: 初回は "xattr -d com.apple.quarantine recpluto isdbtd lib/*.dylib" で隔離属性を外す
     （署名・公証していないため）
   - lib/ の libiio（LGPL-2.1+、https://github.com/analogdevicesinc/libiio）は共有ライブラリとして同梱。
-    macOS は libusb（LGPL-2.1+、https://libusb.info）も同梱。差し替え可能。
+    macOS は libusb（LGPL-2.1+、https://libusb.info）と zstd（BSD-3-Clause）も同梱。差し替え可能。
   - recpluto / isdbtd 本体は MIT（LICENSE）。ソース: https://github.com/k-iseri/BonDriver_PlutoSDR
 EOF
 

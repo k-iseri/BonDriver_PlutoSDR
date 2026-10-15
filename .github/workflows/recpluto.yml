@@ -42,19 +42,19 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build pkg-config libusb-1.0-0-dev libxml2-dev
+          sudo apt-get install -y cmake ninja-build pkg-config libusb-1.0-0-dev libxml2-dev libzstd-dev
 
       - name: Install build dependencies (macOS)
         if: runner.os == 'macOS'
-        run: brew install cmake ninja pkgconf libusb
+        run: brew install cmake ninja pkgconf libusb zstd
 
-      - name: Build libiio 1.x (shared, USB + network backends only)
+      - name: Build libiio 1.x (shared, USB + network backends; zstd は必須)
         run: |
           git clone --depth 1 https://github.com/analogdevicesinc/libiio.git libiio-src
           cmake -S libiio-src -B libiio-build -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX="$PWD/iio-prefix" -DCMAKE_INSTALL_LIBDIR=lib \
             -DOSX_FRAMEWORK=OFF -DWITH_USB_BACKEND=ON -DWITH_NETWORK_BACKEND=ON -DWITH_XML_BACKEND=ON \
-            -DWITH_SERIAL_BACKEND=OFF -DWITH_ZSTD=OFF -DWITH_IIOD=OFF -DWITH_UTILS=OFF -DWITH_EXAMPLES=OFF \
+            -DWITH_SERIAL_BACKEND=OFF -DWITH_ZSTD=ON -DWITH_IIOD=OFF -DWITH_UTILS=OFF -DWITH_EXAMPLES=OFF \
             -DWITH_TESTS=OFF -DHAVE_DNS_SD=OFF -DWITH_LOCAL_BACKEND=OFF -DWITH_HWMON=OFF -DWITH_LIBTINYIIOD=OFF
           cmake --build libiio-build
           cmake --install libiio-build
