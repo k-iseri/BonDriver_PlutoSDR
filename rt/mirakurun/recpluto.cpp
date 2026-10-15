@@ -20,8 +20,12 @@
 
 #include "../demod/live_switch.h"
 #include "../isdbc/params.h"
+#include "channel_spec.h"
 
 using namespace isdbt;
+using isdbt::mirakurun::ChannelLabel;
+using isdbt::mirakurun::ParseChannel;
+using isdbt::mirakurun::ScanTargets;
 
 namespace {
 
@@ -47,63 +51,6 @@ void Usage() {
         "  --scan-wait F       --scan で 1 チャンネルを待つ秒数 (default 8)\n"
         "  --quiet             10 秒ごとの status（JSON）を stderr に出さない\n"
         "  recpt1 互換で受け付けて無視: --b25 --strip --EMM --round N --sid S --udp --addr H --port P --http P --lnb V\n");
-}
-
-// "27" / "27ch" → 地デジ物理 ch、"C56" / "C56ch" → CATV 通し番号（isdbc::CatvChannel の index）
-bool ParseChannel(std::string s, System* sys, int* ch, double* freq) {
-    if (s.size() > 2 && (s.compare(s.size() - 2, 2, "ch") == 0 || s.compare(s.size() - 2, 2, "CH") == 0)) s.resize(s.size() - 2);
-    if (s.empty()) return false;
-    if (s[0] == 'C' || s[0] == 'c') {
-        const int n = std::atoi(s.c_str() + 1);
-        int index;
-        if (n >= 13 && n <= 22) index = 62 + (n - 13);
-        else if (n >= 23 && n <= 63) index = 72 + (n - 23);
-        else return false;
-        *sys = System::kIsdbc;
-        *ch = index;
-        return isdbc::CatvChannel(index, freq, nullptr);
-    }
-    for (char c : s) if (c < '0' || c > '9') return false;
-    const int n = std::atoi(s.c_str());
-    if (n < 13 || n > 62) return false;
-    *sys = System::kIsdbt;
-    *ch = n;
-    *freq = ChannelToHz(n);
-    return true;
-}
-
-std::string ChannelLabel(System sys, int ch) {
-    if (sys == System::kIsdbt) return std::to_string(ch);
-    std::string name;
-    isdbc::CatvChannel(ch, nullptr, &name);        // "C56ch"
-    if (name.size() > 2) name.resize(name.size() - 2);
-    return name;
-}
-
-// --scan の対象を channel 文字列の列にする。"gr" = 13..62、"catv" = C13..C63、"gr:24-27" / "catv:C13-C22" で範囲
-bool ScanTargets(const std::string& spec, std::vector<std::string>* out) {
-    std::string kind = spec, range;
-    const size_t colon = spec.find(':');
-    if (colon != std::string::npos) { kind = spec.substr(0, colon); range = spec.substr(colon + 1); }
-    auto add = [&](bool catv) {
-        int lo = catv ? 13 : 13, hi = catv ? 63 : 62;
-        if (!range.empty()) {
-            const size_t dash = range.find('-');
-            if (dash == std::string::npos) return false;
-            std::string a = range.substr(0, dash), b = range.substr(dash + 1);
-            if (!a.empty() && (a[0] == 'C' || a[0] == 'c')) a.erase(0, 1);
-            if (!b.empty() && (b[0] == 'C' || b[0] == 'c')) b.erase(0, 1);
-            lo = std::atoi(a.c_str());
-            hi = std::atoi(b.c_str());
-            if (lo <= 0 || hi < lo) return false;
-        }
-        for (int n = lo; n <= hi; ++n) out->push_back((catv ? "C" : "") + std::to_string(n));
-        return true;
-    };
-    if (kind == "gr") return add(false);
-    if (kind == "catv") return add(true);
-    if (kind == "all" || kind.empty()) return add(false) && (range.clear(), add(true));
-    return false;
 }
 
 // 選局してロックを待つ。戻り値: ロックしたか。signal_db に最後のレベル（MER / C/N）

@@ -26,6 +26,7 @@
 #include "../isdbt/pilots.h"
 #include "../isdbt/sync.h"
 #include "../isdbt/tmcc.h"
+#include "../mirakurun/channel_spec.h"
 
 using namespace isdbt;
 
@@ -131,6 +132,32 @@ void TestViterbi() {
     size_t nerr = 0;
     for (size_t i = head; i + tail < n; ++i) nerr += bits[i] != want.as<uint8_t>()[i];
     Report(nerr == 0, "viterbi_decode", std::to_string(nerr) + " bit errors");
+}
+
+// recpluto のチャンネル表記（地デジ物理 ch / CATV C 付き）と --scan の範囲指定
+void TestRecplutoChannels() {
+    using namespace isdbt::mirakurun;
+    System sys;
+    int ch = 0;
+    double freq = 0.0;
+    bool ok = ParseChannel("27", &sys, &ch, &freq) && sys == System::kIsdbt && ch == 27 && std::fabs(freq - 557'142'857.0) < 1.0;
+    ok = ok && ParseChannel("13ch", &sys, &ch, &freq) && ch == 13;
+    ok = ok && ParseChannel("C56", &sys, &ch, &freq) && sys == System::kIsdbc && ch == 72 + (56 - 23) && std::fabs(freq - 423e6) < 1.0;
+    ok = ok && ParseChannel("c13ch", &sys, &ch, &freq) && ch == 62 && std::fabs(freq - 111e6) < 1.0;
+    ok = ok && ChannelLabel(System::kIsdbc, 72 + (56 - 23)) == "C56" && ChannelLabel(System::kIsdbt, 27) == "27";
+    for (const char* bad : {"12", "63", "C12", "C64", "BS01_0", "", "2x", "C"}) ok = ok && !ParseChannel(bad, &sys, &ch, &freq);
+    Report(ok, "recpluto_channel_spec");
+    std::vector<std::string> t;
+    ok = ScanTargets("gr", &t) && t.size() == 50 && t.front() == "13" && t.back() == "62";
+    t.clear();
+    ok = ok && ScanTargets("catv:C13-C22", &t) && t.size() == 10 && t.front() == "C13" && t.back() == "C22";
+    t.clear();
+    ok = ok && ScanTargets("all", &t) && t.size() == 50 + 51;
+    t.clear();
+    ok = ok && ScanTargets("gr:24-27", &t) && t.size() == 4 && t[0] == "24";
+    t.clear();
+    ok = ok && !ScanTargets("bs", &t) && !ScanTargets("gr:27-24", &t) && !ScanTargets("all:1-2", &t);
+    Report(ok, "recpluto_scan_targets");
 }
 
 // 8bit 量子化ビタビ（ライブ経路、AVX2 / NEON）: 同じ軟値列を ViterbiDecodeSoft（量子化込み）と
@@ -685,6 +712,7 @@ int main(int argc, char** argv) {
         TestRs();
         TestViterbi();
         TestViterbiQ();
+        TestRecplutoChannels();
         TestByteDeinterleave();
         TestFft();
         TestFracResample();

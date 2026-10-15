@@ -88,12 +88,15 @@ CATV は 1 周波数に複数 TS が多重（TSMF）されている局がある�
 `--tsmf all` を足して全スロットを通す（どちらか一方で選ぶ）。VHF 1〜12ch は AD9363 の LO 範囲外で
 受信できない。
 
-## macOS で Mirakurun 本体を動かす（Docker / PM2 無し）
+## Mirakurun 本体を動かす（Docker / PM2 無し。macOS / Linux / Raspberry Pi）
 
-Mirakurun 4.x は CLI と PM2 連携を廃止し Linux では Docker を推奨しているが、Docker Desktop の
-コンテナからは USB の Pluto に届かない。macOS では Node 22 / 24 で `lib/server.js` を直接起動し、
-設定と DB の場所を環境変数で指定する（既定は `/usr/local/etc/mirakurun` と `/usr/local/var/db/mirakurun`
-で root が要る）。グローバルインストールでなければ postinstall は何もしない:
+Mirakurun 4.x は CLI と PM2 連携を廃止し Linux では Docker を推奨しているが、公式コンテナには recpluto も
+libiio も無く、macOS の Docker Desktop からは USB の Pluto に届かない。そこで Node 22 / 24 で `lib/server.js`
+を直接起動し、設定と DB の場所を環境変数で指定する（既定は `/usr/local/etc/mirakurun` と
+`/usr/local/var/db/mirakurun` で root が要る）。以下は macOS で確認した手順で、Linux / Raspberry Pi も同じ
+（常駐は `tools/mirakurun/mirakurun.service.sample`、macOS のログイン時起動は
+`tools/mirakurun/com.mirakurun.server.plist.sample`。どちらも雛形で未検証）。
+グローバルインストールでなければ postinstall は何もしない:
 ```
 mkdir -p ~/mirakurun && cd ~/mirakurun && npm init -y && npm install mirakurun
 mkdir -p config data/logo-data run log     # config/{server,tuners,channels}.yml を置く

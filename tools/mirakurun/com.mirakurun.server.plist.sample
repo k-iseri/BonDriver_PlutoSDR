@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- macOS でログイン時に Mirakurun を起動する launchd エージェントの雛形（未検証）。
+     ~/Library/LaunchAgents/com.mirakurun.server.plist に置き、USERNAME を自分のユーザー名に、
+     ProgramArguments を自分の start.sh（docs/mirakurun.md）に合わせて
+     `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.mirakurun.server.plist`。
+     止めるのは `launchctl bootout gui/$(id -u)/com.mirakurun.server`。 -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.mirakurun.server</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/USERNAME/mirakurun/start.sh</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/Users/USERNAME/mirakurun/log/launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/USERNAME/mirakurun/log/launchd.err</string>
+</dict>
+</plist>
