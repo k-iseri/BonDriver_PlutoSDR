@@ -259,7 +259,7 @@ int NullInterferedCarriersFast(const Mat<cfloat>& D, Mat<float>* csi, Mode mode,
 void DeinterleaveEqualized(const Mat<cfloat>& D, const Mat<float>& csi_in, Mode mode, int frame_start,
                            const std::vector<RxLayer>& layers,
                            const std::vector<std::vector<int>>& groups,
-                           Mat<cfloat>* Xt, Mat<float>* Wt, bool fast_null) {
+                           Mat<cfloat>* Xt, Mat<float>* Wt, bool fast_null, size_t out_row0) {
     static const bool profile = std::getenv("ISDBT_PROFILE") != nullptr;
     auto pnow = [] { return std::chrono::steady_clock::now(); };
     const auto q0 = pnow();
@@ -271,9 +271,27 @@ void DeinterleaveEqualized(const Mat<cfloat>& D, const Mat<float>& csi_in, Mode 
     }
     const auto q1 = pnow();
 
+    const auto q2 = pnow();
+    if (fast_null) {
+        // 論理変換 + セグメント間を 1 回の gather で、時間デインターリーブは必要な出力行だけ
+        int I_seg2[kNSegments] = {};
+        for (const RxLayer& lyr : layers) {
+            for (int s : lyr.segments) I_seg2[s] = lyr.I;
+        }
+        Mat<cfloat> Yl2 = DataToLogicalDeint(D, mode, frame_start, groups);
+        Mat<float> Wl2 = DataToLogicalDeint(csi, mode, frame_start, groups);
+        const auto q3b = pnow();
+        *Xt = TimeDeinterleaveFrom(Yl2, mode, I_seg2, out_row0);
+        *Wt = TimeDeinterleaveFrom(Wl2, mode, I_seg2, out_row0);
+        if (profile && D.rows > 1000) {
+            auto sec = [](auto a, auto b) { return std::chrono::duration<double>(b - a).count(); };
+            std::fprintf(stderr, "[profile] deint %zu rows: null %.3f logical+interseg %.3f time(from %zu) %.3f\n",
+                         D.rows, sec(q0, q1), sec(q2, q3b), out_row0, sec(q3b, pnow()));
+        }
+        return;
+    }
     Mat<cfloat> Yl = DataToLogical(D, mode, frame_start);
     Mat<float> Wl = DataToLogical(csi, mode, frame_start);
-    const auto q2 = pnow();
     int I_seg[kNSegments] = {};
     for (const RxLayer& lyr : layers) {
         for (int s : lyr.segments) I_seg[s] = lyr.I;
@@ -531,7 +549,9 @@ void DecodeRange(const Mat<cfloat>& D, const Mat<float>& csi_full, Mode mode, in
     Mat<cfloat> Xt;
     Mat<float> Wt;
     const auto tfe0 = std::chrono::steady_clock::now();
-    DeinterleaveEqualized(Y, csi, mode, f0 - s0, fsi.layers, fsi.groups, &Xt, &Wt, true);
+    // 時間デインターリーブの出力は FEC が読む行（先頭助走の少し前）から
+    const size_t out_row0 = static_cast<size_t>(std::max(0, (f0 - s0) + F0 * kSymbolsPerFrame - kFecHeadSymbols - 8));
+    DeinterleaveEqualized(Y, csi, mode, f0 - s0, fsi.layers, fsi.groups, &Xt, &Wt, true, out_row0);
     const double t_fe = std::chrono::duration<double>(std::chrono::steady_clock::now() - tfe0).count();
 
     const bool profile = std::getenv("ISDBT_PROFILE") != nullptr;

@@ -62,6 +62,62 @@ Mat<T> DataToLogical(const Mat<T>& D, Mode mode, int frame_start) {
 }
 
 template <typename T>
+Mat<T> DataToLogicalDeint(const Mat<T>& D, Mode mode, int frame_start, const std::vector<std::vector<int>>& groups) {
+    const GatherTable& gt = GatherOf(mode);
+    const int dc = LayoutOf(mode).dc;
+    const size_t n_cols = gt.idx[0].size();
+    // セグメント間デインターリーブの列並べ替え（行に依らない）: out[group[k]*dc + c'] = in[group[q % n]*dc + q / n]（q = k*dc + c'）
+    std::vector<int> colperm(n_cols);
+    for (size_t j = 0; j < n_cols; ++j) colperm[j] = static_cast<int>(j);
+    for (const auto& group : groups) {
+        const int n = static_cast<int>(group.size());
+        if (n < 2) continue;
+        for (int k = 0; k < n; ++k) {
+            for (int c = 0; c < dc; ++c) {
+                const int q = k * dc + c;
+                colperm[static_cast<size_t>(group[k]) * dc + c] = group[q % n] * dc + q / n;
+            }
+        }
+    }
+    std::vector<int> idx2[kSpSymbolPeriod];
+    for (int p = 0; p < kSpSymbolPeriod; ++p) {
+        idx2[p].resize(n_cols);
+        for (size_t j = 0; j < n_cols; ++j) idx2[p][j] = gt.idx[p][static_cast<size_t>(colperm[j])];
+    }
+    Mat<T> out(D.rows, n_cols);
+    for (size_t n = 0; n < D.rows; ++n) {
+        int p = (static_cast<int>(n) - frame_start) % kSpSymbolPeriod;
+        if (p < 0) p += kSpSymbolPeriod;
+        const int* idx = idx2[p].data();
+        const T* src = D[n];
+        T* dst = out[n];
+        for (size_t j = 0; j < n_cols; ++j) dst[j] = src[idx[j]];
+    }
+    return out;
+}
+
+template <typename T>
+Mat<T> TimeDeinterleaveFrom(const Mat<T>& Y, Mode mode, const int I_per_segment[kNSegments], size_t row0) {
+    const int dc = LayoutOf(mode).dc;
+    Mat<T> out(Y.rows, Y.cols);
+    std::vector<int> delay(dc);
+    for (int s = 0; s < kNSegments; ++s) {
+        const int I = I_per_segment[s];
+        for (int c = 0; c < dc; ++c) {
+            delay[c] = I * (kTimeInterleaveMod - 1 - (kTimeInterleaveMult * c) % kTimeInterleaveMod);
+        }
+        for (size_t n = row0; n < Y.rows; ++n) {
+            T* dst = out[n] + static_cast<size_t>(s) * dc;
+            for (int c = 0; c < dc; ++c) {
+                const long src = static_cast<long>(n) - delay[c];
+                dst[c] = (src >= 0) ? Y[static_cast<size_t>(src)][static_cast<size_t>(s) * dc + c] : T{};
+            }
+        }
+    }
+    return out;
+}
+
+template <typename T>
 Mat<T> TimeDeinterleave(const Mat<T>& Y, Mode mode, const int I_per_segment[kNSegments]) {
     const int dc = LayoutOf(mode).dc;
     Mat<T> out(Y.rows, Y.cols);
@@ -234,6 +290,10 @@ template Mat<cfloat> DataToLogical<cfloat>(const Mat<cfloat>&, Mode, int);
 template Mat<float> DataToLogical<float>(const Mat<float>&, Mode, int);
 template Mat<cfloat> TimeDeinterleave<cfloat>(const Mat<cfloat>&, Mode, const int[kNSegments]);
 template Mat<float> TimeDeinterleave<float>(const Mat<float>&, Mode, const int[kNSegments]);
+template Mat<cfloat> TimeDeinterleaveFrom<cfloat>(const Mat<cfloat>&, Mode, const int[kNSegments], size_t);
+template Mat<float> TimeDeinterleaveFrom<float>(const Mat<float>&, Mode, const int[kNSegments], size_t);
+template Mat<cfloat> DataToLogicalDeint<cfloat>(const Mat<cfloat>&, Mode, int, const std::vector<std::vector<int>>&);
+template Mat<float> DataToLogicalDeint<float>(const Mat<float>&, Mode, int, const std::vector<std::vector<int>>&);
 template void IntersegmentDeinterleave<cfloat>(Mat<cfloat>*, Mode, const std::vector<std::vector<int>>&);
 template void IntersegmentDeinterleave<float>(Mat<float>*, Mode, const std::vector<std::vector<int>>&);
 

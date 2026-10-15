@@ -17,6 +17,12 @@ Mat<T> DataToLogical(const Mat<T>& D, Mode mode, int frame_start);
 // 時間デインターリーブ: out[n][s*dc+c] = in[n − I_s·(95 − m_c)][s*dc+c]。参照先が無い先頭は 0。
 template <typename T>
 Mat<T> TimeDeinterleave(const Mat<T>& Y, Mode mode, const int I_per_segment[kNSegments]);
+// 同上、出力行 [row0, rows) だけ計算する（それより前は 0 のまま。ライブの範囲復号用）
+template <typename T>
+Mat<T> TimeDeinterleaveFrom(const Mat<T>& Y, Mode mode, const int I_per_segment[kNSegments], size_t row0);
+// DataToLogical + IntersegmentDeinterleave を 1 回の gather で（列の並べ替えを合成した表を使う）
+template <typename T>
+Mat<T> DataToLogicalDeint(const Mat<T>& D, Mode mode, int frame_start, const std::vector<std::vector<int>>& groups);
 
 // セグメント間デインターリーブ（図 3-26 の逆）。groups は 2 セグメント以上のグループのみ。
 template <typename T>

@@ -81,7 +81,7 @@ void EqualizeAndDeinterleave(const Mat<cfloat>& Y, Mode mode, int frame_start,
 void DeinterleaveEqualized(const Mat<cfloat>& D, const Mat<float>& csi, Mode mode, int frame_start,
                            const std::vector<RxLayer>& layers,
                            const std::vector<std::vector<int>>& groups,
-                           Mat<cfloat>* Xt, Mat<float>* Wt, bool fast_null = false);
+                           Mat<cfloat>* Xt, Mat<float>* Wt, bool fast_null = false, size_t out_row0 = 0);
 
 // 行列をそのまま返す ISymbolSource（等化済みキャリア行列のフレーム同期・復号用）
 class MatSource : public ISymbolSource {
