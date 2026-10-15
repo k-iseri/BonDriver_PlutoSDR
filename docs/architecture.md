@@ -84,16 +84,13 @@ Pluto SDR Nano（XC7Z010）: ADC → GI 相関同期 → CFO 回転 → FFT 8192
 - CPU（isdbtd、ch 24）: raw ホスト復調 2.7 コア → 前段あり 1.04 → 範囲復号 0.72 → ビタビ 8bit 0.58 → RS SIMD 0.51
   → 量子化 1 パス 0.43 → 干渉検出 1 パス 0.38 → 32bit 詰め 0.30 コア。残りはビタビ 0.19・デマップ 0.12・
   デインターリーブ 0.06 s / 1.8 s。`ISDBT_PROFILE=1` で段ごとの時間、`ISDBT_VITERBI_CHECK=1` で float 版ビタビとの突き合わせ。
-- **既知の問題**: 帯域内 −24 dBFS（ソフト AGC 既定）では raw 経路より MER が約 8 dB 悪く、−18 dBFS でも 3〜5 dB
-  悪い（docs/hw-setup.md「受信ゲイン」）。入力スケーリングかビット幅の固定小数点雑音と見ており、直るまでは
-  `--fpga-eq 0` か `--agc-target -18`。再現は `isdbtd --sdr usb: --ch 27 --stdout --fpga-eq 1 --gain 24`
-  と `--gain 30`（stderr の window 行の A/B MER）を `--fpga-eq 0` の同条件と比べる。切り分けの当たり:
-  (1) 同期 FFT 出力は 12bit（±2048、`fe_eq_model.py --dump` の形式）で、D = Y/H は逆数を正規化してから
-  表引きするので出力スケールは入力レベルに依らないが、Y と H 自身の 12bit 量子化は小さい入力で相対的に
-  大きくなる → FFT 出力のブロック浮動小数点か、FFT 前のディジタルゲイン（PAPR の余裕込み）で救える見込み。
-  (2) `fe_carrier_demod.py --dump` でゲイン 24 / 30 の同期 FFT ビンを取り、`fe_eq_model.py` に通して
-  モデルでも同じ落差が出るか見る。出なければ等化器内部（H 履歴 BRAM・乗算器の幅、|H|² が小さいときの
-  recip_lut 入力）が原因。
+- **弱い入力で FPGA 経路が raw より落ちていた問題（ファーム v2.0.1 以前）**: 原因はファームの GI 相関器の移動和に
+  残る固定オフセット（リセット直後の N 個の積を引き算が取り除かない）で、信号が弱いほど相関位相 = CFO 推定が傾き、
+  FFT 前に補正されない残留 CFO が ICI になっていた（27ch ゲイン 24 dB: 推定 +83 Hz / 真値 +42 Hz → ICI 床 23 dB）。
+  切り分けは `fe_carrier_demod.py --gain` でモード 3 のビンを取り、ホスト等化・`fe_eq_model.py --fixed`・モード 4 の
+  MER が一致（= 等化器は白）、NCO の小数 CFO（ヘッダ w6）とホストで測る残留の和が一定（= 同期の推定が偏る）で
+  確定した。FFT 出力は BFP でビンの大きさはレベルに依らない（量子化ではなかった）。詳細は pluto-fw-isdbt
+  docs/design-v2.md 3g。v2.0.2 で修正。
 - 7010 で残る選択肢（デマップの FPGA 化、TMCC 復号）は数 % の効果。後段（ビタビ・RS）の FPGA 化は時間デインターリーブ
   （6.4 MB）が BRAM に入らず 7020 向け（pluto-fw-isdbt docs/design-v2.md）。
 - 検証ツール: `tools/fe_fft_test.py`（FFT テストモードのループバック）、`fe_sync_test.py`（同期モード）、

@@ -51,7 +51,7 @@ Pluto は 1 台で 1 チャンネルなので、地デジと CATV を同じ 1 �
 # tuners.yml
 - name: PlutoSDR
   types: [GR, BS, CS]
-  command: "isdbtd --sdr usb: --system <system> --fpga-eq 0 --ch <channel> --stdout --quiet"   # "usb:" を含むので引用符必須
+  command: "isdbtd --sdr usb: --system <system> --ch <channel> --stdout --quiet"   # "usb:" を含むので引用符必須
   decoder: arib-b25-stream-test     # スクランブル解除は本リポジトリの範囲外。要らなければ省略
   isDisabled: false
 ```
@@ -68,9 +68,9 @@ Pluto は 1 台で 1 チャンネルなので、地デジと CATV を同じ 1 �
   commandVars: { system: isdbc }
 ```
 
-`--fpga-eq 0` は FPGA 前段（pluto-fw-isdbt v2）を使わず raw 経路で復調する指定。前段はソフト AGC 既定の
-−24 dBFS で MER が約 8 dB 落ちて 64QAM が全滅するため（docs/hw-setup.md「受信ゲイン」）、直るまで付けておく。
-CPU は Apple M5 で約 1.8 コア（前段ありなら約 1 コア）。
+ファーム pluto-fw-isdbt v2.0.1 以前では弱い入力で FPGA 前段の MER が raw より落ちる（相関器のオフセット。
+v2.0.2 で修正）ので、その場合は command に `--fpga-eq 0`（raw 経路で復調）を足す。
+CPU は Apple M5 で raw 約 1.8 コア、FPGA 前段で約 1 コア。
 
 CATV は 1 周波数に複数 TS が多重（TSMF）されている局がある。isdbtd は既定で最小番号の TS を選んで
 188 バイト TS にして出す。Mirakurun 側の `tsmfRelTs`（1〜15）で選ばせたい場合は command に
@@ -108,6 +108,5 @@ server.yml の `path`（UNIX ソケット）は `/var/run` ではなく書ける
 - CPU: x86-64 は AVX2 版（地デジ raw 約 2.7 コア、FPGA 前段で約 0.3 コア、CATV 約 0.35 コア）。
   arm64 はスカラー版で、Apple M5 では地デジ raw 約 1.8 コア、FPGA 前段で約 1 コア。Raspberry Pi 4/5 で
   実時間に足りるかは未測定で、足りなければビタビ・RS の NEON 化（SIMDe で AVX2 版を変換）が次の手。
-- FPGA 前段（pluto-fw-isdbt v2）は libiio 経由のレジスタアクセスなので OS を問わず使えるが、上記の
-  −24 dBFS での MER 劣化が直るまでは `--fpga-eq 0` を推奨。
+- FPGA 前段（pluto-fw-isdbt v2）は libiio 経由のレジスタアクセスなので OS を問わず使える（v2.0.2 以降を推奨）。
 - USB 2.0 帯域: 8bit ファームなら公称レート、純正ファームなら 7/8 レート（Windows と同じ）。
