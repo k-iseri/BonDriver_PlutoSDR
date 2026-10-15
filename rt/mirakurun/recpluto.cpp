@@ -177,7 +177,7 @@ int main(int argc, char** argv) {
         if (a == "--device") sdr_cfg.uri = value();
         else if (a == "--type") {
             const std::string t = value();
-            SystemHint h;
+            SystemHint h = hint;          // 初期化は MSVC の C4701 対策（HintFromType が失敗時に触らない）
             if (!t.empty() && !HintFromType(t, &h)) { std::fprintf(stderr, "bad --type: %s\n", t.c_str()); return 2; }
             if (!t.empty() && !hint_from_system) hint = h;
         }
