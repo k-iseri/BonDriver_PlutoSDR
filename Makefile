@@ -33,14 +33,23 @@ synth:
 bondriver:
 	powershell -NoProfile -ExecutionPolicy Bypass -File rt/bondriver/build.ps1
 
+# rt/: Windows は build.ps1（vswhere で MSVC を探す）、Linux / macOS は CMake を直接
+ifeq ($(OS),Windows_NT)
+  RT_TEST = rt/build/rt-x64/Release/rt_test.exe
 rt:
 	powershell -NoProfile -ExecutionPolicy Bypass -File rt/build.ps1
+else
+  RT_TEST = rt/build/rt-native/rt_test
+rt:
+	cmake -S rt -B rt/build/rt-native -DCMAKE_BUILD_TYPE=Release
+	cmake --build rt/build/rt-native -j
+endif
 
 rt-vectors:
 	$(VPY) tools/gen_rt_vectors.py --out testdata/rt_vectors
 
 rt-test:
-	rt/build/rt-x64/Release/rt_test.exe testdata/rt_vectors
+	$(RT_TEST) testdata/rt_vectors
 
 libiio-fetch:
 	powershell -ExecutionPolicy Bypass -File rt/third_party/fetch_libiio.ps1

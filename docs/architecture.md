@@ -59,8 +59,10 @@ I/Q (任意 fs)
 - `rt/demod/isdbtd.exe` が docs/daemon-protocol.md v2 のデーモン。--ts / --sigmf の再生（demod_server.py と
   同機能）に加え、`--sdr` で実機（libiio）からのライブ受信と逐次復調（長時間再追従込み）を行う
   （docs/hw-setup.md「SDR ライブ受信」）。
-- ビルドは `make rt`（rt/build.ps1 → vswhere で CMake/MSVC を探す）。出力は
-  rt/build/rt-x64/Release/ の rt_test.exe / isdbtd.exe。
+- ビルドは `make rt`（Windows: rt/build.ps1 → vswhere で CMake/MSVC を探す。出力は
+  rt/build/rt-x64/Release/ の rt_test.exe / isdbtd.exe。Linux / macOS: CMake 直接、出力は rt/build/rt-native/）。
+  AVX2 版は x86-64 だけで、arm64 は `__AVX2__` 無しのスカラー版が同じ結果を出す（rt_test で確認）。
+  OS 依存は isdbtd のソケット（Winsock / POSIX）と isdbc のサイクルカウンタだけで、復調コアは標準 C++17。
 
 ## FPGA 前段経路（pluto-fw-isdbt v2、2026-10-15 実装）
 ```

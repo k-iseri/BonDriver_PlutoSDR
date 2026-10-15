@@ -20,8 +20,10 @@ VECTORS = ROOT / "testdata" / "rt_vectors"
 
 
 def _exe(name: str) -> Path | None:
-    for config in ("Release", "Debug"):
-        p = ROOT / "rt" / "build" / "rt-x64" / config / f"{name}.exe"
+    build = ROOT / "rt" / "build"
+    candidates = [build / "rt-x64" / config / f"{name}.exe" for config in ("Release", "Debug")]   # Windows (build.ps1)
+    candidates.append(build / "rt-native" / name)                                                  # Linux / macOS (make rt)
+    for p in candidates:
         if p.exists():
             return p
     return None
@@ -30,7 +32,7 @@ def _exe(name: str) -> Path | None:
 def _require_exe(name: str) -> Path:
     p = _exe(name)
     if p is None:
-        pytest.skip(f"{name}.exe が未ビルド（.\\rt\\build.ps1 を実行）")
+        pytest.skip(f"{name} が未ビルド（make rt / .\\rt\\build.ps1 を実行）")
     return p
 
 

@@ -23,7 +23,8 @@ make test-fast    #                             .\dev.ps1 test-fast
 make synth        # 合成試験信号を testdata/synthetic/ に生成（約 10 秒）
 python tools/demod_sigmf.py testdata/synthetic/std_mode3_gi8_clean.sigmf-meta --out out/   # 復調して TS を得る
 ```
-Python 3.11 以上。Windows ネイティブ環境を前提にしている。
+Python 3.11 以上。開発は Windows ネイティブ環境で行っているが、`ref/` と `rt/`（復調コア・isdbtd）は
+Linux / macOS でもビルド・実行できる（下記「Linux / macOS」）。TVTest 用 BonDriver だけが Windows 専用。
 `make test`（ループバック・BER 曲線を含む slow テスト）は 10 分程度かかる。
 ref/ の復調は 6 フレーム単位のブロック処理で、速度は実時間の約 14 倍遅、メモリは録音データ
 （complex64、30 秒で約 2 GB）+ 数百 MB。C++ 版（`make rt` → isdbtd.exe）はライブ受信で CPU 約 2.7 コア
@@ -51,6 +52,21 @@ rt\build\bondriver-x64\Release\bontest.exe rt\build\bondriver-x64\Release\BonDri
 DLL と同名の ini（`.ini.sample` を編集）を TVTest の BonDriver フォルダへ置く。
 視聴までの一般ユーザー向け手順は `docs/setup-tvtest.md`。
 詳細は `rt/bondriver/README.md`、プロトコルは `docs/daemon-protocol.md`。
+
+## Linux / macOS（Apple Silicon 含む）
+`rt/` は CMake だけでビルドできる（C++17、g++ 11 / clang 15 以降）。AVX2 は x86-64 で自動で付き、
+arm64 ではスカラー版（同じ結果、遅い）になる。SDR ライブ受信には libiio 1.x が要る（Ubuntu は
+ソースから、macOS は `brew install libiio`。無ければ `--sdr` だけ使えないままビルドは通る）。
+```
+make setup && make test-fast            # ref/ のテスト
+make rt                                 # rt/build/rt-native/{rt_test, isdbtd}
+make rt-vectors && make rt-test         # ref/ とのビット一致（43 項目）
+rt/build/rt-native/isdbtd --sigmf testdata/captured/ch25.sigmf-meta --loop   # 録音の復調（TCP 47188 に TS）
+rt/build/rt-native/isdbtd --sdr usb: --ch 24                                 # Pluto ライブ受信
+```
+GitHub Actions（`.github/workflows/ci.yml`）が ubuntu と macOS（arm64）で rt_test と isdbtd の
+プロトコル試験を回す。Raspberry Pi（arm64 Linux）は同じ手順でビルドできる想定だが実機未確認。
+Mirakurun から使うチューナーコマンドは準備中。
 
 ## ケーブルテレビの BS/CS（トランスモジュレーション、ISDB-C）
 ケーブル TV の宅内端子に来ている BS/CS 再送信（64QAM、5.274 Mbaud、TSMF 多重）は
