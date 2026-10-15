@@ -201,6 +201,45 @@ void LiveDemod::OnSymbol(const EqSymbol& s) {
         rx_rate_ = rate_mon_.rate();
         rx_slow_ = rate_mon_.slow();
     }
+    // ロック前の暫定 MER: 等化済みなので TMCC / AC1 キャリア（DBPSK、±4/3 の実軸。フレーム位置に依らない）の
+    // 誤差から 64 シンボルごとに出す。TVTest のチャンネルスキャンは選局 5 秒後の信号レベルが 7 dB 未満だと
+    // 「信号なし」にするが、GI 相関の暫定値（8〜13 dB）は際どく、フレーム同期（約 5 秒）を待つと間に合わない
+    {
+        bool need = false;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            need = !locked_;
+        }
+        if (need) {
+            int n_t = 0, n_a = 0;
+            const int16_t* pt = TmccPositionsAbs(mode_, &n_t);
+            const int16_t* pa = Ac1PositionsAbs(mode_, &n_a);
+            const uint8_t* raw = s.raw.data();
+            auto acc = [&](const int16_t* pos, int n) {
+                for (int i = 0; i < n; ++i) {
+                    const int k = pos[i];
+                    const uint8_t c = raw[k * 3 + 2];
+                    if (c == 0) continue;                       // CSI 0 = 消失
+                    const double re = static_cast<int8_t>(raw[k * 3]) / 64.0;
+                    const double im = static_cast<int8_t>(raw[k * 3 + 1]) / 64.0;
+                    const double ref = (re >= 0.0) ? kPilotAmplitude : -kPilotAmplitude;
+                    qm_err_ += (re - ref) * (re - ref) + im * im;
+                    qm_cnt_ += 1.0;
+                }
+            };
+            acc(pt, n_t);
+            acc(pa, n_a);
+            if (++qm_syms_ >= 64) {
+                if (qm_cnt_ > 0.0) {
+                    const double mer = 10.0 * std::log10(kPilotAmplitude * kPilotAmplitude / (qm_err_ / qm_cnt_ + 1e-9));
+                    std::lock_guard<std::mutex> lock(mu_);
+                    if (!locked_) mer_db_ = std::max(0.0, std::min(40.0, mer));
+                }
+                qm_err_ = qm_cnt_ = 0.0;
+                qm_syms_ = 0;
+            }
+        }
+    }
     std::lock_guard<std::mutex> lock(iq_mu_);
     if (sym_q_.size() > kSymBound) {        // 復調が追いつかない: 全部捨てて仕切り直し
         sym_q_.clear();

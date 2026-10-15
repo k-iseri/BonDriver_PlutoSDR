@@ -160,6 +160,9 @@ private:
     static constexpr size_t kSymBound = 12000;      // 待ち上限 ≈ 13.6 s（1 シンボル 17 KB）
     std::atomic<bool> sym_mode_{false};             // 等化済みシンボルが届いている
     std::atomic<long long> sym_gaps_{0};            // 連番の途切れ（窓の欠け）の回数
+    // ロック前の暫定 MER（等化済みシンボルの TMCC / AC1 キャリア = DBPSK ±4/3 からの誤差。受信スレッドだけが触る）
+    double qm_err_ = 0.0, qm_cnt_ = 0.0;
+    int qm_syms_ = 0;
     // 選局直後の暫定信号レベル: 最初のウィンドウが復調されるまで（約 6 秒）MER が無いので、GI 相関から
     // C/N を見積もって signal_db に入れる。TVTest のチャンネルスキャンは待ち時間（既定 5 秒）経過時点で
     // 信号レベル ≥ 7 dB か SDT 受信済みでなければ即座に次へ進むため（2026-10-14、ChannelScan.cpp より）
