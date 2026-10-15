@@ -85,6 +85,7 @@ private:
     void UpdateTapArrays();
     void OnBits(uint8_t word);
     void OnTsp(const uint8_t* tsp);
+    void HandlePackets(const uint8_t* pkts, const int* nerr, int n);   // RS 済みパケットを TSMF へ
     void FlushOutput();
     void StartTrack();
     void SetInverted(bool inv);
@@ -104,6 +105,10 @@ private:
     double nco_phase_ = 0.0;
     double level_acc_ = 0.0;
     long long level_n_ = 0;
+    // ISDBT_PROFILE 用の段ごとの累積時間 [s]（状態更新のたびに表示してクリア）
+    double prof_rotate_ = 0.0, prof_interp_ = 0.0, prof_symbol_ = 0.0, prof_block_ = 0.0, prof_bits_ = 0.0;
+    long long prof_symbols_ = 0;
+    unsigned long long prof_cyc_interp_ = 0, prof_cyc_symbol_ = 0, prof_cyc_block_ = 0;
 
     // 多相 RRC カーネル（入力レートで設計）
     static constexpr int kTaps = 40;
@@ -115,6 +120,7 @@ private:
     double next_pos_ = 0.0;             // 次のシンボルの位置（絶対サンプル番号、double）
     long long sym_count_ = 0;           // 追従開始からのシンボル数
     double agc_pow_ = 42.0;
+    float agc_gain_ = 0.0f;             // 64 シンボルごとに更新する AGC 利得
 
     // 等化器（T 間隔 FFE）と判定指向 LS
     std::vector<float> zbuf_;           // 直近 eq_taps シンボルの 2 重長履歴（re, im 交互。OnSymbol 参照）

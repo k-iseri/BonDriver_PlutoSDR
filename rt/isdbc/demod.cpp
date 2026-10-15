@@ -3,6 +3,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #ifdef __AVX2__
 #include <immintrin.h>
@@ -184,12 +187,15 @@ void IsdbcDemod::Rotate(const cfloat* x, size_t n) {
 }
 
 void IsdbcDemod::Feed(const cfloat* x, size_t n) {
+    const auto t0 = std::chrono::steady_clock::now();
     Rotate(x, n);
+    prof_rotate_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     Process();
     FlushOutput();
 }
 
 void IsdbcDemod::Process() {
+    const auto t0 = std::chrono::steady_clock::now();
     for (;;) {
         if (state_ == State::kAcquire) {
             if (!Acquire()) return;
@@ -197,6 +203,7 @@ void IsdbcDemod::Process() {
         }
         if (!TrackStep()) break;
     }
+    prof_symbol_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     // 消費済みの入力を捨てる（カーネル幅 + 余裕を残す）
     const long long keep_from = static_cast<long long>(std::floor(next_pos_)) - x_abs0_ - 64;
     if (keep_from > (1 << 16)) {
@@ -468,11 +475,17 @@ bool IsdbcDemod::TrackStep() {
         TimingUpdate();
     }
     if (!AvailAt(next_pos_, x_abs0_, x_.size(), kTaps)) return false;
+    const unsigned long long c0 = __rdtsc();
     const cfloat z = Interp(next_pos_);
+    const unsigned long long c1 = __rdtsc();
     next_pos_ += sym_period_;
     ++sym_count_;
     ++track_symbols_;
     OnSymbol(z);
+    const unsigned long long c2 = __rdtsc();
+    prof_cyc_interp_ += c1 - c0;
+    prof_cyc_symbol_ += c2 - c1;
+    ++prof_symbols_;
     return true;
 }
 
@@ -492,7 +505,11 @@ void IsdbcDemod::OnSymbol(cfloat z) {
     } else {
         agc_pow_ += 1e-4 * (p - agc_pow_);
     }
-    z *= static_cast<float>(std::sqrt(kQam64Rms * kQam64Rms / std::max(agc_pow_, 1e-12)));
+    // 利得は 64 シンボルごとに更新（毎シンボルの sqrt を避ける。EWMA の時定数 1e4 シンボルに対して十分細かい）
+    if ((track_symbols_ & 63) == 0 || agc_gain_ == 0.0f) {
+        agc_gain_ = static_cast<float>(std::sqrt(kQam64Rms * kQam64Rms / std::max(agc_pow_, 1e-12)));
+    }
+    z *= agc_gain_;
     // T 間隔 FFE: y = Σ_m w[m] z_{k−m}（出力は L シンボル遅れの位置に対応）。
     // 履歴は 2 重長の float 列（re, im, ...）に 2 か所書いて、直近 N シンボルが常に連続になるようにし、
     // 実部用・虚部用の係数列（UpdateTapArrays）との 2 本の積和で求める
@@ -502,10 +519,32 @@ void IsdbcDemod::OnSymbol(cfloat z) {
     zbuf_[2 * static_cast<size_t>(zpos_ + N)] = z.real();
     zbuf_[2 * static_cast<size_t>(zpos_ + N) + 1] = z.imag();
     const float* win = &zbuf_[2 * static_cast<size_t>(zpos_ + 1)];     // 古い順に N シンボル（最後が今）
+    float yr, yi;
+#ifdef __AVX2__
+    {
+        // 実部用・虚部用の係数列との積和を 1 ループで（同じ窓を 2 回読まない）
+        __m256 a1 = _mm256_setzero_ps(), a2 = _mm256_setzero_ps();
+        const float* c1 = c1_.data();
+        const float* c2 = c2_.data();
+        for (int i = 0; i < eq_len_; i += 8) {
+            const __m256 w = _mm256_loadu_ps(win + i);
+            a1 = _mm256_fmadd_ps(w, _mm256_loadu_ps(c1 + i), a1);
+            a2 = _mm256_fmadd_ps(w, _mm256_loadu_ps(c2 + i), a2);
+        }
+        // 偶数レーン + 奇数レーンの全和（d1 = Σ wr·zr − wi·zi、d2 = Σ wi·zr + wr·zi）
+        const __m128 s1 = _mm_add_ps(_mm256_castps256_ps128(a1), _mm256_extractf128_ps(a1, 1));
+        const __m128 s2 = _mm_add_ps(_mm256_castps256_ps128(a2), _mm256_extractf128_ps(a2, 1));
+        const __m128 t1 = _mm_add_ps(s1, _mm_movehl_ps(s1, s1));
+        const __m128 t2 = _mm_add_ps(s2, _mm_movehl_ps(s2, s2));
+        yr = _mm_cvtss_f32(_mm_add_ss(t1, _mm_shuffle_ps(t1, t1, 1)));
+        yi = _mm_cvtss_f32(_mm_add_ss(t2, _mm_shuffle_ps(t2, t2, 1)));
+    }
+#else
     const cfloat d1 = DotInterleaved(win, c1_.data(), eq_len_);        // (Σ wr·zr, Σ −wi·zi)
     const cfloat d2 = DotInterleaved(win, c2_.data(), eq_len_);        // (Σ wi·zr, Σ wr·zi)
-    const float yr = d1.real() + d1.imag();
-    const float yi = d2.real() + d2.imag();
+    yr = d1.real() + d1.imag();
+    yi = d2.real() + d2.imag();
+#endif
     // LS 用に等化器入力ベクトルをデシメーションして保存（R は即時蓄積、p は位相確定後）
     if (++ls_decim_ >= kLsDecim) {
         ls_decim_ = 0;
@@ -516,12 +555,8 @@ void IsdbcDemod::OnSymbol(cfloat z) {
             const float* s = win + 2 * (N - 1 - m);
             zblk_[base + static_cast<size_t>(m)] = cfloat(s[0], s[1]);
         }
-        for (int a = 0; a < N; ++a) {
-            const std::complex<double> ca = std::conj(std::complex<double>(zblk_[base + a]));
-            for (int b = a; b < N; ++b) {          // エルミートなので上三角だけ
-                R_[static_cast<size_t>(a) * N + b] += ca * std::complex<double>(zblk_[base + b]);
-            }
-        }
+        // R の蓄積は FinishPhaseBlock でブロック分まとめて行う（複素 double の積和をシンボルごとにやると
+        // 1 シンボルあたり約 40 ns かかっていた）
     }
     zpos_ = (zpos_ + 1 == N) ? 0 : zpos_ + 1;
     ublk_.push_back(cfloat(yr, yi));
@@ -544,6 +579,8 @@ void IsdbcDemod::UpdateTapArrays() {
 }
 
 void IsdbcDemod::FinishPhaseBlock() {
+    const unsigned long long cb0 = __rdtsc();
+    struct CycAcc { unsigned long long& acc; unsigned long long c0; ~CycAcc() { acc += __rdtsc() - c0; } } cyc{prof_cyc_block_, cb0};
     const cfloat* C = Constellation();
     double theta = Wrap(theta_ + theta_rate_);
     if (blocks_done_ < kInitialPhaseBlocks) {
@@ -585,6 +622,29 @@ void IsdbcDemod::FinishPhaseBlock() {
     mer_n_ += static_cast<long long>(ublk_.size());
     // LS の右辺: 判定点を位相で戻した目標値 d e^{jθ}
     const int N = cfg_.eq_taps;
+    // R += Σ z^H z（上三角）。ベクトルごとに実部・虚部を分けた列にして float で積和し、ブロック末尾で double に足す
+    {
+        std::vector<float> Rr(static_cast<size_t>(N) * N, 0.0f), Ri(static_cast<size_t>(N) * N, 0.0f);
+        float zr[64], zi[64];
+        for (size_t i = 0; i < zblk_idx_.size(); ++i) {
+            const cfloat* xv = &zblk_[i * static_cast<size_t>(N)];
+            for (int m = 0; m < N; ++m) { zr[m] = xv[m].real(); zi[m] = xv[m].imag(); }
+            for (int a = 0; a < N; ++a) {
+                const float ar = zr[a], ai = zi[a];
+                float* rr = &Rr[static_cast<size_t>(a) * N];
+                float* ri = &Ri[static_cast<size_t>(a) * N];
+                for (int b = a; b < N; ++b) {           // conj(z_a)·z_b
+                    rr[b] += ar * zr[b] + ai * zi[b];
+                    ri[b] += ar * zi[b] - ai * zr[b];
+                }
+            }
+        }
+        for (int a = 0; a < N; ++a) {
+            for (int b = a; b < N; ++b) {
+                R_[static_cast<size_t>(a) * N + b] += std::complex<double>(Rr[static_cast<size_t>(a) * N + b], Ri[static_cast<size_t>(a) * N + b]);
+            }
+        }
+    }
     for (size_t i = 0; i < zblk_idx_.size(); ++i) {
         const int sym = zblk_idx_[i];
         if (sym < 0 || sym >= static_cast<int>(words.size())) continue;
@@ -599,9 +659,23 @@ void IsdbcDemod::FinishPhaseBlock() {
     blk_n_ = 0;
     ++blocks_done_;
     if (ls_count_ >= kLsSolveEvery) SolveEqualizer();
-
+    const auto tb0 = std::chrono::steady_clock::now();
     for (uint8_t wd : words) OnBits(diff_.Decode(wd));
+    prof_bits_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - tb0).count();
 
+    {
+        static const bool profile = std::getenv("ISDBT_PROFILE") != nullptr;
+        if (profile && prof_symbols_ >= 2000000) {
+            // track = 補間 + FFE + LS 蓄積 + 位相ブロック（bits を含む）。bits = 差動復号・同期・RS・TSMF
+            std::fprintf(stderr, "[isdbc] %lld symbols (%.2f s of signal): rotate %.3f track %.3f (of which bits %.3f) s; cycles/symbol: interp %.0f onsymbol %.0f block %.0f\n",
+                         prof_symbols_, prof_symbols_ / cfg_.symbol_rate, prof_rotate_, prof_symbol_, prof_bits_,
+                         static_cast<double>(prof_cyc_interp_) / prof_symbols_, static_cast<double>(prof_cyc_symbol_) / prof_symbols_,
+                         static_cast<double>(prof_cyc_block_) / prof_symbols_);
+            prof_rotate_ = prof_interp_ = prof_symbol_ = prof_block_ = prof_bits_ = 0.0;
+            prof_cyc_interp_ = prof_cyc_symbol_ = prof_cyc_block_ = 0;
+            prof_symbols_ = 0;
+        }
+    }
     if (blocks_done_ % kStatusEveryBlocks == 0) {
         mer_db_ = mer_err_acc_ > 0 ? 10 * std::log10(mer_ref_acc_ / mer_err_acc_) : 60.0;
         mer_err_acc_ = mer_ref_acc_ = 0.0;
@@ -777,20 +851,32 @@ void IsdbcDemod::OnTsp(const uint8_t* tsp) {
         st_.locked = false;
         return;
     }
-    uint8_t pkt[kTsPacket];
-    int nerr = 0;
-    if (!frame_.Push(tsp, pkt, &nerr)) return;
+    uint8_t pkts[FrameDecoder::kBatch * kTsPacket];
+    int nerr[FrameDecoder::kBatch];
+    const int n = frame_.Push(tsp, pkts, nerr);
+    if (n > 0) HandlePackets(pkts, nerr, n);
+}
+
+void IsdbcDemod::HandlePackets(const uint8_t* pkts, const int* nerr, int n) {
     {
         std::lock_guard<std::mutex> lk(mu_);
-        ++st_.rs_packets;
-        if (nerr < 0) ++st_.rs_uncorrectable;
+        st_.rs_packets += n;
+        for (int i = 0; i < n; ++i) st_.rs_uncorrectable += (nerr[i] < 0);
     }
-    if (tsmf_.Push(pkt)) {
-        out_.insert(out_.end(), pkt, pkt + kTsPacket);
+    for (int i = 0; i < n; ++i) {
+        const uint8_t* pkt = pkts + static_cast<size_t>(i) * kTsPacket;
+        if (tsmf_.Push(pkt)) out_.insert(out_.end(), pkt, pkt + kTsPacket);
     }
 }
 
 void IsdbcDemod::FlushOutput() {
+    {
+        // RS 待ちの端数を Feed ブロックの終わりで出す（遅延を 1 ブロック以内に）
+        uint8_t pkts[FrameDecoder::kBatch * kTsPacket];
+        int nerr[FrameDecoder::kBatch];
+        const int n = frame_.Flush(pkts, nerr);
+        if (n > 0) HandlePackets(pkts, nerr, n);
+    }
     if (out_.empty()) return;
     const size_t n = out_.size() / kTsPacket;
     {

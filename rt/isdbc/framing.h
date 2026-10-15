@@ -17,10 +17,18 @@ class FrameDecoder {
 public:
     FrameDecoder();
     void Reset();
-    // 出力があれば out（188 バイト）に書いて true。nerr は RS の訂正バイト数（-1 = 訂正不能、TEI を立てる）
-    bool Push(const uint8_t* tsp, uint8_t* out, int* nerr);
+    // RS はまとめて復号する（AVX2 版が 32 TSP 同時なので、1 個ずつだと転置の分だけ無駄になる）。
+    // Push はバッチが満ちたときだけ out（kBatch × 188 バイト）と nerr（kBatch 個。RS の訂正バイト数、
+    // -1 = 訂正不能で TEI を立てる）に書いて個数を返す（0 または kBatch）。Flush は溜まっている分を出す
+    static constexpr int kBatch = 32;
+    int Push(const uint8_t* tsp, uint8_t* out, int* nerr);
+    int Flush(uint8_t* out, int* nerr);
 
 private:
+    int Decode(uint8_t* out, int* nerr);
+    uint8_t pend_[kBatch][kRsN];        // デインターリーブ済み、RS 待ち
+    int pend_phase_[kBatch];
+    int pend_n_ = 0;
     uint8_t ring_[kInterleaveI][kRsN];
     int ring_phase_[kInterleaveI];  // 各入力 TSP の 8 パケットグループ内位置（同期バイトはブランチ 0 で
                                     // 遅延なしなので、入力の 0xB8 から 11 TSP 先の出力位相が分かる）

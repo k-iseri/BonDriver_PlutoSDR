@@ -42,9 +42,37 @@ void FrameDecoder::Reset() {
     for (int& p : ring_phase_) p = -1;
     count_ = 0;
     in_phase_ = -1;
+    pend_n_ = 0;
 }
 
-bool FrameDecoder::Push(const uint8_t* tsp, uint8_t* out, int* nerr) {
+int FrameDecoder::Decode(uint8_t* out, int* nerr) {
+    const int n = pend_n_;
+    if (n == 0) return 0;
+    int errs[kBatch];
+    isdbt::RsDecode(&pend_[0][0], static_cast<size_t>(n), errs);
+    for (int i = 0; i < n; ++i) {
+        const uint8_t* de = pend_[i];
+        int err = errs[i];
+        int phase = pend_phase_[i];
+        if (err >= 0 && de[0] == kSyncByteInverted) phase = 0;
+        uint8_t* o = out + static_cast<size_t>(i) * kTsPacket;
+        o[0] = kSyncByte;
+        if (phase >= 0) {
+            for (int k = 0; k < kTsPacket - 1; ++k) o[1 + k] = de[1 + k] ^ prbs_[phase][k];
+        } else {
+            std::memcpy(o + 1, de + 1, kTsPacket - 1);
+            err = -1;                                     // 位相未確定のうちは信用しない
+        }
+        if (err < 0) o[1] |= kTeiMask;
+        nerr[i] = err;
+    }
+    pend_n_ = 0;
+    return n;
+}
+
+int FrameDecoder::Flush(uint8_t* out, int* nerr) { return Decode(out, nerr); }
+
+int FrameDecoder::Push(const uint8_t* tsp, uint8_t* out, int* nerr) {
     const int slot = static_cast<int>(count_ % kInterleaveI);
     std::memcpy(ring_[slot], tsp, kRsN);
     // 入力側のグループ位相（同期バイトは遅延なしで通るので、デインターリーブ前でも分かる）。
@@ -61,30 +89,17 @@ bool FrameDecoder::Push(const uint8_t* tsp, uint8_t* out, int* nerr) {
     }
     ring_phase_[slot] = in_phase_;
     ++count_;
-    if (count_ < kInterleaveI) return false;         // 履歴不足（先頭 11 TSP）
-    // デインターリーブ: 出力 TSP t のバイト j は入力 TSP t − 11 + b（b = j mod 12）のバイト j
-    uint8_t de[kRsN];
+    if (count_ < kInterleaveI) return 0;             // 履歴不足（先頭 11 TSP）
+    uint8_t* de = pend_[pend_n_];
     const long long t = count_ - 1;
     for (int j = 0; j < kRsN; ++j) {
         const int b = j % kInterleaveI;
         const long long src = t - (kInterleaveI - 1) + b;
         de[j] = ring_[src % kInterleaveI][j];
     }
-    int err = 0;
-    isdbt::RsDecode(de, 1, &err);
-    // 出力 TSP t の同期バイト（位相）は入力 TSP t − 11 のもの。RS 訂正後の 0xB8 が最優先
-    int phase = ring_phase_[(t - (kInterleaveI - 1) + kInterleaveI) % kInterleaveI];
-    if (err >= 0 && de[0] == kSyncByteInverted) phase = 0;
-    out[0] = kSyncByte;
-    if (phase >= 0) {
-        for (int i = 0; i < kTsPacket - 1; ++i) out[1 + i] = de[1 + i] ^ prbs_[phase][i];
-    } else {
-        std::memcpy(out + 1, de + 1, kTsPacket - 1);
-        err = -1;                                     // 位相未確定のうちは信用しない
-    }
-    if (err < 0) out[1] |= kTeiMask;
-    *nerr = err;
-    return true;
+    pend_phase_[pend_n_] = ring_phase_[(t - (kInterleaveI - 1) + kInterleaveI) % kInterleaveI];
+    ++pend_n_;
+    return (pend_n_ >= kBatch) ? Decode(out, nerr) : 0;
 }
 
 }  // namespace isdbc

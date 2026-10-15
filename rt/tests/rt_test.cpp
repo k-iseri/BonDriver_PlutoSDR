@@ -435,15 +435,17 @@ void TestIsdbcFraming() {
     const uint8_t* s = stream.as<uint8_t>() + off;
     const size_t n_tsp = (stream.elements() - off) / isdbc::kRsN;
     int bad = 0, n_out = 0;
-    for (size_t i = 0; i < n_tsp; ++i) {
-        uint8_t pkt[188];
-        int nerr = 0;
-        if (fd.Push(s + i * isdbc::kRsN, pkt, &nerr)) {
-            got.insert(got.end(), pkt, pkt + 188);
+    uint8_t pkts[isdbc::FrameDecoder::kBatch * 188];
+    int nerr[isdbc::FrameDecoder::kBatch];
+    auto take = [&](int n) {
+        for (int k = 0; k < n; ++k) {
+            got.insert(got.end(), pkts + k * 188, pkts + (k + 1) * 188);
             ++n_out;
-            if (nerr != 5) ++bad;       // 各 TSP に 5 バイト誤りを入れてある
+            if (nerr[k] != 5) ++bad;    // 各 TSP に 5 バイト誤りを入れてある
         }
-    }
+    };
+    for (size_t i = 0; i < n_tsp; ++i) take(fd.Push(s + i * isdbc::kRsN, pkts, nerr));
+    take(fd.Flush(pkts, nerr));
     // 出力 i は入力パケット i + 11 に対応（先頭 11 TSP は履歴なし）
     const size_t n_cmp = std::min<size_t>(n_out, want.rows() - 11);
     ok = ok && n_cmp > 100 && bad == 0 &&
