@@ -3,7 +3,8 @@
 isdbtd の `--stdout` モードは recpt1 などと同じ「選局して TS を標準出力に流し、SIGTERM で止まる」
 チューナーコマンドなので、Mirakurun の `tuners.yml` にそのまま書ける。BonDriver（Windows / TVTest）とは
 独立で、同じ復調コアを使う。状態: 2026-10-15 に Windows と WSL（Ubuntu 22.04）で録音ファイル
-（`--sigmf`）からの動作を確認。Mac / Raspberry Pi の実機と Mirakurun 本体との結合は未確認。
+（`--sigmf`）からの動作を確認し、同日 MacBook Air（M5）で Pluto 実機からの `--sdr` 受信と Mirakurun 4.x
+（下記の直接起動）の結合・チャンネル走査まで確認。Raspberry Pi は未確認。
 
 ## 準備
 
@@ -105,7 +106,8 @@ server.yml の `path`（UNIX ソケット）は `/var/run` ではなく書ける
 
 - 選局から TS が出るまで約 5 秒（FPGA 前段ありでも同程度）。Mirakurun の既定タイムアウトで足りるはず。
 - CPU: x86-64 は AVX2 版（地デジ raw 約 2.7 コア、FPGA 前段で約 0.3 コア、CATV 約 0.35 コア）。
-  arm64（Apple Silicon / Raspberry Pi）はスカラー版で、Raspberry Pi 4/5 で実時間に足りるかは未測定。
-  足りなければビタビ・RS の NEON 化（SIMDe で AVX2 版を変換）が次の手。
-- FPGA 前段（pluto-fw-isdbt v2）は libiio 経由のレジスタアクセスなので OS を問わず使える。
+  arm64 はスカラー版で、Apple M5 では地デジ raw 約 1.8 コア、FPGA 前段で約 1 コア。Raspberry Pi 4/5 で
+  実時間に足りるかは未測定で、足りなければビタビ・RS の NEON 化（SIMDe で AVX2 版を変換）が次の手。
+- FPGA 前段（pluto-fw-isdbt v2）は libiio 経由のレジスタアクセスなので OS を問わず使えるが、上記の
+  −24 dBFS での MER 劣化が直るまでは `--fpga-eq 0` を推奨。
 - USB 2.0 帯域: 8bit ファームなら公称レート、純正ファームなら 7/8 レート（Windows と同じ）。
