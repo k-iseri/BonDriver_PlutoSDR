@@ -304,7 +304,13 @@ void LiveDemod::SchedLoop() {
     std::vector<EqSymbol> acc_sym;
     uint32_t last_seq = 0;
     bool have_seq = false;
-    auto win_syms_for = [&](int nf, int ctx) { return static_cast<size_t>(ctx + nf + 1) * kSymbolsPerFrame; };
+    // FPGA 等化モードのウィンドウ: 文脈 kSymCtxFrames（時間デインターリーブ履歴 380 シンボル + 先頭助走 102 が
+    // フレーム位置によらず収まる 3 フレーム）+ 新規 nf + 1 フレーム + 末尾助走。復号は新規 nf フレームだけ
+    //（DemodulateEqualized の範囲復号）なので、重なり分を復号し直さない
+    constexpr int kSymCtxFrames = 3;
+    auto win_syms_for = [&](int nf, int /*ctx*/) {
+        return static_cast<size_t>(kSymCtxFrames + nf + 1) * kSymbolsPerFrame + kFecTailSymbols + 8;
+    };
     // 仕掛かり数は現世代のジョブだけ数える。選局前のジョブ（1 本 4〜5 秒）を待っていると
     // 次のチャンネルの最初のウィンドウが遅れ、信号のあるチャンネルが続くとスキャンが交互に落ちる
     auto active_jobs = [&]() {
@@ -385,12 +391,10 @@ void LiveDemod::SchedLoop() {
             std::lock_guard<std::mutex> lock(mu_);
             if (!locked_ && mer_db_ == 0.0) mer_db_ = 10.0;     // 暫定レベル（FPGA が同期しているので信号はある）
         }
-        while (sym_mode_ && acc_sym.size() >= win_syms_for(cur_new, cur_new == first_new ? first_ctx : ctx_frames_) &&
-               active_jobs() < workers_) {
-            const bool first = (cur_new == first_new);
-            const size_t win_syms = win_syms_for(cur_new, first ? first_ctx : ctx_frames_);
-            const size_t adv_syms = static_cast<size_t>(first ? std::max(1, cur_new - (ctx_frames_ - first_ctx)) : cur_new) *
-                                    kSymbolsPerFrame;
+        while (sym_mode_ && acc_sym.size() >= win_syms_for(cur_new, 0) && active_jobs() < workers_) {
+            const size_t win_syms = win_syms_for(cur_new, 0);
+            const int fec_frames = cur_new;
+            const size_t adv_syms = static_cast<size_t>(cur_new) * kSymbolsPerFrame;
             cur_new = new_frames_;
             const int total = ModeParamsOf(mode_).total_carriers;
             auto D = std::make_shared<Mat<cfloat>>(win_syms, static_cast<size_t>(total));
@@ -408,9 +412,9 @@ void LiveDemod::SchedLoop() {
             job.gen = cur_gen;
             // FPGA のサンプルカウンタは公称レート。Emit は入力サンプル単位で継ぐので換算しておく
             job.abs0 = static_cast<long long>(std::llround(static_cast<double>(acc_sym[0].start) * in_per_nominal_));
-            job.fut = std::async(std::launch::async, [this, D, csi]() -> std::shared_ptr<DemodResult> {
+            job.fut = std::async(std::launch::async, [this, D, csi, fec_frames]() -> std::shared_ptr<DemodResult> {
                 try {
-                    return std::make_shared<DemodResult>(DemodulateEqualized(*D, *csi, mode_));
+                    return std::make_shared<DemodResult>(DemodulateEqualized(*D, *csi, mode_, 6, fec_frames));
                 } catch (const std::exception&) {
                     return nullptr;
                 }
@@ -503,7 +507,12 @@ void LiveDemod::Emit(const DemodResult& res, long long abs0) {
         // 最終フレームは排出しない: バイトデインターリーブの補遅延（11 TSP）の尻尾が
         // 未完成で、各呼び出しの末尾 11 TSP が必ず訂正不能になる。重複分（ctx_frames_）が
         // あるので次のウィンドウが完全な形で出し直す。
-        for (int f = reliable_from; f < res.fsi.n_frames - 1; ++f) {
+        int f_begin = reliable_from, f_end = res.fsi.n_frames - 1;
+        if (res.emit_first >= 0) {          // 範囲復号: [emit_first, emit_end) は全層とも完全
+            f_begin = res.emit_first;
+            f_end = res.emit_end;
+        }
+        for (int f = f_begin; f < f_end; ++f) {
             // gi_start0・シンボル番号は公称タイムライン、abs0 は入力サンプル → 入力単位に換算
             const double s_f = abs0 + (res.sync.gi_start0 +
                                static_cast<double>(f0 + f * kSymbolsPerFrame) * T) * in_per_nominal_;

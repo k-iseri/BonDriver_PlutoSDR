@@ -43,6 +43,9 @@ struct DemodResult {
     SyncInfo sync;
     FrameSyncInfo fsi;
     std::map<std::string, LayerResult> layers;
+    // DemodulateEqualized の範囲復号: 受信フレーム [emit_first, emit_end) は全層とも完全（先頭の助走・末尾の
+    // 未完成が無い）ので、呼び出し側はそのまま出してよい。-1 なら従来どおり（先頭 +1、最終フレームは未完成）
+    int emit_first = -1, emit_end = -1;
 };
 
 // I/Q（サンプルレート fs）→ 階層ごとの TS。block_frames フレームずつ処理する。
@@ -90,9 +93,17 @@ private:
 };
 
 // 等化済みキャリア行列 D (n_sym, total) と CSI → 階層ごとの TS（Demodulate の後段だけ）。
-// 同期情報は gi_start0 = 0（行 i はウィンドウ先頭 + i シンボル）として返す
+// 同期情報は gi_start0 = 0（行 i はウィンドウ先頭 + i シンボル）として返す。
+// fec_frames > 0 なら範囲復号: 復号（デマップ〜RS）を受信フレーム [F0, F0 + fec_frames) だけにかける
+// （F0 は時間デインターリーブの履歴と助走が揃う最小のフレーム。result.emit_first / emit_end に入る）。
+// 助走は先頭 kFecHeadSymbols・末尾 kFecTailSymbols だけなので、ライブ受信のウィンドウ重なり分を
+// 復号し直さずに済む（CPU 約 −30 %）。ウィンドウは (F0 + fec_frames) フレーム + 末尾 kFecTailSymbols 以上必要
 DemodResult DemodulateEqualized(const Mat<cfloat>& D, const Mat<float>& csi, Mode mode,
-                                int block_frames = 6);
+                                int block_frames = 6, int fec_frames = -1);
+// 範囲復号の助走。先頭はバイトデインターリーブの履歴 11 TSP + ビタビの立ち上がりを含み、どの階層でも
+// TSP 境界に揃うシンボル数（102 = 51 × 2: TSP/フレーム が 4 の倍数なら 102 × tpf / 204 は整数）
+inline constexpr int kFecHeadSymbols = 102;
+inline constexpr int kFecTailSymbols = 8;       // ビタビの打ち切りとビットデインターリーブ遅延の分
 
 // 時間デインターリーブの参照先が揃う最初の受信フレーム番号
 int LayerFirstFrame(const RxLayer& lyr, int frame_start);
@@ -100,5 +111,9 @@ int LayerFirstFrame(const RxLayer& lyr, int frame_start);
 // ビットデインターリーブ後の軟判定 (n_slots, bps) → TS パケット列・RS 統計
 void DecodeSoftBits(const Mat<float>& soft, const RxLayer& lyr, Mode mode,
                     std::vector<uint8_t>* ts, std::vector<int>* nerr);
+// 同上、範囲復号用: 先頭 head_tsp 個の TSP（助走）を捨て、そこがフレーム先頭として n_frames フレーム分だけ
+// エネルギー逆拡散・RS をかける（入力が足りなければ揃うフレームまで）
+void DecodeSoftBitsRange(const Mat<float>& soft, const RxLayer& lyr, Mode mode, int head_tsp, int n_frames,
+                         std::vector<uint8_t>* ts, std::vector<int>* nerr);
 
 }  // namespace isdbt
