@@ -515,18 +515,34 @@ bool IsdbcDemod::TrackStep() {
         if (!AvailAt(next_pos_ + (kOmSpan + 1) * sym_period_, x_abs0_, x_.size(), kTaps)) return false;
         TimingUpdate();
     }
-    if (!AvailAt(next_pos_, x_abs0_, x_.size(), kTaps)) return false;
+    // 8 シンボルまとめて補間してから OnSymbol を回す（補間の積和は互いに独立なので、1 シンボルずつ
+    // 補間 → FFE → 出力と直列に進めるより乱序実行で重なる）。O&M の更新境界をまたぐときは 1 シンボルずつ
+    constexpr int B = 8;
+    const long long in_block = sym_count_ % kOmBlock;
+    const int nb = (in_block + B <= kOmBlock) ? B : 1;
+    if (!AvailAt(next_pos_ + (nb - 1) * sym_period_, x_abs0_, x_.size(), kTaps)) {
+        if (nb == 1 || !AvailAt(next_pos_, x_abs0_, x_.size(), kTaps)) return false;
+    }
+    int n = nb;
+    while (n > 1 && !AvailAt(next_pos_ + (n - 1) * sym_period_, x_abs0_, x_.size(), kTaps)) --n;
     const unsigned long long c0 = __rdtsc();
-    const cfloat z = Interp(next_pos_);
+    cfloat z[B];
+    double pos = next_pos_;
+    for (int k = 0; k < n; ++k) {
+        z[k] = Interp(pos);
+        pos += sym_period_;
+    }
     const unsigned long long c1 = __rdtsc();
-    next_pos_ += sym_period_;
-    ++sym_count_;
-    ++track_symbols_;
-    OnSymbol(z);
+    next_pos_ = pos;
+    sym_count_ += n;
+    for (int k = 0; k < n; ++k) {
+        ++track_symbols_;
+        OnSymbol(z[k]);
+    }
     const unsigned long long c2 = __rdtsc();
     prof_cyc_interp_ += c1 - c0;
     prof_cyc_symbol_ += c2 - c1;
-    ++prof_symbols_;
+    prof_symbols_ += n;
     return true;
 }
 
@@ -687,6 +703,59 @@ void IsdbcDemod::FinishPhaseBlock() {
     const cfloat r = static_cast<cfloat>(std::polar(1.0, -theta));
     const std::complex<double> rt = std::polar(1.0, theta);
     std::vector<uint8_t> words(ublk_.size());
+#ifdef __AVX2__
+    {
+        // 8 シンボルずつ: v = u·r、|v| からレベル添字（0..3 = レベル 1,3,5,7）、符号から象限。語は DemapHard と同じ規則で組む
+        // （象限 1・2 では z1 = ±j·v なので I/Q のレベル添字が入れ替わる）。MER は最近傍点（スライス）との差
+        static const uint8_t kGray[4] = {0b00, 0b01, 0b11, 0b10};
+        const __m256 rr = _mm256_set1_ps(r.real()), ri = _mm256_set1_ps(r.imag());
+        const __m256 half = _mm256_set1_ps(0.5f), one = _mm256_set1_ps(1.0f), two = _mm256_set1_ps(2.0f), three = _mm256_set1_ps(3.0f);
+        const __m256 lim = _mm256_set1_ps(7.0f), nlim = _mm256_set1_ps(-7.0f), zero = _mm256_setzero_ps();
+        const __m256 absmask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
+        __m256 err = zero, ref = zero;
+        const float* up = reinterpret_cast<const float*>(ublk_.data());
+        const size_t n2 = ublk_.size() / 8 * 8;
+        alignas(32) int32_t lv[16];
+        for (size_t k = 0; k < n2; k += 8) {
+            uint32_t signs[2];
+            for (int h = 0; h < 2; ++h) {
+                const __m256 u = _mm256_loadu_ps(up + 2 * k + 8 * h);
+                const __m256 v = _mm256_addsub_ps(_mm256_mul_ps(u, rr), _mm256_mul_ps(_mm256_permute_ps(u, 0xB1), ri));
+                __m256 sl = _mm256_fmadd_ps(_mm256_floor_ps(_mm256_mul_ps(v, half)), two, one);
+                sl = _mm256_min_ps(_mm256_max_ps(sl, nlim), lim);
+                const __m256 d = _mm256_sub_ps(v, sl);
+                err = _mm256_fmadd_ps(d, d, err);
+                ref = _mm256_fmadd_ps(sl, sl, ref);
+                // レベル添字 = clamp(trunc((|v| − 1)·0.5 + 0.5), 0, 3)
+                const __m256 a = _mm256_and_ps(v, absmask);
+                __m256 fi = _mm256_fmadd_ps(_mm256_sub_ps(a, one), half, half);
+                fi = _mm256_min_ps(_mm256_max_ps(fi, zero), three);
+                _mm256_store_si256(reinterpret_cast<__m256i*>(lv + 8 * h), _mm256_cvttps_epi32(fi));
+                signs[h] = static_cast<uint32_t>(_mm256_movemask_ps(v));     // レーンごとの符号（bit 2j = re、2j+1 = im）
+            }
+            for (int j = 0; j < 8; ++j) {
+                const uint32_t sg = signs[j >> 2] >> (2 * (j & 3));
+                const int i_bit = sg & 1, q_bit = (sg >> 1) & 1;
+                const int iq = i_bit * 2 + q_bit;
+                int li = lv[2 * j], lq = lv[2 * j + 1];
+                if (iq == 1 || iq == 2) std::swap(li, lq);
+                const int gi = kGray[li], gq = kGray[lq];
+                words[k + j] = static_cast<uint8_t>((iq << 4) | ((gq >> 1) << 3) | ((gi >> 1) << 2) | ((gq & 1) << 1) | (gi & 1));
+            }
+        }
+        alignas(32) float ea[8], ra[8];
+        _mm256_store_ps(ea, err);
+        _mm256_store_ps(ra, ref);
+        for (int j = 0; j < 8; ++j) { mer_err_acc_ += ea[j]; mer_ref_acc_ += ra[j]; }
+        for (size_t i = n2; i < ublk_.size(); ++i) {
+            const cfloat v = ublk_[i] * r;
+            const uint8_t wd = DemapHard(v);
+            words[i] = wd;
+            mer_err_acc_ += std::norm(v - C[wd]);
+            mer_ref_acc_ += std::norm(C[wd]);
+        }
+    }
+#else
     for (size_t i = 0; i < ublk_.size(); ++i) {
         const cfloat v = ublk_[i] * r;
         const uint8_t wd = DemapHard(v);
@@ -694,29 +763,45 @@ void IsdbcDemod::FinishPhaseBlock() {
         mer_err_acc_ += std::norm(v - C[wd]);
         mer_ref_acc_ += std::norm(C[wd]);
     }
+#endif
     mer_n_ += static_cast<long long>(ublk_.size());
     // LS の右辺: 判定点を位相で戻した目標値 d e^{jθ}
     const int N = cfg_.eq_taps;
     // R += Σ z^H z（上三角）。ベクトルごとに実部・虚部を分けた列にして float で積和し、ブロック末尾で double に足す
     {
-        std::vector<float> Rr(static_cast<size_t>(N) * N, 0.0f), Ri(static_cast<size_t>(N) * N, 0.0f);
-        float zr[64], zi[64];
+        constexpr int NP = 64;                          // 8 の倍数に 0 詰め（N ≤ 64）
+        const int nv = (N + 7) / 8;
+        std::vector<float> Rr(static_cast<size_t>(N) * NP, 0.0f), Ri(static_cast<size_t>(N) * NP, 0.0f);
+        alignas(32) float zr[NP] = {}, zi[NP] = {};
         for (size_t i = 0; i < zblk_idx_.size(); ++i) {
             const cfloat* xv = &zblk_[i * static_cast<size_t>(N)];
             for (int m = 0; m < N; ++m) { zr[m] = xv[m].real(); zi[m] = xv[m].imag(); }
+#ifdef __AVX2__
+            for (int a = 0; a < N; ++a) {
+                const __m256 ar = _mm256_set1_ps(zr[a]), ai = _mm256_set1_ps(zi[a]);
+                float* rr = &Rr[static_cast<size_t>(a) * NP];
+                float* ri = &Ri[static_cast<size_t>(a) * NP];
+                for (int b = (a / 8) * 8, v = a / 8; v < nv; b += 8, ++v) {    // 上三角を含む 8 幅
+                    const __m256 br = _mm256_load_ps(zr + b), bi = _mm256_load_ps(zi + b);
+                    _mm256_storeu_ps(rr + b, _mm256_fmadd_ps(ar, br, _mm256_fmadd_ps(ai, bi, _mm256_loadu_ps(rr + b))));
+                    _mm256_storeu_ps(ri + b, _mm256_fmsub_ps(ar, bi, _mm256_fmsub_ps(ai, br, _mm256_loadu_ps(ri + b))));
+                }
+            }
+#else
             for (int a = 0; a < N; ++a) {
                 const float ar = zr[a], ai = zi[a];
-                float* rr = &Rr[static_cast<size_t>(a) * N];
-                float* ri = &Ri[static_cast<size_t>(a) * N];
+                float* rr = &Rr[static_cast<size_t>(a) * NP];
+                float* ri = &Ri[static_cast<size_t>(a) * NP];
                 for (int b = a; b < N; ++b) {           // conj(z_a)·z_b
                     rr[b] += ar * zr[b] + ai * zi[b];
                     ri[b] += ar * zi[b] - ai * zr[b];
                 }
             }
+#endif
         }
         for (int a = 0; a < N; ++a) {
             for (int b = a; b < N; ++b) {
-                R_[static_cast<size_t>(a) * N + b] += std::complex<double>(Rr[static_cast<size_t>(a) * N + b], Ri[static_cast<size_t>(a) * N + b]);
+                R_[static_cast<size_t>(a) * N + b] += std::complex<double>(Rr[static_cast<size_t>(a) * NP + b], Ri[static_cast<size_t>(a) * NP + b]);
             }
         }
     }
