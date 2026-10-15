@@ -223,7 +223,7 @@ std::vector<uint8_t> MergeLayersByFrame(const DemodResult& res, Mode mode) {
 }
 
 Source LoadSigmf(const std::string& path, Mode mode, Gi gi, double max_seconds, double bitrate_opt,
-                 bool track) {
+                 bool track, bool fast_fec) {
     SigmfMeta meta;
     std::vector<cfloat> iq = ReadSigmf(path, &meta);
     if (max_seconds > 0) {
@@ -273,7 +273,7 @@ Source LoadSigmf(const std::string& path, Mode mode, Gi gi, double max_seconds, 
         s.source_desc = "sigmf:" + path;
         return s;
     }
-    res = Demodulate(std::move(iq), meta.sample_rate, mode, gi);
+    res = Demodulate(std::move(iq), meta.sample_rate, mode, gi, kDefaultBlockFrames, fast_fec);
     const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     std::fprintf(stderr, "done in %.1f s\n", sec);
     std::fprintf(stderr,
@@ -372,22 +372,22 @@ public:
         if (thread_.joinable()) thread_.join();
     }
 
-    std::shared_ptr<ClientQueue> AddClient() {
+    std::shared_ptr<ClientQueue> AddClient() override {
         auto q = std::make_shared<ClientQueue>();
         std::lock_guard<std::mutex> lock(mu_);
         clients_.push_back(q);
         return q;
     }
-    void AttachClient(const std::shared_ptr<ClientQueue>& q) {
+    void AttachClient(const std::shared_ptr<ClientQueue>& q) override {
         std::lock_guard<std::mutex> lock(mu_);
         clients_.push_back(q);
     }
-    void RemoveClient(const std::shared_ptr<ClientQueue>& q) {
+    void RemoveClient(const std::shared_ptr<ClientQueue>& q) override {
         std::lock_guard<std::mutex> lock(mu_);
         clients_.erase(std::remove(clients_.begin(), clients_.end(), q), clients_.end());
     }
 
-    void Tune(bool has_ch, int ch, double freq) {
+    void Tune(bool has_ch, int ch, double freq) override {
         std::lock_guard<std::mutex> lock(mu_);
         has_channel_ = has_ch;
         channel_ = ch;
@@ -401,7 +401,7 @@ public:
         }
     }
 
-    std::string StatusJson() {
+    std::string StatusJson() override {
         std::lock_guard<std::mutex> lock(mu_);
         std::string s = "{\"ok\": true";
         s += ", \"locked\": " + std::string(src_.locked && !ended_ ? "true" : "false");
@@ -427,7 +427,11 @@ public:
         return s;
     }
 
-    const std::string& source_desc() const { return src_.source_desc; }
+    const std::string& source_desc() const override { return src_.source_desc; }
+    bool Ended() const override {
+        std::lock_guard<std::mutex> lock(mu_);
+        return ended_;
+    }
 
 private:
     void Run() {
@@ -476,7 +480,7 @@ private:
     Source src_;
     bool loop_;
     double signal_db_;
-    std::mutex mu_;
+    mutable std::mutex mu_;                 // Ended() は const
     std::vector<std::shared_ptr<ClientQueue>> clients_;
     size_t pos_ = 0;
     bool ended_ = false;
@@ -689,7 +693,10 @@ int StreamToStdout(IFeed* feed, bool verbose) {
         std::vector<uint8_t> chunk;
         {
             std::unique_lock<std::mutex> lock(q->mu);
-            if (!q->cv.wait_for(lock, std::chrono::milliseconds(500), [&] { return !q->chunks.empty(); })) continue;
+            if (!q->cv.wait_for(lock, std::chrono::milliseconds(500), [&] { return !q->chunks.empty(); })) {
+                if (feed->Ended()) break;       // ファイル再生（--loop 無し）の末尾: 出し切ったら終わる
+                continue;
+            }
             chunk = std::move(q->chunks.front());
             q->chunks.pop_front();
         }
@@ -714,6 +721,7 @@ void Usage() {
         "  --bitrate F         再生ビットレート [bit/s]\n"
         "  --loop              末尾まで来たら先頭に戻る\n"
         "  --track             追従復調（長時間・ドリフト・瞬断のある録音向け）\n"
+        "  --fast-fec          --sigmf でもライブ受信と同じ 8bit ビタビを使う（float 版との比較用）\n"
         "  --signal-db F       status.signal_db に返す固定値 (default 30)\n"
         "  --tsmf N | all      ISDB-C: TSMF の相対 TS 番号（既定は自動、all = 全スロット通過）\n"
         "  --host H --port N   (default 127.0.0.1:47188)\n"
@@ -742,7 +750,7 @@ int main(int argc, char** argv) {
     std::string ts_path, sigmf_path, host = "127.0.0.1", gi_str = "1/8";
     int mode_i = 3, port = kDefaultPort;
     double max_seconds = 0, bitrate = 0, signal_db = 30.0;
-    bool loop = false, no_quit = false, quiet = false, track = false, to_stdout = false;
+    bool loop = false, no_quit = false, quiet = false, track = false, to_stdout = false, fast_fec = false;
     bool sdr = false;
     SdrConfig sdr_cfg;
     std::string dump_iq, system_str;
@@ -784,6 +792,7 @@ int main(int argc, char** argv) {
         else if (a == "--bitrate") bitrate = std::atof(next().c_str());
         else if (a == "--loop") loop = true;
         else if (a == "--track") track = true;
+        else if (a == "--fast-fec") fast_fec = true;
         else if (a == "--signal-db") signal_db = std::atof(next().c_str());
         else if (a == "--tsmf" || a == "--rel-ts") {
             const std::string v = next();
@@ -858,7 +867,7 @@ int main(int argc, char** argv) {
             Source src = !ts_path.empty() ? LoadTsFile(ts_path, bitrate)
                          : (system == System::kIsdbc
                                 ? LoadSigmfIsdbc(sigmf_path, max_seconds, bitrate, ts_sel)
-                                : LoadSigmf(sigmf_path, static_cast<Mode>(mode_i), gi, max_seconds, bitrate, track));
+                                : LoadSigmf(sigmf_path, static_cast<Mode>(mode_i), gi, max_seconds, bitrate, track, fast_fec));
             const size_t n_tsp = src.packets.size() / kTsPacket;
             std::fprintf(stderr, "serving %zu TSP (%.1f s at %.3f Mbps, loop=%d) on %s:%d  source=%s\n",
                          n_tsp, n_tsp * kTsPacket * 8 / src.bitrate, src.bitrate / 1e6, loop ? 1 : 0,

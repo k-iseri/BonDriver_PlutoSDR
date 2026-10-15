@@ -440,11 +440,14 @@ void LiveDemod::SchedLoop() {
             job.gen = cur_gen;
             job.abs0 = acc_abs0;
             std::vector<cfloat> win(acc.begin(), acc.begin() + win_samples);
-            job.fut = std::async(std::launch::async, [this, w = std::move(win)]() mutable
+            // 文脈フレームは前のウィンドウが排出済み（範囲復号は末尾フレームまで出す）なので、1 フレームの
+            // 余裕を残して FEC を省く。前段と時間デインターリーブの履歴はその前から取られる
+            const int first_fec = std::max(0, (first ? first_ctx : ctx_frames_) - 1);
+            job.fut = std::async(std::launch::async, [this, w = std::move(win), first_fec]() mutable
                                  -> std::shared_ptr<DemodResult> {
                 try {
                     auto res = std::make_shared<DemodResult>(
-                        Demodulate(std::move(w), cfg_.fs, mode_, gi_));
+                        Demodulate(std::move(w), cfg_.fs, mode_, gi_, kDefaultBlockFrames, /*fast_fec=*/true, first_fec));
                     return res;
                 } catch (const std::exception&) {
                     return nullptr;         // 同期失敗（無信号など）
