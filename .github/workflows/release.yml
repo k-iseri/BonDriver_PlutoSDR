@@ -34,6 +34,10 @@ jobs:
       - name: Build BonDriver DLL (x64 Release)
         run: .\rt\bondriver\build.ps1
 
+      # recpluto.exe / isdbtd.exe（Windows でも Mirakurun 風のコマンドとして使える。zip に同梱）
+      - name: Build rt/ (recpluto, isdbtd)
+        run: .\rt\build.ps1
+
       # SDR 実機なしでできる範囲の確認: DLL がロードでき CreateBonDriver を export しているか
       # （libiio1.dll は /DELAYLOAD なのでロード自体は libiio 無しでも通るはず）
       - name: Verify DLL loads
@@ -56,3 +60,10 @@ jobs:
         run: |
           $zip = (Get-Item dist\*.zip).FullName
           gh release create "$env:TAG" $zip --title "$env:TAG" --notes-file .github\release-notes.md
+
+  # Linux / macOS の recpluto バイナリ（.github/workflows/recpluto.yml）をリリースに添付
+  recpluto:
+    needs: release
+    uses: ./.github/workflows/recpluto.yml
+    with:
+      tag: ${{ inputs.tag || github.ref_name }}
