@@ -554,7 +554,86 @@ int DecodeOne(uint8_t* c, const int S[kRsNRoots]) {
 
 }  // namespace
 
+namespace {
+
+// 1 TSP を訂正する（シンドローム計算済み）。訂正不能なら元に戻す
+int RsCorrectOne(uint8_t* c, int S[kRsNRoots]) {
+    std::vector<uint8_t> saved(c, c + kRsN);
+    int r = DecodeOne(c, S);
+    if (r >= 0 && Syndromes(c, S)) r = -1;      // 訂正後もシンドロームが残る = 誤訂正
+    if (r < 0) std::copy(saved.begin(), saved.end(), c);
+    return r;
+}
+
+#ifdef __AVX2__
+// 32 TSP 同時のシンドローム計算。GF(256) の定数倍 x·α^i をニブル表 2 つの pshufb で求める
+// （x = hi·16 + lo → x·r = T_hi[hi] ⊕ T_lo[lo]）。誤りの無い TSP（大半）はこれだけで済み、
+// 非 0 の TSP だけスカラーの Berlekamp-Massey へ回す。ホーナー法: S_i = (…(c_0·r_i + c_1)·r_i + …)·r_i + c_203
+struct RsSyndromeTables {
+    alignas(32) uint8_t lo[kRsNRoots][32];
+    alignas(32) uint8_t hi[kRsNRoots][32];
+    RsSyndromeTables() {
+        for (int i = 0; i < kRsNRoots; ++i) {
+            const int root = GPow2(kRsFirstRoot + i);
+            for (int x = 0; x < 16; ++x) {
+                lo[i][x] = lo[i][x + 16] = static_cast<uint8_t>(GMul(x, root));
+                hi[i][x] = hi[i][x + 16] = static_cast<uint8_t>(GMul(x << 4, root));
+            }
+        }
+    }
+};
+
+void RsDecodeAvx2(uint8_t* tsps, size_t n_tsp, int* nerr) {
+    static const RsSyndromeTables tabs;
+    const __m256i nib = _mm256_set1_epi8(0x0F);
+    alignas(32) uint8_t col[kRsN][32];          // col[j][lane] = TSP(base + lane) のバイト j
+    alignas(32) uint8_t Sv[kRsNRoots][32];
+    for (size_t base = 0; base < n_tsp; base += 32) {
+        const size_t cnt = std::min<size_t>(32, n_tsp - base);
+        // 転置（使わないレーンは 0 → シンドロームも 0）
+        for (size_t l = 0; l < 32; ++l) {
+            if (l < cnt) {
+                const uint8_t* c = tsps + (base + l) * kRsN;
+                for (int j = 0; j < kRsN; ++j) col[j][l] = c[j];
+            } else {
+                for (int j = 0; j < kRsN; ++j) col[j][l] = 0;
+            }
+        }
+        __m256i any = _mm256_setzero_si256();
+        for (int i = 0; i < kRsNRoots; ++i) {
+            const __m256i tlo = _mm256_load_si256(reinterpret_cast<const __m256i*>(tabs.lo[i]));
+            const __m256i thi = _mm256_load_si256(reinterpret_cast<const __m256i*>(tabs.hi[i]));
+            __m256i acc = _mm256_load_si256(reinterpret_cast<const __m256i*>(col[0]));
+            for (int j = 1; j < kRsN; ++j) {
+                const __m256i lo = _mm256_and_si256(acc, nib);
+                const __m256i hi = _mm256_and_si256(_mm256_srli_epi16(acc, 4), nib);
+                const __m256i prod = _mm256_xor_si256(_mm256_shuffle_epi8(tlo, lo), _mm256_shuffle_epi8(thi, hi));
+                acc = _mm256_xor_si256(prod, _mm256_load_si256(reinterpret_cast<const __m256i*>(col[j])));
+            }
+            _mm256_store_si256(reinterpret_cast<__m256i*>(Sv[i]), acc);
+            any = _mm256_or_si256(any, acc);
+        }
+        const uint32_t nonzero = static_cast<uint32_t>(
+            ~_mm256_movemask_epi8(_mm256_cmpeq_epi8(any, _mm256_setzero_si256())));
+        for (size_t l = 0; l < cnt; ++l) {
+            if (!((nonzero >> l) & 1u)) {
+                nerr[base + l] = 0;
+                continue;
+            }
+            int S[kRsNRoots];
+            for (int i = 0; i < kRsNRoots; ++i) S[i] = Sv[i][l];
+            nerr[base + l] = RsCorrectOne(tsps + (base + l) * kRsN, S);
+        }
+    }
+}
+#endif  // __AVX2__
+
+}  // namespace
+
 void RsDecode(uint8_t* tsps, size_t n_tsp, int* nerr) {
+#ifdef __AVX2__
+    RsDecodeAvx2(tsps, n_tsp, nerr);
+#else
     for (size_t i = 0; i < n_tsp; ++i) {
         uint8_t* c = tsps + i * kRsN;
         int S[kRsNRoots];
@@ -562,12 +641,9 @@ void RsDecode(uint8_t* tsps, size_t n_tsp, int* nerr) {
             nerr[i] = 0;
             continue;
         }
-        std::vector<uint8_t> saved(c, c + kRsN);
-        int r = DecodeOne(c, S);
-        if (r >= 0 && Syndromes(c, S)) r = -1;      // 訂正後もシンドロームが残る = 誤訂正
-        if (r < 0) std::copy(saved.begin(), saved.end(), c);
-        nerr[i] = r;
+        nerr[i] = RsCorrectOne(c, S);
     }
+#endif
 }
 
 // ---------------------------------------------------------------------------
