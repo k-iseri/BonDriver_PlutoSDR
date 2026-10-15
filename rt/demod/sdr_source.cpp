@@ -96,6 +96,7 @@ constexpr int kFeEqWords = (kFeTotal * 3 + 3) / 4;   // 4213
 constexpr int kFeSettleBlocks = 8;          // raw でソフト AGC を走らせる時間（≈ 1 秒）
 constexpr int kFeCfoFrames = 16;            // 整数 CFO 推定に使う同期 FFT の窓数
 constexpr int kFeCfoTimeoutBlocks = 40;     // モード 3 で窓が来ないときの諦め（≈ 5 秒 → raw へ戻してやり直す）
+constexpr int kFeWarmupSymbols = 512;       // モード 4 に入ってから捨てるシンボル数（時間軸の立ち上がり 256 シンボルで B 層が崩れる）
 
 // DMA ワード列から前段フレーム（ヘッダ 8 ワード + 本体）を切り出す。ブロック境界をまたぐので持ち越す
 class FeParser {
@@ -411,10 +412,12 @@ void SdrSource::Run() {
         std::lock_guard<std::mutex> lk(mu_);
         if (connected_ && impl_->rxdev) (void)iio_device_reg_write(impl_->rxdev, kPcoreRegMagic | reg, v);
     };
+    int fe_warm = 0;                    // モード 4 に入ってから受けたシンボル数（kFeWarmupSymbols まで捨てる）
     auto fe_to_raw = [&]() {
         fe_write(kRegMode, 0);
         fe = Fe::kRaw;
         fe_blocks = 0;
+        fe_warm = 0;
         fpga_eq_ = false;
         parser.Reset();
         fe_start_init_ = false;
@@ -511,6 +514,7 @@ void SdrSource::Run() {
                         std::fprintf(stderr, "sdr: fpga front-end: integer CFO %d bins\n", best_d);
                     }
                 } else if (fe == Fe::kEq && fmt == 2) {
+                    if (fe_warm < kFeWarmupSymbols) { ++fe_warm; return; }    // 立ち上がりは捨てる（先頭ウィンドウの TEI を防ぐ）
                     EqSymbol sym;
                     // 窓開始サンプル番号: ヘッダは 64bit だが v2.0.0 までのファームは下位 32bit しか入れていない
                     // （8.127 MSPS では 528 秒で一周し、継ぎ合わせのフレーム番号が戻って TS が止まった、2026-10-15）。
@@ -546,6 +550,7 @@ void SdrSource::Run() {
                 fe_write(kRegMode, 4);
                 fe = Fe::kEq;
                 fe_blocks = 0;
+                fe_warm = 0;
                 fpga_eq_ = true;
                 std::fprintf(stderr, "sdr: fpga front-end: equalized carriers (mode 4)\n");
             }
