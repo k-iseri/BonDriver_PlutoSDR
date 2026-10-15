@@ -140,23 +140,35 @@ void TestRecplutoChannels() {
     System sys;
     int ch = 0;
     double freq = 0.0;
-    bool ok = ParseChannel("27", &sys, &ch, &freq) && sys == System::kIsdbt && ch == 27 && std::fabs(freq - 557'142'857.0) < 1.0;
-    ok = ok && ParseChannel("13ch", &sys, &ch, &freq) && ch == 13;
-    ok = ok && ParseChannel("C56", &sys, &ch, &freq) && sys == System::kIsdbc && ch == 72 + (56 - 23) && std::fabs(freq - 423e6) < 1.0;
-    ok = ok && ParseChannel("c13ch", &sys, &ch, &freq) && ch == 62 && std::fabs(freq - 111e6) < 1.0;
-    ok = ok && ChannelLabel(System::kIsdbc, 72 + (56 - 23)) == "C56" && ChannelLabel(System::kIsdbt, 27) == "27";
-    for (const char* bad : {"12", "63", "C12", "C64", "BS01_0", "", "2x", "C"}) ok = ok && !ParseChannel(bad, &sys, &ch, &freq);
+    const SystemHint A = SystemHint::kAuto, T = SystemHint::kIsdbt, C = SystemHint::kIsdbc;
+    bool ok = ParseChannel("27", A, &sys, &ch, &freq) && sys == System::kIsdbt && ch == 27 && std::fabs(freq - 557'142'857.0) < 1.0;
+    ok = ok && ParseChannel("13ch", A, &sys, &ch, &freq) && ch == 13;
+    ok = ok && ParseChannel("C56", A, &sys, &ch, &freq) && sys == System::kIsdbc && ch == 72 + (56 - 23) && std::fabs(freq - 423e6) < 1.0;
+    ok = ok && ParseChannel("c13ch", A, &sys, &ch, &freq) && ch == 62 && std::fabs(freq - 111e6) < 1.0;
+    // ケーブルの UHF 帯トラモジ（BonDriver_BDA の通し番号 55 = 56ch = 731 MHz、1/7 MHz オフセット無し）
+    ok = ok && ParseChannel("56", C, &sys, &ch, &freq) && sys == System::kIsdbc && ch == 55 && std::fabs(freq - 731e6) < 1.0;
+    ok = ok && ParseChannel("56", T, &sys, &ch, &freq) && sys == System::kIsdbt && std::fabs(freq - 731'142'857.0) < 1.0;
+    ok = ok && !ParseChannel("C41", T, &sys, &ch, &freq) && ParseChannel("C41", C, &sys, &ch, &freq) && ch == 90;
+    ok = ok && ChannelLabel(System::kIsdbc, 72 + (56 - 23)) == "C56" && ChannelLabel(System::kIsdbc, 55) == "56" && ChannelLabel(System::kIsdbt, 27) == "27";
+    for (const char* bad : {"12", "63", "C12", "C64", "BS01_0", "", "2x", "C"}) ok = ok && !ParseChannel(bad, A, &sys, &ch, &freq);
+    SystemHint h;
+    ok = ok && HintFromType("GR", &h) && h == T && HintFromType("BS", &h) && h == C && HintFromType("CS", &h) && HintFromType("SKY", &h) && !HintFromType("NW1", &h);
+    ok = ok && HintFromSystem("isdbc", &h) && h == C && HintFromSystem("", &h) && h == A && !HintFromSystem("x", &h);
     Report(ok, "recpluto_channel_spec");
-    std::vector<std::string> t;
-    ok = ScanTargets("gr", &t) && t.size() == 50 && t.front() == "13" && t.back() == "62";
+    std::vector<ScanTarget> t;
+    ok = ScanTargets("gr", &t) && t.size() == 50 && t.front().channel == "13" && t.back().channel == "62" && t[0].hint == T;
     t.clear();
-    ok = ok && ScanTargets("catv:C13-C22", &t) && t.size() == 10 && t.front() == "C13" && t.back() == "C22";
+    ok = ok && ScanTargets("catv:C13-C22", &t) && t.size() == 10 && t.front().channel == "C13" && t.back().channel == "C22" && t[0].hint == C;
     t.clear();
-    ok = ok && ScanTargets("all", &t) && t.size() == 50 + 51;
+    ok = ok && ScanTargets("catv:50-60", &t) && t.size() == 11 && t[0].channel == "50" && t[0].hint == C;
     t.clear();
-    ok = ok && ScanTargets("gr:24-27", &t) && t.size() == 4 && t[0] == "24";
+    ok = ok && ScanTargets("catv", &t) && t.size() == 51 + 50;
     t.clear();
-    ok = ok && !ScanTargets("bs", &t) && !ScanTargets("gr:27-24", &t) && !ScanTargets("all:1-2", &t);
+    ok = ok && ScanTargets("all", &t) && t.size() == 50 + 51 + 50;
+    t.clear();
+    ok = ok && ScanTargets("gr:24-27", &t) && t.size() == 4 && t[0].channel == "24";
+    t.clear();
+    ok = ok && !ScanTargets("bs", &t) && !ScanTargets("gr:27-24", &t) && !ScanTargets("all:1-2", &t) && !ScanTargets("catv:C13-22", &t);
     Report(ok, "recpluto_scan_targets");
 }
 

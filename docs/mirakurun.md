@@ -50,7 +50,8 @@ Mirakurun にはドライバ API が無く、「選局して TS を標準出力�
 4. 動作確認（TS がファイルに出る。`-` は止めるまで / 標準出力）:
    ```
    recpluto 24 10 ch24.ts             # 地デジ UHF 24ch を 10 秒
-   recpluto C56 - - > catv.ts         # CATV トラモジ C56（BS/CS 再送信）、Ctrl-C で止める
+   recpluto --type=BS 56 - - > catv.ts   # CATV トラモジ（BS/CS 再送信）のケーブル UHF 帯 56ch、Ctrl-C で止める
+   recpluto C41 10 catv.ts            # 同じく C 帯 C41（C 付きなら --type 無しでもケーブル）
    recpluto --scan gr:13-52           # 受信できるチャンネルを channels.yml の形で出す（catv / all も可、1 ch 約 5 秒）
    ```
    `--quiet` を付けないと 10 秒ごとに status（JSON）が stderr に出る。recpt1 の `--b25` `--strip` `--sid` などは
@@ -62,14 +63,14 @@ Mirakurun にはドライバ API が無く、「選局して TS を標準出力�
 ## tuners.yml / channels.yml（Mirakurun 4.0 以降）
 
 Pluto は 1 台で 1 チャンネルなので、地デジと CATV を同じ 1 本の tuner にする（Mirakurun は tuner ごとに
-同時 1 プロセス）。`<channel>` は channels.yml の `channel` がそのまま入り、recpluto は数字なら地デジの物理 ch、
-`C` 付きなら CATV の物理 ch と解釈するので、方式の指定は要らない。雛形は `tools/mirakurun/` にある。
+同時 1 プロセス）。`<channel>` は channels.yml の `channel`、`<type>` は type（GR / BS / CS / SKY）がそのまま入り、
+recpluto は type が GR なら地デジ、それ以外ならケーブル（ISDB-C）として受ける。雛形は `tools/mirakurun/` にある。
 
 ```yaml
 # tuners.yml（tools/mirakurun/tuners.yml.sample）
 - name: PlutoSDR
-  types: [GR, BS, CS]
-  command: recpluto <channel> - -
+  types: [GR, BS, CS, SKY]
+  command: recpluto --type=<type> --tsid=<tsid> <channel> - -
   decoder: arib-b25-stream-test     # スクランブル解除は本リポジトリの範囲外。要らなければ省略
   isDisabled: false
 ```
@@ -78,10 +79,10 @@ Pluto は 1 台で 1 チャンネルなので、地デジと CATV を同じ 1 �
 - name: NHK総合
   type: GR
   channel: '27'          # UHF 物理チャンネル。Mirakurun の走査 API で作れる
-- name: NHK BS
+- name: ＮＨＫ　ＢＳ
   type: BS
-  channel: 'C56'         # CATV の物理チャンネル C13〜C63（BS/CS 再送信）。`recpluto --scan catv` で調べる
-  serviceId: 101
+  channel: '56'          # ケーブルの UHF 帯 56ch（BS/CS 再送信）。TS は TSID で選ぶ（下の「CATV を見る」）
+  commandVars: { tsid: 16625 }
 ```
 `--device ip:...` のように `:` を含む引数を command に書くときは行全体を引用符で囲む（js-yaml が mapping と
 解釈して起動に失敗する）。isdbtd を使う場合は `"isdbtd --sdr usb: --system <system> --ch <channel> --stdout --quiet"`
@@ -93,51 +94,60 @@ CPU は Apple M5（NEON、2026-10-15）で FPGA 前段約 0.2 コア、raw 経�
 
 ## CATV（ケーブルの BS/CS 再送信、ISDB-C）を見る
 
-地デジと同じ recpluto で、チャンネルを `C` 付き（物理チャンネル C13〜C63）で書くと ISDB-C として受ける。
-recpluto の CATV 経路は isdbtd `--system isdbc` / BonDriver_PlutoSDR_TC.dll と同じパイプラインだが、
-Mirakurun 経由での実放送の確認はまだ（2026-10-16 時点。ケーブル端子のある環境で確認したら更新する）。
+ケーブル TV の BS/CS 再送信（ISDB-C トラモジ）は、局によって C 帯（C13〜C63、111〜465 MHz）と UHF 帯
+（13〜62ch、473 MHz〜。地デジと同じ番号だが変調は 64QAM の ISDB-C で、周波数に 1/7 MHz のオフセットが無い）の
+両方に置かれる。recpluto は数字のチャンネルを既定では地デジと解釈するので、Mirakurun の `<type>`（GR = 地デジ、
+BS / CS / SKY = ケーブル）を `--type=<type>` で渡して方式を決める。1 周波数に複数の TS が多重（TSMF）されて
+いることがあるので、TS は `--tsid=<tsid>`（channels.yml の `commandVars.tsid`、TS_id）で選ぶ。
+状態: 2026-10-16 に Mac M5 + Pluto をケーブル端子につなぎ、NHK BS（UHF 帯 56ch）と WOWOW ライブ（C41）の録画
+（同期エラー 0、MER 約 30 dB）と、Mirakurun 4.1.5 の API からの BS ストリーム取得を確認。
 
 1. **配線とゲイン**: Pluto の RX をケーブル TV の宅内端子につなぐ。ゲインは既定のソフト AGC（帯域内 −24 dBFS）
    のまま。ケーブルは全チャンネルが強く、`--gain hw`（AD936x の AGC）ではフロントエンドが圧縮して MER が
-   20 dB に張り付く（docs/hw-setup.md）。受信できるのは C23（225 MHz）以上。C13〜C22（111〜165 MHz）は
-   AD9363 の LO 範囲より下で未確認。
-2. **受信できるチャンネルを探す**: `recpluto --scan catv:C23-C63`。ロックしたチャンネルが channels.yml の形で出る
-   （1 チャンネル約 5〜8 秒）。
-3. **何の TS が乗っているか調べる**: CATV は 1 周波数に複数の TS が多重（TSMF）されている。`--quiet` 無しで
-   数十秒受けると 10 秒ごとの status（JSON）の `streams` に `rel`（相対 TS 番号 1〜15）・`tsid`・`onid` が並ぶ:
+   20 dB に張り付く（docs/hw-setup.md）。C13〜C22（111〜165 MHz）は AD9363 の LO 範囲より下で未確認。
+2. **チャンネル表（BonDriver_BDA の .ch2）があるなら変換する**: TVTest 用の BonDriver_BDA.ch2（TransModulation
+   空間）には通し番号・TSID・networkID が入っているので、そのまま channels.yml にできる:
    ```
-   recpluto C56 25 /dev/null
+   python tools/mirakurun/ch2_to_channels.py BonDriver_BDA.ch2 >> channels.yml
    ```
-   onid 4 が BS、6 と 7 が CS110。これで channels.yml の type（BS / CS）と選ぶ TS が決まる。
-4. **tuners.yml**: types に BS / CS を足し、TS の選択を channels.yml から渡す。BS/CS はスクランブルされているので
-   decoder が要る（スクランブル解除は本リポジトリの範囲外）:
+   通し番号は recpluto の表記（UHF 帯 '56'、C 帯 'C41'）に、networkID は type（4 = BS、6 / 7 = CS、他 = SKY）に、
+   TSID は `commandVars: { tsid: N }` になる。serviceId は書かない（Mirakurun が SDT から全サービスを拾う。
+   書くとそのサービスだけになる）。
+3. **表が無いなら探す**: `recpluto --scan catv`（C13〜C63 と UHF 帯 13〜62 を ISDB-C で走査。`catv:C23-C63` /
+   `catv:50-60` で範囲）でロックするチャンネルを出し、`--quiet` 無しで数十秒受けて 10 秒ごとの status（JSON）の
+   `streams`（`rel`・`tsid`・`onid`。onid 4 = BS、6・7 = CS110）から TS を決める:
+   ```
+   recpluto --type=BS 56 25 /dev/null
+   ```
+4. **tuners.yml**（`tools/mirakurun/tuners.yml.sample`）: types に BS / CS / SKY を足し、`--type=<type> --tsid=<tsid>`
+   を渡す。未定義のプレースホルダは空文字になるので `=` で繋いだ形にする（`--tsid=` は自動 = 最小番号の TS）。
+   BS/CS はスクランブルされているので decoder が要る（スクランブル解除は本リポジトリの範囲外）:
    ```yaml
    - name: PlutoSDR
-     types: [GR, BS, CS]
-     command: recpluto --tsmf <tsmf> <channel> - -
+     types: [GR, BS, CS, SKY]
+     command: recpluto --type=<type> --tsid=<tsid> <channel> - -
      decoder: arib-b25-stream-test
      isDisabled: false
    ```
-5. **channels.yml**: TS ごとに 1 項目。地デジにも `tsmf: 0`（自動 = 最小番号の TS）を付けておく。serviceId は
-   書かなくてよく、Mirakurun が起動時にそのチャンネルを選局してサービスを拾う:
+5. **channels.yml**（`tools/mirakurun/channels.yml.sample`）:
    ```yaml
    - name: NHK総合
      type: GR
      channel: '27'
-     commandVars: { tsmf: 0 }
-   - name: BS (C56 TS1)
+   - name: ＮＨＫ　ＢＳ
      type: BS
-     channel: 'C56'
-     commandVars: { tsmf: 1 }
-   - name: CS (C58 TS2)
-     type: CS
-     channel: 'C58'
-     commandVars: { tsmf: 2 }
+     channel: '56'          # ケーブルの UHF 帯 56ch（731 MHz）。type が BS なので ISDB-C
+     commandVars: { tsid: 16625 }
+   - name: ＷＯＷＯＷライブ
+     type: BS
+     channel: 'C41'         # C 帯 C41（333 MHz）
+     commandVars: { tsid: 17488 }
    ```
-   別の書き方として、command を `recpluto --tsmf all <channel> - -` にして全スロット（TSMF ヘッダ含む）を通し、
-   channels.yml の `tsmfRelTs: 1` で Mirakurun に選ばせることもできる。どちらか一方にする。
-6. **確認**: Mirakurun を再起動し、サービス走査が終わったら
-   `curl -s "http://127.0.0.1:40772/api/channels/BS/C56/stream?decode=1" | head -c 5000000 > test.ts`
+   同じ周波数に TS が 2 つ以上ある場合、Mirakurun は type + channel でチャンネルを区別するので 1 項目しか書けない。
+   その場合は command を `recpluto --type=<type> --tsmf all <channel> - -` にして全スロットを通し、channels.yml の
+   `tsmfRelTs`（相対 TS 番号 1〜15）で Mirakurun に選ばせる。
+6. **確認**: Mirakurun を再起動すると、サービスの無いチャンネルを順に選局して SDT からサービスを拾う（1 チャンネル
+   10〜20 秒）。`curl -s "http://127.0.0.1:40772/api/channels/BS/56/stream?decode=1" | head -c 5000000 > test.ts`
    で TS が取れればよい。あとは EPGStation などから普通に選べる。
 
 VHF 1〜12ch（地デジ以前の帯域）は AD9363 の LO 範囲外で受信できない。

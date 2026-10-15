@@ -77,12 +77,13 @@ Mirakurun にはドライバ API が無く、recpt1 のような「選局して 
    （Linux は `sudo make install-rt`、macOS は `make install-rt PREFIX=/opt/homebrew`）
 2. Linux は `tools/mirakurun/99-plutosdr.rules` を /etc/udev/rules.d/ に置いて Pluto の USB を一般ユーザーに許可
 3. 動作確認: `recpluto 27 10 test.ts`（10 秒録画）、`recpluto --scan gr:13-52`（受信できる局を channels.yml の形で表示）
-4. tuners.yml に 1 行（`command: recpluto <channel> - -`。`tools/mirakurun/tuners.yml.sample`）。channels.yml は
-   地デジなら Mirakurun の走査 API、CATV なら `recpluto --scan catv` の出力（`channel: 'C56'` のように C 付き）
+4. tuners.yml に 1 行（`command: recpluto --type=<type> --tsid=<tsid> <channel> - -`。`tools/mirakurun/tuners.yml.sample`）。
+   channels.yml は地デジなら Mirakurun の走査 API、CATV（BS/CS 再送信）なら BonDriver_BDA の .ch2 を
+   `tools/mirakurun/ch2_to_channels.py` で変換するか `recpluto --scan catv` で探す
 5. Mirakurun を起動（4.x は Docker 無しでも `lib/server.js` を直接起動できる。手順と常駐の雛形は `docs/mirakurun.md`）
 
-MacBook Air M5 + Pluto で Mirakurun 4.1.5 からの視聴・EPG 取得まで確認済み（CPU は FPGA 前段で約 0.2 コア）。
-Raspberry Pi は未確認。
+MacBook Air M5 + Pluto で Mirakurun 4.1.5 からの地デジの視聴・EPG 取得と、ケーブル端子からの BS 再送信の
+ストリーム取得まで確認済み（CPU は FPGA 前段で約 0.2 コア）。Raspberry Pi は未確認。
 
 ## ケーブルテレビの BS/CS（トランスモジュレーション、ISDB-C）
 ケーブル TV の宅内端子に来ている BS/CS 再送信（64QAM、5.274 Mbaud、TSMF 多重）は

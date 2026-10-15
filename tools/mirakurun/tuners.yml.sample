@@ -1,16 +1,17 @@
 # Mirakurun 4.x の tuners.yml（recpluto を使う。docs/mirakurun.md）
 # Pluto は 1 台で 1 チャンネルなので、地デジ（GR）とケーブル TV の BS/CS 再送信（ISDB-C）を 1 本の tuner にする。
-# <channel> には channels.yml の channel がそのまま入る: 地デジは物理 ch（'27'）、CATV は 'C56' のように C 付き。
+# <channel> には channels.yml の channel、<type> には type がそのまま入る（GR = 地デジ、BS / CS / SKY = ケーブル）。
+# <tsid> は channels.yml の commandVars.tsid（TSMF の TS を TS_id で選ぶ。無ければ空 = 自動）。未定義のプレースホルダは
+# 空文字になるので、値を取るオプションは `--opt=<var>` の形で書く。
 - name: PlutoSDR
   types:
     - GR
     - BS
     - CS
-  command: recpluto <channel> - -
-  # CATV で TS（TSMF の相対 TS 番号）を channels.yml から選ぶなら:
-  # command: recpluto --tsmf <tsmf> <channel> - -        （channels.yml の全項目に commandVars: { tsmf: N } を書く）
+    - SKY
+  command: recpluto --type=<type> --tsid=<tsid> <channel> - -
   # Pluto+ / LibreSDR を LAN で使う場合（"ip:" を含むので引用符が要る）:
-  # command: "recpluto --device ip:192.168.2.1 <channel> - -"
+  # command: "recpluto --device ip:192.168.2.1 --type=<type> --tsid=<tsid> <channel> - -"
   # ファーム pluto-fw-isdbt v2.0.1 以前（FPGA 前段の GI 相関器にオフセット）なら --fpga-eq 0 を足す
-  decoder: arib-b25-stream-test     # スクランブル解除は本リポジトリの範囲外。要らなければ省略
+  decoder: arib-b25-stream-test     # スクランブル解除は本リポジトリの範囲外。地デジだけで要らなければ省略
   isDisabled: false

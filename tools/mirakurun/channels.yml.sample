@@ -1,16 +1,22 @@
 # Mirakurun 4.x の channels.yml（recpluto 用）
 # 地デジは Mirakurun の走査 API で作れる:
 #   curl -X PUT "http://127.0.0.1:40772/api/config/channels/scan?type=GR&minCh=13&maxCh=52&refresh=true"
-# CATV（ISDB-C）は Mirakurun の走査対象外なので、`recpluto --scan catv` の出力（channel と MER）を元に書く。
-# serviceId は Mirakurun のサービス走査が埋める（type は BS / CS のどちらかに分ける）。
+# ケーブル TV の BS/CS 再送信（ISDB-C）は Mirakurun の走査対象外。BonDriver_BDA の .ch2 があれば
+#   python tools/mirakurun/ch2_to_channels.py BonDriver_BDA.ch2
+# で作れる。無ければ `recpluto --scan catv` でロックするチャンネルを出し、`recpluto --type=BS 56 25 /dev/null` の
+# status（streams の rel / tsid / onid）で TS を決める。serviceId は書かない（Mirakurun が SDT から全サービスを拾う）。
 - name: NHK総合
   type: GR
   channel: '27'          # UHF 物理チャンネル
-  commandVars: { tsmf: 0 }   # 地デジでは使わない（command に <tsmf> を書くなら 0 = 自動を付けておく）
-# CATV の 1 周波数には複数の TS が多重（TSMF）されていることがある。TS ごとに 1 項目書き、tuners.yml の
-# command を `recpluto --tsmf <tsmf> <channel> - -` にして相対 TS 番号（1〜15、0 = 自動）を渡す。
-# 乗っている TS（rel / tsid / onid: 4 = BS、6・7 = CS110）は `recpluto C56 25 /dev/null` の status で分かる。
-- name: NHK BS
+- name: ＮＨＫ　ＢＳ
   type: BS
-  channel: 'C56'         # ケーブル TV の物理チャンネル（C13〜C63）。BS/CS 再送信（ISDB-C トラモジ）
-  commandVars: { tsmf: 1 }
+  channel: '56'          # ケーブルの UHF 帯 56ch（731 MHz、ISDB-C）。type が BS / CS / SKY なら数字でもケーブル
+  commandVars: { tsid: 16625 }   # TSMF の TS を TS_id で選ぶ
+- name: ＷＯＷＯＷライブ
+  type: BS
+  channel: 'C41'         # ケーブルの C 帯 C41（333 MHz）
+  commandVars: { tsid: 17488 }
+- name: ショップチャンネル
+  type: SKY              # ケーブル局独自のネットワーク（networkID 65534 など）は SKY にしておく
+  channel: '29'
+  commandVars: { tsid: 48 }

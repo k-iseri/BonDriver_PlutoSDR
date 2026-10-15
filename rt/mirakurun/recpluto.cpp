@@ -24,8 +24,12 @@
 
 using namespace isdbt;
 using isdbt::mirakurun::ChannelLabel;
+using isdbt::mirakurun::HintFromSystem;
+using isdbt::mirakurun::HintFromType;
 using isdbt::mirakurun::ParseChannel;
+using isdbt::mirakurun::ScanTarget;
 using isdbt::mirakurun::ScanTargets;
+using isdbt::mirakurun::SystemHint;
 
 namespace {
 
@@ -36,10 +40,15 @@ void Usage() {
     std::fprintf(stderr,
         "usage: recpluto [options] <channel> <rectime> <destfile>\n"
         "       recpluto [options] --scan [gr|catv|all|gr:24-27|catv:C13-C63]\n"
-        "  channel   地デジ UHF 物理チャンネル 13..62、またはケーブル TV トラモジ（BS/CS 再送信）C13..C63\n"
+        "  channel   UHF 物理チャンネル 13..62、またはケーブル TV の C 帯 C13..C63。数字は --type / --system が\n"
+        "            無ければ地デジ、BS / CS / SKY か isdbc ならケーブルの UHF 帯トラモジ（BS/CS 再送信）\n"
         "  rectime   秒数、- で止めるまで（SIGTERM / SIGINT で止まる）\n"
         "  destfile  ファイル名、- で標準出力\n"
         "options:\n"
+        "  --type GR|BS|CS|SKY Mirakurun の <type>（GR = 地デジ、他 = ケーブル）。--type=<type> と書ける\n"
+        "  --system isdbt|isdbc 方式を直接指定（--type より優先）\n"
+        "  --tsid N            ISDB-C: TSMF の TS を TS_id で選ぶ（--onid N も合わせられる）。--tsid=<tsid> と書け、\n"
+        "                      値が空か 0 なら自動（--tsmf と同じ）\n"
         "  --device URI        libiio の URI (default usb:)。Pluto+ / LibreSDR の LAN なら ip:192.168.2.1\n"
         "  --fpga-eq auto|0|1  FPGA 前段（pluto-fw-isdbt v2）を使う (default auto)\n"
         "  --gain F | hw       手動ゲイン dB / AD936x の slow_attack AGC。省略時はソフト AGC\n"
@@ -66,27 +75,27 @@ bool WaitLock(LiveSwitch* live, double wait_s, double* signal_db) {
     return false;
 }
 
-int Scan(LiveSwitch* live, const std::vector<std::string>& targets, double wait_s, bool verbose) {
+int Scan(LiveSwitch* live, const std::vector<ScanTarget>& targets, double wait_s, bool verbose) {
     std::printf("# recpluto --scan: 受信できたチャンネル（channels.yml の形式。name は局名に書き換える）\n");
     int found = 0;
-    for (const std::string& t : targets) {
+    for (const ScanTarget& t : targets) {
         if (g_stop) break;
         System sys;
         int ch;
         double freq;
-        if (!ParseChannel(t, &sys, &ch, &freq)) continue;
+        if (!ParseChannel(t.channel, t.hint, &sys, &ch, &freq)) continue;
         live->TuneSystem(sys, true, ch, freq);
         double sig = 0.0;
         const bool ok = WaitLock(live, wait_s, &sig);
         const std::string label = ChannelLabel(sys, ch);
-        if (verbose) std::fprintf(stderr, "%-5s %7.3f MHz  %s  %.1f dB\n", label.c_str(), freq / 1e6, ok ? "locked" : "-", sig);
+        if (verbose) std::fprintf(stderr, "%-5s %-5s %7.3f MHz  %s  %.1f dB\n", SystemName(sys), label.c_str(), freq / 1e6, ok ? "locked" : "-", sig);
         if (!ok) continue;
         ++found;
         if (sys == System::kIsdbt) {
             std::printf("- name: GR%s\n  type: GR\n  channel: '%s'          # MER %.1f dB\n", label.c_str(), label.c_str(), sig);
         } else {
             // BS/CS の区別と serviceId は TS を見て決める（Mirakurun はサービス走査で埋める）
-            std::printf("- name: %s\n  type: BS\n  channel: '%s'          # ISDB-C MER %.1f dB。CS なら type: CS\n", label.c_str(), label.c_str(), sig);
+            std::printf("- name: %s\n  type: BS\n  channel: '%s'          # ISDB-C MER %.1f dB。CS なら type: CS、TS は commandVars の tsid で選ぶ\n", label.c_str(), label.c_str(), sig);
         }
         std::fflush(stdout);
     }
@@ -148,42 +157,75 @@ int main(int argc, char** argv) {
     int win_frames = 8, ctx_frames = 4, workers = 3;
     isdbc::TsmfDemux::Select ts_sel;
     std::vector<std::string> pos;
+    SystemHint hint = SystemHint::kAuto;
+    bool hint_from_system = false;
     auto next = [&](int& i) -> std::string {
         if (i + 1 >= argc) { Usage(); std::exit(2); }
         return argv[++i];
     };
     for (int i = 1; i < argc; ++i) {
-        const std::string a = argv[i];
-        if (a == "--device") sdr_cfg.uri = next(i);
-        else if (a == "--fs") sdr_cfg.fs = std::atof(next(i).c_str());
-        else if (a == "--bw") { sdr_cfg.bw = std::atof(next(i).c_str()); bw_fixed = true; }
+        std::string a = argv[i];
+        // Mirakurun の command は未定義のプレースホルダが空になるので、--tsid=<tsid> のような "=" 形式を受ける
+        std::string eq_value;
+        bool has_eq = false;
+        if (a.size() > 2 && a[0] == '-' && a[1] == '-') {
+            const size_t eq = a.find('=');
+            if (eq != std::string::npos) { eq_value = a.substr(eq + 1); a.resize(eq); has_eq = true; }
+        }
+        auto value = [&]() -> std::string { return has_eq ? eq_value : next(i); };
+        if (a.empty()) continue;
+        if (a == "--device") sdr_cfg.uri = value();
+        else if (a == "--type") {
+            const std::string t = value();
+            SystemHint h;
+            if (!t.empty() && !HintFromType(t, &h)) { std::fprintf(stderr, "bad --type: %s\n", t.c_str()); return 2; }
+            if (!t.empty() && !hint_from_system) hint = h;
+        }
+        else if (a == "--system") {
+            const std::string v = value();
+            if (!HintFromSystem(v, &hint)) { std::fprintf(stderr, "bad --system: %s\n", v.c_str()); return 2; }
+            hint_from_system = hint != SystemHint::kAuto;
+        }
+        else if (a == "--tsid") {
+            const std::string v = value();
+            const long n = v.empty() ? 0 : std::atol(v.c_str());
+            ts_sel.tsid = n > 0 ? static_cast<int>(n) : -1;
+        }
+        else if (a == "--onid") {
+            const std::string v = value();
+            const long n = v.empty() ? 0 : std::atol(v.c_str());
+            ts_sel.onid = n > 0 ? static_cast<int>(n) : -1;
+        }
+        else if (a == "--fs") sdr_cfg.fs = std::atof(value().c_str());
+        else if (a == "--bw") { sdr_cfg.bw = std::atof(value().c_str()); bw_fixed = true; }
         else if (a == "--gain") {
-            const std::string g = next(i);
+            const std::string g = value();
             if (g == "hw") sdr_cfg.hw_agc = true;
             else { sdr_cfg.agc = false; sdr_cfg.gain_db = std::atof(g.c_str()); }
         }
-        else if (a == "--agc-target") sdr_cfg.agc_target_dbfs = std::atof(next(i).c_str());
-        else if (a == "--fpga-eq") { const std::string v = next(i); sdr_cfg.fpga_eq = (v == "0") ? 0 : (v == "1") ? 1 : -1; }
+        else if (a == "--agc-target") sdr_cfg.agc_target_dbfs = std::atof(value().c_str());
+        else if (a == "--fpga-eq") { const std::string v = value(); sdr_cfg.fpga_eq = (v == "0") ? 0 : (v == "1") ? 1 : -1; }
         else if (a == "--no-reconnect") sdr_cfg.reconnect = false;
-        else if (a == "--win-frames") win_frames = std::atoi(next(i).c_str());
-        else if (a == "--ctx-frames") ctx_frames = std::atoi(next(i).c_str());
-        else if (a == "--workers") workers = std::atoi(next(i).c_str());
-        else if (a == "--first-burst") first_burst_str = next(i);
+        else if (a == "--win-frames") win_frames = std::atoi(value().c_str());
+        else if (a == "--ctx-frames") ctx_frames = std::atoi(value().c_str());
+        else if (a == "--workers") workers = std::atoi(value().c_str());
+        else if (a == "--first-burst") first_burst_str = value();
         else if (a == "--tsmf" || a == "--rel-ts") {
-            const std::string v = next(i);
+            const std::string v = value();
             if (v == "all") ts_sel.pass_all = true;
             else ts_sel.rel = std::atoi(v.c_str());
         }
         else if (a == "--scan") {
             scan = true;
-            if (i + 1 < argc && argv[i + 1][0] != '-') scan_spec = next(i);
+            if (has_eq) scan_spec = eq_value;
+            else if (i + 1 < argc && argv[i + 1][0] != '-') scan_spec = next(i);
         }
-        else if (a == "--scan-wait") scan_wait = std::atof(next(i).c_str());
+        else if (a == "--scan-wait") scan_wait = std::atof(value().c_str());
         else if (a == "--quiet") quiet = true;
         else if (a == "--help" || a == "-h") { Usage(); return 0; }
         // recpt1 互換（無視）
         else if (a == "--b25" || a == "--strip" || a == "--EMM" || a == "--udp" || a == "--http") {}
-        else if (a == "--round" || a == "--sid" || a == "--addr" || a == "--port" || a == "--lnb") next(i);
+        else if (a == "--round" || a == "--sid" || a == "--addr" || a == "--port" || a == "--lnb") { if (!has_eq) next(i); }
         else if (a.size() > 1 && a[0] == '-' && a != "-") { Usage(); return 2; }
         else pos.push_back(a);
     }
@@ -192,17 +234,17 @@ int main(int argc, char** argv) {
     int ch = 0;
     double freq = 0.0, rectime = 0.0;
     std::string dest = "-";
-    std::vector<std::string> scan_targets;
+    std::vector<ScanTarget> scan_targets;
     if (scan) {
         if (!ScanTargets(scan_spec, &scan_targets) || scan_targets.empty()) {
             std::fprintf(stderr, "bad --scan: %s\n", scan_spec.c_str());
             return 2;
         }
-        if (!ParseChannel(scan_targets[0], &sys, &ch, &freq)) return 2;
+        if (!ParseChannel(scan_targets[0].channel, scan_targets[0].hint, &sys, &ch, &freq)) return 2;
     } else {
         if (pos.size() != 3) { Usage(); return 2; }
-        if (!ParseChannel(pos[0], &sys, &ch, &freq)) {
-            std::fprintf(stderr, "bad channel: %s（地デジ 13..62 か CATV C13..C63）\n", pos[0].c_str());
+        if (!ParseChannel(pos[0], hint, &sys, &ch, &freq)) {
+            std::fprintf(stderr, "bad channel: %s（UHF 13..62 か CATV C13..C63。ケーブルの UHF 帯は --type BS/CS か --system isdbc）\n", pos[0].c_str());
             return 2;
         }
         rectime = pos[1] == "-" ? 0.0 : std::atof(pos[1].c_str());
