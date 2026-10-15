@@ -243,9 +243,24 @@ void DecodeSoftBits(const Mat<float>& soft, const RxLayer& lyr, Mode mode,
 
 void DecodeSoftBitsRange(const Mat<float>& soft, const RxLayer& lyr, Mode mode, int head_tsp, int n_frames,
                          std::vector<uint8_t>* ts, std::vector<int>* nerr) {
-    std::vector<float> pairs;
-    const size_t steps = Depuncture(soft.data(), soft.size(), lyr.rate, &pairs);
-    std::vector<uint8_t> bits = ViterbiDecode(pairs.data(), steps);
+    static const bool profile = std::getenv("ISDBT_PROFILE") != nullptr;
+    auto now = [] { return std::chrono::steady_clock::now(); };
+    auto sec = [](auto a, auto b) { return std::chrono::duration<double>(b - a).count(); };
+    static const bool vcheck = std::getenv("ISDBT_VITERBI_CHECK") != nullptr;
+    const auto tp0 = now();
+    const auto tp1 = now();
+    std::vector<uint8_t> bits = ViterbiDecodeSoft(soft.data(), soft.size(), lyr.rate);
+    const size_t steps = bits.size();
+    const auto tp2 = now();
+    if (vcheck) {
+        std::vector<float> pairs;
+        const size_t st = Depuncture(soft.data(), soft.size(), lyr.rate, &pairs);
+        std::vector<uint8_t> ref = ViterbiDecode(pairs.data(), st);
+        size_t diff = 0;
+        const size_t m = std::min(ref.size(), bits.size());
+        for (size_t i = 0; i < m; ++i) diff += (ref[i] != bits[i]);
+        std::fprintf(stderr, "[vcheck] %s: %zu bits, %zu differ (sizes %zu / %zu)\n", lyr.name.c_str(), m, diff, bits.size(), ref.size());
+    }
 
     const size_t n_bytes = bits.size() / 8;
     std::vector<uint8_t> onair(n_bytes);
@@ -261,12 +276,18 @@ void DecodeSoftBitsRange(const Mat<float>& soft, const RxLayer& lyr, Mode mode, 
     std::vector<uint8_t> tsps(T * kRsN);
     if (T > 0) EnergyDescrambleLayer(deint.data() + head * kRsN, T, tsp_pf, tsps.data());
     nerr->resize(T);
+    const auto tp3 = now();
     if (T > 0) RsDecode(tsps.data(), T, nerr->data());
+    const auto tp4 = now();
 
     ts->resize(T * kTsPacket);
     for (size_t t = 0; t < T; ++t) {
         std::copy(tsps.begin() + t * kRsN, tsps.begin() + t * kRsN + kTsPacket,
                   ts->begin() + t * kTsPacket);
+    }
+    if (profile) {
+        std::fprintf(stderr, "[profile] %s: depunct %.3f viterbi %.3f (%zu steps) pack+deint+descr %.3f rs %.3f (%zu tsp)\n",
+                     lyr.name.c_str(), sec(tp0, tp1), sec(tp1, tp2), steps, sec(tp2, tp3), sec(tp3, tp4), T);
     }
 }
 

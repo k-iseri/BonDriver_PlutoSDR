@@ -45,6 +45,12 @@ private:
 // 一括復号（ref/isdbt/fec.py viterbi_decode 相当の使い方）。bits は 0/1 を 1 バイトずつ。
 std::vector<uint8_t> ViterbiDecode(const float* pairs, size_t n_steps);
 
+// ライブ経路用の速い版: デパンクチャを融合し（パンクチャ後の軟値列 soft をそのまま受ける）、
+// 軟値を ±31 に量子化して 8bit コスト × 32 レーンの AVX2 で復号する。出力は ViterbiDecode と同じ形式。
+// 量子化（平均振幅を 12、約 2.6 倍で飽和）で判定が変わるのはごく稀で、AVX2 が無いビルドでは
+// Depuncture + ViterbiDecode に落ちる
+std::vector<uint8_t> ViterbiDecodeSoft(const float* soft, size_t n, CodeRate rate);
+
 // --- バイトデインターリーブ（3.7 の逆: ブランチ b を 11 - b TSP 遅延） ---
 // in/out は (n, 204)。先頭 11 TSP は履歴が無く不定（0 由来）。
 void ByteDeinterleave(const uint8_t* in, size_t n_tsp, uint8_t* out);

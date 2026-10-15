@@ -2,6 +2,10 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #ifdef __AVX2__
@@ -214,6 +218,211 @@ std::vector<uint8_t> ViterbiDecode(const float* pairs, size_t n_steps) {
     dec.Feed(pairs, n_steps, &bits);
     dec.Flush(&bits);
     return bits;
+}
+
+// ---------------------------------------------------------------------------
+// 8bit 計量の AVX2 ビタビ（デパンクチャ融合、ライブ経路用）
+// ---------------------------------------------------------------------------
+// 64 状態を 8bit 符号なし「コスト」× 32 レーン × 2 ベクタで持つ。軟値は ±31 に量子化し、枝コストは
+// (31 − sx·X) + (31 − sy·Y) ∈ [0, 124]。毎 2 ステップで最小コストを引いて 0 に戻すので、最良経路から
+// 255 以上劣る経路だけが飽和する（そういう経路は生き残らないので判定に影響しない）。
+// 判定ビットは cmpeq + movemask で 32 レーン分がそのまま取れ、16bit 版（packs で詰め直し）より速い。
+#ifdef __AVX2__
+namespace {
+
+class ViterbiU8 {
+public:
+    static constexpr int kStates = 64;
+    static constexpr size_t kWindow = 1 << 16;
+    static constexpr size_t kTail = 192;
+    static constexpr int kQ = 31;                   // 軟値の量子化幅（±kQ）
+
+    ViterbiU8() {
+        // 枝コスト表 {k=0: (Q−X)+(Q−Y), 1: (Q−X)+(Q+Y), 2: (Q+X)+(Q−Y), 3: (Q+X)+(Q+Y)} を pshufb で引く添字。
+        // k = sx_neg*2 + sy_neg（FeedScalar の bm_index と同じ定義）
+        for (int s_new = 0; s_new < kStates; ++s_new) {
+            const int u = s_new >> 5;
+            for (int b = 0; b < 2; ++b) {
+                const int s_old = ((s_new & 0x1F) << 1) | b;
+                const unsigned r = static_cast<unsigned>((u << 6) | s_old);
+                const int k = Parity(r & kConvG1) * 2 + Parity(r & kConvG2);
+                shuf_[b][s_new >> 5][s_new & 31] = static_cast<uint8_t>(k);
+            }
+        }
+        for (uint8_t& c : pm_) c = 0;
+        // 枝コスト表: (X, Y) ∈ [−Q, Q]² → {k=0..3} の 4 バイト（ステップごとの組み立てを表引き 1 回にする）
+        for (int x = -kQ; x <= kQ; ++x) {
+            for (int y = -kQ; y <= kQ; ++y) {
+                const uint32_t t0 = static_cast<uint32_t>((kQ - x) + (kQ - y));
+                const uint32_t t1 = static_cast<uint32_t>((kQ - x) + (kQ + y));
+                const uint32_t t2 = static_cast<uint32_t>((kQ + x) + (kQ - y));
+                const uint32_t t3 = static_cast<uint32_t>((kQ + x) + (kQ + y));
+                tab2d_[(x + kQ) * (2 * kQ + 1) + (y + kQ)] = t0 | (t1 << 8) | (t2 << 16) | (t3 << 24);
+            }
+        }
+    }
+
+    double t_scale = 0.0, t_tb = 0.0;       // ISDBT_PROFILE 用
+    void Run(const float* soft, size_t n, const PuncturePattern* pat, std::vector<uint8_t>* out) {
+        const auto tq0 = std::chrono::steady_clock::now();
+        // 量子化: 平均振幅を 12 に（±31 で飽和 = 平均の約 2.6 倍）
+        double acc = 0.0;
+        {
+            const __m256 absmask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
+            size_t i = 0;
+            for (; i + 4096 <= n; i += 4096) {          // 4096 値ごとに double へ足す（float 累積の丸めを抑える）
+                __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+                for (size_t k = 0; k < 4096; k += 16) {
+                    a0 = _mm256_add_ps(a0, _mm256_and_ps(_mm256_loadu_ps(soft + i + k), absmask));
+                    a1 = _mm256_add_ps(a1, _mm256_and_ps(_mm256_loadu_ps(soft + i + k + 8), absmask));
+                }
+                alignas(32) float tmp[8];
+                _mm256_store_ps(tmp, _mm256_add_ps(a0, a1));
+                for (float v : tmp) acc += v;
+            }
+            for (; i < n; ++i) acc += std::fabs(soft[i]);
+        }
+        const float scale = (acc > 0.0) ? static_cast<float>(12.0 * n / acc) : 1.0f;
+        // 一括量子化（32 値ずつ: 乗算 → 丸めて int32 → int16 → int8 に飽和 → ±Q にクランプ）
+        std::vector<int8_t> qs(n + 32);
+        {
+            const __m256 sc = _mm256_set1_ps(scale);
+            const __m256i qmax = _mm256_set1_epi8(static_cast<char>(kQ)), qmin = _mm256_set1_epi8(static_cast<char>(-kQ));
+            const __m256i fix = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+            size_t i = 0;
+            for (; i + 32 <= n; i += 32) {
+                const __m256i a = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(soft + i), sc));
+                const __m256i b = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(soft + i + 8), sc));
+                const __m256i c = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(soft + i + 16), sc));
+                const __m256i d = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(soft + i + 24), sc));
+                // packs は 128bit レーン内で詰めるので、最後に 32bit 単位で並べ直す
+                const __m256i ab = _mm256_packs_epi32(a, b);           // [a0-3 b0-3 | a4-7 b4-7]（16bit）
+                const __m256i cd = _mm256_packs_epi32(c, d);
+                __m256i v = _mm256_packs_epi16(ab, cd);                // [a0-3 b0-3 c0-3 d0-3 | a4-7 b4-7 c4-7 d4-7]
+                v = _mm256_permutevar8x32_epi32(v, fix);               // → a0-3 a4-7 b0-3 b4-7 c... d...
+                v = _mm256_min_epi8(_mm256_max_epi8(v, qmin), qmax);
+                _mm256_storeu_si256(reinterpret_cast<__m256i*>(&qs[i]), v);
+            }
+            for (; i < n; ++i) {
+                const float x = soft[i] * scale;
+                int r = static_cast<int>(x + (x >= 0 ? 0.5f : -0.5f));
+                r = r > kQ ? kQ : (r < -kQ ? -kQ : r);
+                qs[i] = static_cast<int8_t>(r);
+            }
+        }
+        const int8_t* qp = qs.data();
+        const size_t period = std::strlen(pat->x);
+        size_t sent = 0;
+        for (size_t i = 0; i < period; ++i) sent += (pat->x[i] == '1') + (pat->y[i] == '1');
+        const size_t blocks = n / sent;
+        t_scale += std::chrono::duration<double>(std::chrono::steady_clock::now() - tq0).count();
+
+        __m256i pm0 = _mm256_load_si256(reinterpret_cast<const __m256i*>(&pm_[0]));
+        __m256i pm1 = _mm256_load_si256(reinterpret_cast<const __m256i*>(&pm_[32]));
+        const __m256i deint_sh = _mm256_setr_epi8(0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15,
+                                                  0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15);
+        const __m256i sh00 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(shuf_[0][0]));
+        const __m256i sh01 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(shuf_[0][1]));
+        const __m256i sh10 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(shuf_[1][0]));
+        const __m256i sh11 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(shuf_[1][1]));
+        const __m256i zero = _mm256_setzero_si256();
+        int since_norm = 0;
+        __m256i norm_v = zero;                  // 前ステップのコストの最小値（全レーン）
+        size_t s = 0;
+        for (size_t blk = 0; blk < blocks; ++blk) {
+            for (size_t i = 0; i < period; ++i) {
+                const int X = (pat->x[i] == '1') ? qp[s++] : 0;
+                const int Y = (pat->y[i] == '1') ? qp[s++] : 0;
+                const __m256i tab = _mm256_set1_epi32(static_cast<int>(tab2d_[(X + kQ) * (2 * kQ + 1) + (Y + kQ)]));
+                // 旧コストを偶数 state（A = old[2j]）と奇数 state（B = old[2j+1]）に分離（j = 0..31）
+                const __m256i a = _mm256_shuffle_epi8(pm0, deint_sh);      // 128bit レーンごとに [偶 8 | 奇 8]
+                const __m256i b = _mm256_shuffle_epi8(pm1, deint_sh);
+                const __m256i A = _mm256_permute4x64_epi64(_mm256_unpacklo_epi64(a, b), 0xD8);
+                const __m256i B = _mm256_permute4x64_epi64(_mm256_unpackhi_epi64(a, b), 0xD8);
+                // 新 state 0..31（u=0）と 32..63（u=1）。どちらも前者は同じ (A, B)、枝コストだけ違う
+                const __m256i c00 = _mm256_adds_epu8(A, _mm256_shuffle_epi8(tab, sh00));
+                const __m256i c10 = _mm256_adds_epu8(B, _mm256_shuffle_epi8(tab, sh10));
+                const __m256i c01 = _mm256_adds_epu8(A, _mm256_shuffle_epi8(tab, sh01));
+                const __m256i c11 = _mm256_adds_epu8(B, _mm256_shuffle_epi8(tab, sh11));
+                pm0 = _mm256_min_epu8(c00, c10);
+                pm1 = _mm256_min_epu8(c01, c11);
+                // pick1 = c1 < c0 ⇔ c0 − c1 > 0（飽和減算）⇔ NOT (c0 −sat c1 == 0)
+                const uint32_t le0 = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_subs_epu8(c00, c10), zero)));
+                const uint32_t le1 = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_subs_epu8(c01, c11), zero)));
+                dec_.push_back(static_cast<uint64_t>(static_cast<uint32_t>(~le0)) | (static_cast<uint64_t>(static_cast<uint32_t>(~le1)) << 32));
+                // 正規化: 2 ステップで最大 248 増えるので 2 ステップごとに最小値を引く。最小値は 1 ステップ前の
+                // コスト（min_prev）から求めておき、今のコストから引く（フォールドの遅延を ACS と重ねる）。
+                // 最良経路のコストは min_prev + 124 以下、その他は飽和しても判定に影響しない
+                ++since_norm;
+                if (since_norm == 1) {
+                    __m256i m = _mm256_min_epu8(pm0, pm1);
+                    __m128i m8 = _mm_min_epu8(_mm256_castsi256_si128(m), _mm256_extracti128_si256(m, 1));
+                    m8 = _mm_min_epu8(m8, _mm_srli_si128(m8, 8));
+                    m8 = _mm_min_epu8(m8, _mm_srli_si128(m8, 4));
+                    m8 = _mm_min_epu8(m8, _mm_srli_si128(m8, 2));
+                    m8 = _mm_min_epu8(m8, _mm_srli_si128(m8, 1));
+                    norm_v = _mm256_broadcastb_epi8(m8);
+                } else {
+                    pm0 = _mm256_subs_epu8(pm0, norm_v);
+                    pm1 = _mm256_subs_epu8(pm1, norm_v);
+                    since_norm = 0;
+                }
+                if (dec_.size() >= kWindow + kTail) {
+                    _mm256_store_si256(reinterpret_cast<__m256i*>(&pm_[0]), pm0);
+                    _mm256_store_si256(reinterpret_cast<__m256i*>(&pm_[32]), pm1);
+                    Traceback(kWindow, out);
+                }
+            }
+        }
+        _mm256_store_si256(reinterpret_cast<__m256i*>(&pm_[0]), pm0);
+        _mm256_store_si256(reinterpret_cast<__m256i*>(&pm_[32]), pm1);
+        if (!dec_.empty()) Traceback(dec_.size(), out);
+    }
+
+private:
+    void Traceback(size_t n_emit, std::vector<uint8_t>* out) {
+        const auto tt0 = std::chrono::steady_clock::now();
+        const size_t n = dec_.size();
+        int state = static_cast<int>(std::min_element(pm_, pm_ + kStates) - pm_);   // コスト最小
+        std::vector<uint8_t> bits(n);
+        for (size_t t = n; t-- > 0;) {
+            bits[t] = static_cast<uint8_t>(state >> 5);
+            const int b = static_cast<int>((dec_[t] >> state) & 1);
+            state = ((state & 0x1F) << 1) | b;
+        }
+        out->insert(out->end(), bits.begin(), bits.begin() + n_emit);
+        dec_.erase(dec_.begin(), dec_.begin() + n_emit);
+        t_tb += std::chrono::duration<double>(std::chrono::steady_clock::now() - tt0).count();
+    }
+
+    alignas(32) uint8_t pm_[kStates];
+    alignas(32) uint8_t shuf_[2][2][32];
+    uint32_t tab2d_[(2 * kQ + 1) * (2 * kQ + 1)];
+    std::vector<uint64_t> dec_;
+};
+
+}  // namespace
+#endif  // __AVX2__
+
+std::vector<uint8_t> ViterbiDecodeSoft(const float* soft, size_t n, CodeRate rate) {
+    const PuncturePattern* pat = FindPuncture(rate);
+    assert(pat);
+#ifdef __AVX2__
+    std::vector<uint8_t> bits;
+    ViterbiU8 dec;
+    const auto tr0 = std::chrono::steady_clock::now();
+    dec.Run(soft, n, pat, &bits);
+    static const bool profile = std::getenv("ISDBT_PROFILE") != nullptr;
+    if (profile && n > 1000000) {
+        const double total = std::chrono::duration<double>(std::chrono::steady_clock::now() - tr0).count();
+        std::fprintf(stderr, "[viterbi] total %.3f scale %.3f traceback %.3f acs %.3f (%zu bits)\n", total, dec.t_scale, dec.t_tb, total - dec.t_scale - dec.t_tb, bits.size());
+    }
+    return bits;
+#else
+    std::vector<float> pairs;
+    const size_t steps = Depuncture(soft, n, rate, &pairs);
+    return ViterbiDecode(pairs.data(), steps);
+#endif
 }
 
 // ---------------------------------------------------------------------------
