@@ -50,7 +50,7 @@ Pluto は 1 台で 1 チャンネルなので、地デジと CATV を同じ 1 �
 # tuners.yml
 - name: PlutoSDR
   types: [GR, BS, CS]
-  command: "isdbtd --sdr usb: --system <system> --ch <channel> --stdout --quiet"   # "usb:" を含むので引用符必須
+  command: "isdbtd --sdr usb: --system <system> --fpga-eq 0 --ch <channel> --stdout --quiet"   # "usb:" を含むので引用符必須
   decoder: arib-b25-stream-test     # スクランブル解除は本リポジトリの範囲外。要らなければ省略
   isDisabled: false
 ```
@@ -66,6 +66,10 @@ Pluto は 1 台で 1 チャンネルなので、地デジと CATV を同じ 1 �
   serviceId: 101
   commandVars: { system: isdbc }
 ```
+
+`--fpga-eq 0` は FPGA 前段（pluto-fw-isdbt v2）を使わず raw 経路で復調する指定。前段はソフト AGC 既定の
+−24 dBFS で MER が約 8 dB 落ちて 64QAM が全滅するため（docs/hw-setup.md「受信ゲイン」）、直るまで付けておく。
+CPU は Apple M5 で約 1.8 コア（前段ありなら約 1 コア）。
 
 CATV は 1 周波数に複数 TS が多重（TSMF）されている局がある。isdbtd は既定で最小番号の TS を選んで
 188 バイト TS にして出す。Mirakurun 側の `tsmfRelTs`（1〜15）で選ばせたい場合は command に

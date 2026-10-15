@@ -109,6 +109,12 @@ AD936x 内蔵の slow_attack AGC は帯域内レベルを約 −11 dBFS に保�
 （`tools/iq_record.py`）。弱い空中線では目標に届かずゲインが上限（73 dB）まで上がるので、
 ソフト AGC は従来の AGC の上位互換になる。
 
+**FPGA 前段（等化モード）では −24 dBFS は低すぎる（2026-10-15 実測、27ch、同一ゲイン 24 dB）**: raw 経路
+A 25.3 / B 26.2 dB に対し FPGA 経路は A 15.5 / B 17.8 dB で B 階層 RS が全滅する。ゲイン 30 dB（−18 dBFS）で
+B 22.9 dB、40 dB（−9.5 dBFS）で 19.8 dB、50 dB は圧縮。ゲインを上げると C/N が改善するのでゲインに比例しない
+雑音床（FPGA 内の固定小数点量子化）が疑われる。上の表は raw 経路の値で、FPGA 経路では未調整。当面は
+`--fpga-eq 0` か `--agc-target -18` で回避する（docs/decisions.md 2026-10-15）。
+
 ## 未検証のまま残っているもの
 - `--bits 8`（tezuka_fw の complex 8bit モード）: 本機は独自ビルド v0.39 のため
   モードがあるか不明。また record_8bit は libiio 0.x の Buffer API で書かれており、

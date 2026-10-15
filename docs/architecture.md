@@ -84,6 +84,9 @@ Pluto SDR Nano（XC7Z010）: ADC → GI 相関同期 → CFO 回転 → FFT 8192
 - CPU（isdbtd、ch 24）: raw ホスト復調 2.7 コア → 前段あり 1.04 → 範囲復号 0.72 → ビタビ 8bit 0.58 → RS SIMD 0.51
   → 量子化 1 パス 0.43 → 干渉検出 1 パス 0.38 → 32bit 詰め 0.30 コア。残りはビタビ 0.19・デマップ 0.12・
   デインターリーブ 0.06 s / 1.8 s。`ISDBT_PROFILE=1` で段ごとの時間、`ISDBT_VITERBI_CHECK=1` で float 版ビタビとの突き合わせ。
+- **既知の問題**: 帯域内 −24 dBFS（ソフト AGC 既定）では raw 経路より MER が約 8 dB 悪く、−18 dBFS でも 3〜5 dB
+  悪い（docs/hw-setup.md「受信ゲイン」）。入力スケーリングかビット幅の固定小数点雑音と見ており、直るまでは
+  `--fpga-eq 0` か `--agc-target -18`。
 - 7010 で残る選択肢（デマップの FPGA 化、TMCC 復号）は数 % の効果。後段（ビタビ・RS）の FPGA 化は時間デインターリーブ
   （6.4 MB）が BRAM に入らず 7020 向け（pluto-fw-isdbt docs/design-v2.md）。
 - 検証ツール: `tools/fe_fft_test.py`（FFT テストモードのループバック）、`fe_sync_test.py`（同期モード）、
