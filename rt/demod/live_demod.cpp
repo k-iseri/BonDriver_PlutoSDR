@@ -397,24 +397,23 @@ void LiveDemod::SchedLoop() {
             const size_t adv_syms = static_cast<size_t>(cur_new) * kSymbolsPerFrame;
             cur_new = new_frames_;
             const int total = ModeParamsOf(mode_).total_carriers;
-            auto D = std::make_shared<Mat<cfloat>>(win_syms, static_cast<size_t>(total));
-            auto csi = std::make_shared<Mat<float>>(win_syms, static_cast<size_t>(total));
+            // {I8, Q8, CSI8} を 32bit に詰めたまま後段へ（cfloat/float に広げない）
+            auto P = std::make_shared<Mat<uint32_t>>(win_syms, static_cast<size_t>(total));
             for (size_t r = 0; r < win_syms; ++r) {
                 const uint8_t* raw = acc_sym[r].raw.data();
-                cfloat* d = (*D)[r];
-                float* c = (*csi)[r];
+                uint32_t* d = (*P)[r];
                 for (int k = 0; k < total; ++k) {
-                    d[k] = cfloat(static_cast<int8_t>(raw[k * 3]) / 64.0f, static_cast<int8_t>(raw[k * 3 + 1]) / 64.0f);
-                    c[k] = raw[k * 3 + 2] / 64.0f;
+                    d[k] = static_cast<uint32_t>(raw[k * 3]) | (static_cast<uint32_t>(raw[k * 3 + 1]) << 8) |
+                           (static_cast<uint32_t>(raw[k * 3 + 2]) << 16);
                 }
             }
             WindowJob job;
             job.gen = cur_gen;
             // FPGA のサンプルカウンタは公称レート。Emit は入力サンプル単位で継ぐので換算しておく
             job.abs0 = static_cast<long long>(std::llround(static_cast<double>(acc_sym[0].start) * in_per_nominal_));
-            job.fut = std::async(std::launch::async, [this, D, csi, fec_frames]() -> std::shared_ptr<DemodResult> {
+            job.fut = std::async(std::launch::async, [this, P, fec_frames]() -> std::shared_ptr<DemodResult> {
                 try {
-                    return std::make_shared<DemodResult>(DemodulateEqualized(*D, *csi, mode_, 6, fec_frames));
+                    return std::make_shared<DemodResult>(DemodulateEqualizedPacked(P.get(), mode_, fec_frames));
                 } catch (const std::exception&) {
                     return nullptr;
                 }

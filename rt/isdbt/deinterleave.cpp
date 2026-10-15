@@ -62,6 +62,42 @@ Mat<T> DataToLogical(const Mat<T>& D, Mode mode, int frame_start) {
 }
 
 template <typename T>
+Mat<T> DataToLogicalDeintRange(const Mat<T>& D, Mode mode, int frame_start,
+                               const std::vector<std::vector<int>>& groups, size_t row0, size_t row1) {
+    const GatherTable& gt = GatherOf(mode);
+    const int dc = LayoutOf(mode).dc;
+    const size_t n_cols = gt.idx[0].size();
+    std::vector<int> colperm(n_cols);
+    for (size_t j = 0; j < n_cols; ++j) colperm[j] = static_cast<int>(j);
+    for (const auto& group : groups) {
+        const int n = static_cast<int>(group.size());
+        if (n < 2) continue;
+        for (int k = 0; k < n; ++k) {
+            for (int c = 0; c < dc; ++c) {
+                const int q = k * dc + c;
+                colperm[static_cast<size_t>(group[k]) * dc + c] = group[q % n] * dc + q / n;
+            }
+        }
+    }
+    std::vector<int> idx2[kSpSymbolPeriod];
+    for (int p = 0; p < kSpSymbolPeriod; ++p) {
+        idx2[p].resize(n_cols);
+        for (size_t j = 0; j < n_cols; ++j) idx2[p][j] = gt.idx[p][static_cast<size_t>(colperm[j])];
+    }
+    row1 = std::min(row1, D.rows);
+    Mat<T> out(row1 > row0 ? row1 - row0 : 0, n_cols);
+    for (size_t n = row0; n < row1; ++n) {
+        int p = (static_cast<int>(n) - frame_start) % kSpSymbolPeriod;
+        if (p < 0) p += kSpSymbolPeriod;
+        const int* idx = idx2[p].data();
+        const T* src = D[n];
+        T* dst = out[n - row0];
+        for (size_t j = 0; j < n_cols; ++j) dst[j] = src[idx[j]];
+    }
+    return out;
+}
+
+template <typename T>
 Mat<T> DataToLogicalDeint(const Mat<T>& D, Mode mode, int frame_start, const std::vector<std::vector<int>>& groups) {
     const GatherTable& gt = GatherOf(mode);
     const int dc = LayoutOf(mode).dc;
@@ -226,6 +262,68 @@ Mat<float> LayerSoftBits(const Mat<cfloat>& Xt, const Mat<float>& Wt,
     return out;
 }
 
+std::vector<int8_t> LayerSoftBitsQPacked(const Mat<uint32_t>& Xt, const std::vector<int>& rows,
+                                         const std::vector<int>& segments, Modulation mod, Mode mode, int q) {
+    const int dc = LayoutOf(mode).dc;
+    const int bps = BitsPerSymbol(mod);
+    const size_t slots_per_row = segments.size() * static_cast<size_t>(dc);
+    const size_t n_slots = rows.size() * slots_per_row;
+    const int* delays = BitInterleaveDelays(mod);
+    int d[8] = {};
+    for (int i = 0; i < bps; ++i) d[i] = kBitInterleaveMaxDelay - delays[i];
+    auto unpack = [](uint32_t p, float* w) -> cfloat {
+        *w = static_cast<float>((p >> 16) & 0xFF) * (1.0f / 64.0f);
+        return cfloat(static_cast<int8_t>(p & 0xFF) * (1.0f / 64.0f), static_cast<int8_t>((p >> 8) & 0xFF) * (1.0f / 64.0f));
+    };
+
+    double acc = 0.0;
+    size_t cnt = 0;
+    {
+        float tmp[8];
+        size_t t = 0;
+        for (int r : rows) {
+            const uint32_t* xr = Xt[r];
+            for (int s : segments) {
+                for (int c = 0; c < dc; ++c, ++t) {
+                    if (t % 61 != 0) continue;
+                    float w;
+                    const cfloat x = unpack(xr[static_cast<size_t>(s) * dc + c], &w);
+                    DemapSoft(x, mod, tmp);
+                    for (int i = 0; i < bps; ++i) acc += std::fabs(tmp[i] * w);
+                    cnt += static_cast<size_t>(bps);
+                }
+            }
+        }
+    }
+    const float scale = (acc > 0.0) ? static_cast<float>(12.0 * static_cast<double>(cnt) / acc) : 1.0f;
+    const float qmax = static_cast<float>(q), qmin = -static_cast<float>(q);
+
+    std::vector<int8_t> out(n_slots * static_cast<size_t>(bps));
+    alignas(32) float ring[128][8];
+    size_t t = 0;
+    for (int r : rows) {
+        const uint32_t* xr = Xt[r];
+        for (int s : segments) {
+            for (int c = 0; c < dc; ++c, ++t) {
+                float* cur = ring[t & 127];
+                float w;
+                const cfloat x = unpack(xr[static_cast<size_t>(s) * dc + c], &w);
+                DemapSoft(x, mod, cur);
+                w *= scale;
+                for (int i = 0; i < bps; ++i) cur[i] *= w;
+                int8_t* o = out.data() + t * static_cast<size_t>(bps);
+                for (int i = 0; i < bps; ++i) {
+                    const size_t di = static_cast<size_t>(d[i]);
+                    float v = (t >= di) ? ring[(t - di) & 127][i] : 0.0f;
+                    v = v > qmax ? qmax : (v < qmin ? qmin : v);
+                    o[i] = static_cast<int8_t>(static_cast<int>(v + (v >= 0 ? 0.5f : -0.5f)));
+                }
+            }
+        }
+    }
+    return out;
+}
+
 std::vector<int8_t> LayerSoftBitsQ(const Mat<cfloat>& Xt, const Mat<float>& Wt,
                                    const std::vector<int>& rows, const std::vector<int>& segments,
                                    Modulation mod, Mode mode, int q) {
@@ -294,6 +392,8 @@ template Mat<cfloat> TimeDeinterleaveFrom<cfloat>(const Mat<cfloat>&, Mode, cons
 template Mat<float> TimeDeinterleaveFrom<float>(const Mat<float>&, Mode, const int[kNSegments], size_t);
 template Mat<cfloat> DataToLogicalDeint<cfloat>(const Mat<cfloat>&, Mode, int, const std::vector<std::vector<int>>&);
 template Mat<float> DataToLogicalDeint<float>(const Mat<float>&, Mode, int, const std::vector<std::vector<int>>&);
+template Mat<uint32_t> DataToLogicalDeintRange<uint32_t>(const Mat<uint32_t>&, Mode, int, const std::vector<std::vector<int>>&, size_t, size_t);
+template Mat<uint32_t> TimeDeinterleaveFrom<uint32_t>(const Mat<uint32_t>&, Mode, const int[kNSegments], size_t);
 template void IntersegmentDeinterleave<cfloat>(Mat<cfloat>*, Mode, const std::vector<std::vector<int>>&);
 template void IntersegmentDeinterleave<float>(Mat<float>*, Mode, const std::vector<std::vector<int>>&);
 

@@ -101,6 +101,10 @@ private:
 // 復号し直さずに済む（CPU 約 −30 %）。ウィンドウは (F0 + fec_frames) フレーム + 末尾 kFecTailSymbols 以上必要
 DemodResult DemodulateEqualized(const Mat<cfloat>& D, const Mat<float>& csi, Mode mode,
                                 int block_frames = 6, int fec_frames = -1);
+// FPGA 前段の等化済みキャリアを {I8, Q8, CSI8, 0}（下位バイトから）の 32bit に詰めたまま後段を通す範囲復号
+// （ライブ用）。I/Q は 1/64 単位の int8、CSI は 1/64 単位の uint8。cfloat/float の行列を作らないので、
+// デインターリーブのメモリ往復が 3 分の 1 になる。結果は DemodulateEqualized の範囲復号と同じ形式
+DemodResult DemodulateEqualizedPacked(Mat<uint32_t>* P, Mode mode, int fec_frames);
 // 範囲復号の助走。先頭はバイトデインターリーブの履歴 11 TSP + ビタビの立ち上がりを含み、どの階層でも
 // TSP 境界に揃うシンボル数（102 = 51 × 2: TSP/フレーム が 4 の倍数なら 102 × tpf / 204 は整数）
 inline constexpr int kFecHeadSymbols = 102;
