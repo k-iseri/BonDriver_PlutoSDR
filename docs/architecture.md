@@ -62,6 +62,31 @@ I/Q (任意 fs)
 - ビルドは `make rt`（rt/build.ps1 → vswhere で CMake/MSVC を探す）。出力は
   rt/build/rt-x64/Release/ の rt_test.exe / isdbtd.exe。
 
+## FPGA 前段経路（pluto-fw-isdbt v2、2026-10-15 実装）
+```
+Pluto SDR Nano（XC7Z010）: ADC → GI 相関同期 → CFO 回転 → FFT 8192 → SP 等化（CSI 付き）→ {I8, Q8, CSI8} × 5617 / シンボル
+  ── USB 14.9 MB/s ──
+ホスト rt/: 32bit 詰めのまま 干渉検出 → 論理変換+セグメント間（1 gather）→ 時間デインターリーブ（必要行だけ）
+  → デマップ+ビットデインターリーブ+±31 量子化（1 パス、int8）→ ビタビ（8bit コスト × 32 レーン AVX2、デパンクチャ融合）
+  → バイトデインターリーブ → 逆拡散 → RS（32 TSP 同時 AVX2）→ TS
+```
+- `rt/demod/sdr_source` が CAPS bit3 で前段の有無を見て自動で使う（ini `[SDR] FpgaEq=auto`）。手順は raw でソフト
+  AGC 約 1 秒 → モード 3（同期 FFT）の 16 窓から整数 CFO δ → モード 0 を 260 ms → EQ_CTRL / モード 4。モード 3/4 中は
+  ファームの ADC レベル計（0x54）でソフト AGC を回し続ける。CATV（ISDB-C）は raw のまま（前段を止める）。
+- `rt/demod/live_demod` はウィンドウ（文脈 3 + 新規 8 + 1 フレーム + 16 シンボル）を `DemodulateEqualizedPacked`
+  に渡し、**範囲復号**（`DecodeRangePacked`）で出力する 8 フレーム + 助走（先頭 102・末尾 8 シンボル）だけを
+  デマップ〜RS にかける。先頭助走はバイトデインターリーブの履歴 11 TSP とビタビの立ち上がりを含み、どの階層でも
+  TSP 境界に揃う長さ。出力は完全なフレームだけ（`DemodResult::emit_first / emit_end`）なので Emit がそのまま継ぐ。
+- ロック前の信号レベルは等化済みシンボルの TMCC / AC1 キャリア（DBPSK ±4/3）から 64 シンボルごとに MER を出す
+  （TVTest のスキャンは選局 5 秒後に 7 dB 未満だと次へ進むため）。
+- CPU（isdbtd、ch 24）: raw ホスト復調 2.7 コア → 前段あり 1.04 → 範囲復号 0.72 → ビタビ 8bit 0.58 → RS SIMD 0.51
+  → 量子化 1 パス 0.43 → 干渉検出 1 パス 0.38 → 32bit 詰め 0.30 コア。残りはビタビ 0.19・デマップ 0.12・
+  デインターリーブ 0.06 s / 1.8 s。`ISDBT_PROFILE=1` で段ごとの時間、`ISDBT_VITERBI_CHECK=1` で float 版ビタビとの突き合わせ。
+- 7010 で残る選択肢（デマップの FPGA 化、TMCC 復号）は数 % の効果。後段（ビタビ・RS）の FPGA 化は時間デインターリーブ
+  （6.4 MB）が BRAM に入らず 7020 向け（pluto-fw-isdbt docs/design-v2.md）。
+- 落とし穴: ファーム v2.0.0 の窓開始サンプル番号は下位 32bit だけ（528 秒で一周）。ホストで周回を数え（v1.3.1）、
+  ファーム v2.0.1 で 64bit 化。モード 3 → 4 を直接切り替えると時間軸がずれるのでモード 0 を挟む。
+
 ## TVTest / EDCB 連携（BonDriver、2026-10-02 実装）
 ```
 TVTest / EDCB
@@ -94,6 +119,10 @@ I/Q (任意 fs)
 - `rt/isdbc/` は同じ推定器を逐次化（入力レートの多相 RRC 補間でシンボル直接抽出、O&M をブロックごと、
   LS 等化をチャンクごとに再解）。`rt/demod/live_isdbc` は 1 ワーカーの逐次復調（ウィンドウ分割不要、
   レイテンシ < 0.5 s）。`rt/demod/live_switch` が地デジ / ISDB-C を 1 台の SDR で切り替える。
+- rt 側の軽量化（2026-10-15）: RS は 32 TSP ずつ溜めて AVX2 版に渡す（Feed ブロック末尾で端数を Flush）、LS の
+  R 蓄積は位相ブロック末尾で float 積和、FFE の実部・虚部積和を 1 ループに、AGC 利得は 64 シンボルごと。
+  ch 55 で約 0.5 コア。残りは位相ブロック（判定指向位相 2 パス + 語生成、スカラー）と double の CFO 回転。
+  FPGA 化は 7010 の資源が無く、CATV 専用ビットストリームの PL リロードか 7020 が要る。
 - 変調器 `ref/isdbc/modulator.py` と `tsmf.multiplex` でループバック（AWGN / CFO / クロック / 反射 /
   スペクトル反転 / TSMF 2 本）を検証。実放送キャプチャは `ref/tests/test_isdbc_real.py` と rt_test の
   `isdbc_real_catv56ch`。
