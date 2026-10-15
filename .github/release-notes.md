@@ -1,3 +1,18 @@
+## v1.5.0 の変更点（v1.4.2 から）
+
+- **Linux / macOS（Apple Silicon 含む）でも復調コアと isdbtd がビルドできるようになりました**。CMake だけで
+  `make rt`。GitHub Actions が ubuntu と macOS（arm64）で ref/ との一致テストを回しています。
+- **Mirakurun 用チューナーコマンド `recpluto`**（recpt1 互換の引数）を追加。地デジとケーブル TV の BS/CS 再送信を
+  1 本の tuner として扱え、`--scan` で channels.yml の雛形を出します。MacBook Air M5 + Pluto で Mirakurun 4.1.5 からの
+  視聴・EPG 取得を確認済み。手順は `docs/mirakurun.md`、雛形は `tools/mirakurun/`。
+- arm64 の FEC（ビタビ・RS）を NEON 化、raw 経路の前段（リサンプル・FFT・等化）を高速化。Apple M5 で raw 約 0.5 コア、
+  FPGA 前段で約 0.2 コア。
+- ライブの raw 経路も 8bit ビタビ + 範囲復号になり、選局後の遅延が 1 フレーム短くなりました（Windows の BonDriver も同じ）。
+- `isdbtd --stdout`（TS を標準出力へ。SIGTERM / Ctrl-C で終了）を追加。
+- ファーム **pluto-fw-isdbt v2.0.2** で、弱い入力で FPGA 前段の MER が raw より落ちる問題（GI 相関器のオフセット →
+  残留 CFO の ICI）が直りました。DLL 側の変更はありませんが、v2.0.1 以前では `[SDR] FpgaEq=0` が回避策です。
+- Windows の BonDriver 機能は v1.4.2 と同じです（bontest で UHF / CATV とも同期崩れ 0 を確認）。
+
 ## v1.4.2 の変更点（v1.4.1 から）
 
 - **TVTest 起動直後のチャンネルスキャンで 13ch / 14ch を取りこぼすことがある問題を修正**。選局直後の立ち上がりを
