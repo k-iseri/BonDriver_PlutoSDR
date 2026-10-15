@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "params.h"
+#include "simd.h"
 
 namespace isdbt {
 
@@ -27,8 +28,10 @@ public:
 private:
     void Traceback(size_t n_emit, std::vector<uint8_t>* out);
     void FeedScalar(const float* pairs, size_t n_steps, std::vector<uint8_t>* out);
-#ifdef __AVX2__
+#if defined(__AVX2__)
     void FeedAvx2(const float* pairs, size_t n_steps, std::vector<uint8_t>* out);
+#elif defined(ISDBT_NEON)
+    void FeedNeon(const float* pairs, size_t n_steps, std::vector<uint8_t>* out);
 #endif
 
     static constexpr int kStates = 64;
@@ -46,9 +49,9 @@ private:
 std::vector<uint8_t> ViterbiDecode(const float* pairs, size_t n_steps);
 
 // ライブ経路用の速い版: デパンクチャを融合し（パンクチャ後の軟値列 soft をそのまま受ける）、
-// 軟値を ±31 に量子化して 8bit コスト × 32 レーンの AVX2 で復号する。出力は ViterbiDecode と同じ形式。
-// 量子化（平均振幅を 12、約 2.6 倍で飽和）で判定が変わるのはごく稀で、AVX2 が無いビルドでは
-// Depuncture + ViterbiDecode に落ちる
+// 軟値を ±31 に量子化して 8bit コスト × 32 レーン（AVX2）/ 16 レーン × 4（NEON）で復号する。
+// 出力は ViterbiDecode と同じ形式。量子化（平均振幅を 12、約 2.6 倍で飽和）で判定が変わるのはごく稀で、
+// AVX2 も NEON も無いビルドでは Depuncture + ViterbiDecode に落ちる
 std::vector<uint8_t> ViterbiDecodeSoft(const float* soft, size_t n, CodeRate rate);
 // 同上、量子化済み（±kViterbiSoftQ の int8）の軟値列を受ける版（LayerSoftBitsQ の出力用）
 inline constexpr int kViterbiSoftQ = 31;

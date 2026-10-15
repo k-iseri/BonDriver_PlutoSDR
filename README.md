@@ -55,7 +55,7 @@ DLL と同名の ini（`.ini.sample` を編集）を TVTest の BonDriver フォ
 
 ## Linux / macOS（Apple Silicon 含む）
 `rt/` は CMake だけでビルドできる（C++17、g++ 11 / clang 15 以降）。AVX2 は x86-64 で自動で付き、
-arm64 ではスカラー版（同じ結果、遅い）になる。SDR ライブ受信には libiio 1.x が要る（Homebrew / apt には
+arm64 は NEON 版（ビタビ・RS。結果は同じ）になる。SDR ライブ受信には libiio 1.x が要る（Homebrew / apt には
 1.x が無いのでソースからビルドする。手順は `docs/mirakurun.md`。無ければ `--sdr` だけ使えないままビルドは通る）。
 `make setup` には Python 3.11 以上の `python3` が必要（`python3 --version` で確認）。
 ```

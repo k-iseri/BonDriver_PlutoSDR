@@ -12,9 +12,13 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 add_compile_definitions(_CRT_SECURE_NO_WARNINGS NOMINMAX)
 # 復調コアは速度が要るので Release は常に最適化 + AVX2（x86-64 は Haswell 以降前提。
-# 古い CPU 向けには -DISDBT_NO_AVX2=ON で外す。arm64（Apple Silicon / Raspberry Pi）では
-# __AVX2__ が付かずスカラー版が使われる）
+# 古い CPU 向けには -DISDBT_NO_AVX2=ON で外す）。arm64（Apple Silicon / Raspberry Pi）では
+# AArch64 に常にある NEON 版（isdbt/simd.h）が使われ、-DISDBT_NO_NEON=ON でスカラー版に戻せる
 option(ISDBT_NO_AVX2 "AVX2 を使わない" OFF)
+option(ISDBT_NO_NEON "NEON を使わない（arm64。速度比較・切り分け用）" OFF)
+if(ISDBT_NO_NEON)
+  add_compile_definitions(ISDBT_NO_NEON)
+endif()
 if(MSVC)
   add_compile_options(/W4 /utf-8 /EHsc)
   if(NOT ISDBT_NO_AVX2)
@@ -22,7 +26,8 @@ if(MSVC)
   endif()
 else()
   add_compile_options(-Wall -Wextra)
-  if(NOT ISDBT_NO_AVX2 AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+  # クロスビルド（macOS の CMAKE_OSX_ARCHITECTURES=x86_64 など）は CMAKE_SYSTEM_PROCESSOR がホストのままなので別に見る
+  if(NOT ISDBT_NO_AVX2 AND (CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$" OR CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64"))
     add_compile_options($<$<CONFIG:Release>:-mavx2> $<$<CONFIG:Release>:-mfma>)
   endif()
 endif()

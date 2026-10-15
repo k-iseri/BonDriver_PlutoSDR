@@ -11,6 +11,10 @@
 #ifdef __AVX2__
 #include <immintrin.h>
 #endif
+// 8bit コストのビタビ（ViterbiU8）は AVX2 版と NEON 版がある
+#if defined(__AVX2__) || defined(ISDBT_NEON)
+#define ISDBT_VITERBI_U8 1
+#endif
 
 namespace isdbt {
 
@@ -108,8 +112,10 @@ void ViterbiDecoder::Reset() {
 }
 
 void ViterbiDecoder::Feed(const float* pairs, size_t n_steps, std::vector<uint8_t>* out) {
-#ifdef __AVX2__
+#if defined(__AVX2__)
     FeedAvx2(pairs, n_steps, out);
+#elif defined(ISDBT_NEON)
+    FeedNeon(pairs, n_steps, out);
 #else
     FeedScalar(pairs, n_steps, out);
 #endif
@@ -189,6 +195,58 @@ void ViterbiDecoder::FeedAvx2(const float* pairs, size_t n_steps, std::vector<ui
         }
     }
     for (int v = 0; v < 8; ++v) _mm256_store_ps(&pm_[static_cast<size_t>(v) * 8], pm[v]);
+}
+#endif
+
+#ifdef ISDBT_NEON
+// FeedAvx2 と同じ分割を 4 状態 × 16 ベクタで行う（結果は FeedScalar とビット一致。枝メトリック ±X ± Y は
+// 積が正確なので fma でも 1 回の丸めになり、スカラーの X + Y と同じ値になる）。
+// 旧メトリックの偶数/奇数分離は vuzp1 / vuzp2 で 1 命令ずつ
+void ViterbiDecoder::FeedNeon(const float* pairs, size_t n_steps, std::vector<uint8_t>* out) {
+    float32x4_t pm[16];
+    for (int v = 0; v < 16; ++v) pm[v] = vld1q_f32(&pm_[static_cast<size_t>(v) * 4]);
+    // 判定ビットの詰め込み: 16 状態（ベクタ 4 本）を 1 語に。ベクタ k のレーン l → ビット 4k + l
+    static const uint32_t kBitWeights[4][4] = {
+        {1u, 2u, 4u, 8u}, {16u, 32u, 64u, 128u}, {256u, 512u, 1024u, 2048u}, {4096u, 8192u, 16384u, 32768u}};
+    uint32x4_t w[4];
+    for (int k = 0; k < 4; ++k) w[k] = vld1q_u32(kBitWeights[k]);
+    for (size_t t = 0; t < n_steps; ++t) {
+        const float32x4_t X = vdupq_n_f32(pairs[2 * t]);
+        const float32x4_t Y = vdupq_n_f32(pairs[2 * t + 1]);
+        float32x4_t A[8], B[8];     // A[k] = old[2j], B[k] = old[2j+1]（j = 4k..4k+3）
+        for (int k = 0; k < 8; ++k) {
+            A[k] = vuzp1q_f32(pm[2 * k], pm[2 * k + 1]);
+            B[k] = vuzp2q_f32(pm[2 * k], pm[2 * k + 1]);
+        }
+        uint64_t word = 0;
+        for (int g = 0; g < 4; ++g) {
+            uint32x4_t bits = vdupq_n_u32(0);
+            for (int k = 0; k < 4; ++k) {
+                const int v = 4 * g + k;
+                const int j = v & 7;
+                const float32x4_t bm0 = vfmaq_f32(vmulq_f32(vld1q_f32(&sy_[0][v * 4]), Y), vld1q_f32(&sx_[0][v * 4]), X);
+                const float32x4_t bm1 = vfmaq_f32(vmulq_f32(vld1q_f32(&sy_[1][v * 4]), Y), vld1q_f32(&sx_[1][v * 4]), X);
+                const float32x4_t c0 = vaddq_f32(A[j], bm0);
+                const float32x4_t c1 = vaddq_f32(B[j], bm1);
+                pm[v] = vmaxq_f32(c0, c1);
+                bits = vorrq_u32(bits, vandq_u32(vcgtq_f32(c1, c0), w[k]));
+            }
+            word |= static_cast<uint64_t>(vaddvq_u32(bits)) << (16 * g);
+        }
+        dec_.push_back(word);
+        if (++steps_since_norm_ >= 4096) {
+            float32x4_t m = pm[0];
+            for (int v = 1; v < 16; ++v) m = vmaxq_f32(m, pm[v]);
+            const float32x4_t mv = vdupq_n_f32(vmaxvq_f32(m));
+            for (int v = 0; v < 16; ++v) pm[v] = vsubq_f32(pm[v], mv);
+            steps_since_norm_ = 0;
+        }
+        if (dec_.size() >= kWindow + kTail) {
+            for (int v = 0; v < 16; ++v) vst1q_f32(&pm_[static_cast<size_t>(v) * 4], pm[v]);
+            Traceback(kWindow, out);
+        }
+    }
+    for (int v = 0; v < 16; ++v) vst1q_f32(&pm_[static_cast<size_t>(v) * 4], pm[v]);
 }
 #endif
 
@@ -408,11 +466,190 @@ private:
 }  // namespace
 #endif  // __AVX2__
 
+// 同じ 8bit コストのビタビの NEON 版。64 状態を uint8x16 × 4（p0 = 0..15, p1 = 16..31, p2 = 32..47,
+// p3 = 48..63）で持つ。量子化・枝コスト表・正規化の周期は AVX2 版と同じなので判定も同じになる。
+// 判定ビットは 16 レーンのマスクを vshrn で 1 状態 1 ニブル（64bit）に落とし、1 ステップ 4 語で持つ
+// （movemask 相当のビット詰めより安い。トレースバックは自前なので語の形式は内部だけの約束）
+#ifdef ISDBT_NEON
+namespace {
+
+class ViterbiU8 {
+public:
+    static constexpr int kStates = 64;
+    static constexpr size_t kWindow = 1 << 16;
+    static constexpr size_t kTail = 192;
+    static constexpr int kQ = kViterbiSoftQ;
+    static constexpr size_t kWordsPerStep = 4;      // dec_ の 1 ステップあたりの語数（16 状態 × 4 ビット）
+
+    ViterbiU8() {
+        for (int s_new = 0; s_new < kStates; ++s_new) {
+            const int u = s_new >> 5;
+            for (int b = 0; b < 2; ++b) {
+                const int s_old = ((s_new & 0x1F) << 1) | b;
+                const unsigned r = static_cast<unsigned>((u << 6) | s_old);
+                const int k = Parity(r & kConvG1) * 2 + Parity(r & kConvG2);
+                shuf_[b][s_new >> 5][s_new & 31] = static_cast<uint8_t>(k);
+            }
+        }
+        for (uint8_t& c : pm_) c = 0;
+        for (int x = -kQ; x <= kQ; ++x) {
+            for (int y = -kQ; y <= kQ; ++y) {
+                const uint32_t t0 = static_cast<uint32_t>((kQ - x) + (kQ - y));
+                const uint32_t t1 = static_cast<uint32_t>((kQ - x) + (kQ + y));
+                const uint32_t t2 = static_cast<uint32_t>((kQ + x) + (kQ - y));
+                const uint32_t t3 = static_cast<uint32_t>((kQ + x) + (kQ + y));
+                tab2d_[(x + kQ) * (2 * kQ + 1) + (y + kQ)] = t0 | (t1 << 8) | (t2 << 16) | (t3 << 24);
+            }
+        }
+    }
+
+    double t_scale = 0.0, t_tb = 0.0;       // ISDBT_PROFILE 用
+    void Run(const float* soft, size_t n, const PuncturePattern* pat, std::vector<uint8_t>* out) {
+        const auto tq0 = std::chrono::steady_clock::now();
+        // 量子化: 平均振幅を 12 に（±31 で飽和 = 平均の約 2.6 倍）。AVX2 版と同じく 4096 値ごとに double へ足す
+        double acc = 0.0;
+        {
+            size_t i = 0;
+            for (; i + 4096 <= n; i += 4096) {
+                float32x4_t a0 = vdupq_n_f32(0.0f), a1 = vdupq_n_f32(0.0f);
+                for (size_t k = 0; k < 4096; k += 8) {
+                    a0 = vaddq_f32(a0, vabsq_f32(vld1q_f32(soft + i + k)));
+                    a1 = vaddq_f32(a1, vabsq_f32(vld1q_f32(soft + i + k + 4)));
+                }
+                acc += vaddvq_f32(vaddq_f32(a0, a1));
+            }
+            for (; i < n; ++i) acc += std::fabs(soft[i]);
+        }
+        const float scale = (acc > 0.0) ? static_cast<float>(12.0 * n / acc) : 1.0f;
+        // 一括量子化（16 値ずつ: 乗算 → 最近接偶数丸めで int32 → int16 → int8 に飽和 → ±Q にクランプ）
+        std::vector<int8_t> qs(n + 32);
+        {
+            const float32x4_t sc = vdupq_n_f32(scale);
+            const int8x16_t qmax = vdupq_n_s8(static_cast<int8_t>(kQ)), qmin = vdupq_n_s8(static_cast<int8_t>(-kQ));
+            size_t i = 0;
+            for (; i + 16 <= n; i += 16) {
+                const int32x4_t a = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(soft + i), sc));
+                const int32x4_t b = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(soft + i + 4), sc));
+                const int32x4_t c = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(soft + i + 8), sc));
+                const int32x4_t d = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(soft + i + 12), sc));
+                const int16x8_t ab = vcombine_s16(vqmovn_s32(a), vqmovn_s32(b));
+                const int16x8_t cd = vcombine_s16(vqmovn_s32(c), vqmovn_s32(d));
+                int8x16_t v = vcombine_s8(vqmovn_s16(ab), vqmovn_s16(cd));
+                v = vminq_s8(vmaxq_s8(v, qmin), qmax);
+                vst1q_s8(&qs[i], v);
+            }
+            for (; i < n; ++i) {
+                const float x = soft[i] * scale;
+                int r = static_cast<int>(x + (x >= 0 ? 0.5f : -0.5f));
+                r = r > kQ ? kQ : (r < -kQ ? -kQ : r);
+                qs[i] = static_cast<int8_t>(r);
+            }
+        }
+        t_scale += std::chrono::duration<double>(std::chrono::steady_clock::now() - tq0).count();
+        RunQ(qs.data(), n, pat, out);
+    }
+
+    // 量子化済みの軟値列（±kQ の int8）を復号する本体
+    void RunQ(const int8_t* qp, size_t n, const PuncturePattern* pat, std::vector<uint8_t>* out) {
+        const size_t period = std::strlen(pat->x);
+        size_t sent = 0;
+        for (size_t i = 0; i < period; ++i) sent += (pat->x[i] == '1') + (pat->y[i] == '1');
+        const size_t blocks = n / sent;
+
+        uint8x16_t p0 = vld1q_u8(&pm_[0]), p1 = vld1q_u8(&pm_[16]), p2 = vld1q_u8(&pm_[32]), p3 = vld1q_u8(&pm_[48]);
+        // 枝コストの添字: [b][u] の前半（j = 0..15）と後半（j = 16..31）
+        const uint8x16_t sh00l = vld1q_u8(shuf_[0][0]), sh00h = vld1q_u8(shuf_[0][0] + 16);
+        const uint8x16_t sh10l = vld1q_u8(shuf_[1][0]), sh10h = vld1q_u8(shuf_[1][0] + 16);
+        const uint8x16_t sh01l = vld1q_u8(shuf_[0][1]), sh01h = vld1q_u8(shuf_[0][1] + 16);
+        const uint8x16_t sh11l = vld1q_u8(shuf_[1][1]), sh11h = vld1q_u8(shuf_[1][1] + 16);
+        int since_norm = 0;
+        uint8x16_t norm_v = vdupq_n_u8(0);
+        size_t s = 0;
+        for (size_t blk = 0; blk < blocks; ++blk) {
+            for (size_t i = 0; i < period; ++i) {
+                const int X = (pat->x[i] == '1') ? qp[s++] : 0;
+                const int Y = (pat->y[i] == '1') ? qp[s++] : 0;
+                // 枝コスト表 {k = 0..3} の 4 バイトを全レーンに置き、添字 0..3 の表引きで枝ごとのコストにする
+                const uint8x16_t tab = vreinterpretq_u8_u32(vdupq_n_u32(tab2d_[(X + kQ) * (2 * kQ + 1) + (Y + kQ)]));
+                // 旧コストを偶数 state（A = old[2j]）と奇数 state（B = old[2j+1]）に分離。l: j = 0..15、h: j = 16..31
+                const uint8x16_t Al = vuzp1q_u8(p0, p1), Bl = vuzp2q_u8(p0, p1);
+                const uint8x16_t Ah = vuzp1q_u8(p2, p3), Bh = vuzp2q_u8(p2, p3);
+                // 新 state 0..15 / 16..31（u = 0）と 32..47 / 48..63（u = 1）。前者は同じ (A, B)、枝コストだけ違う
+                const uint8x16_t c0a = vqaddq_u8(Al, vqtbl1q_u8(tab, sh00l)), c1a = vqaddq_u8(Bl, vqtbl1q_u8(tab, sh10l));
+                const uint8x16_t c0b = vqaddq_u8(Ah, vqtbl1q_u8(tab, sh00h)), c1b = vqaddq_u8(Bh, vqtbl1q_u8(tab, sh10h));
+                const uint8x16_t c0c = vqaddq_u8(Al, vqtbl1q_u8(tab, sh01l)), c1c = vqaddq_u8(Bl, vqtbl1q_u8(tab, sh11l));
+                const uint8x16_t c0d = vqaddq_u8(Ah, vqtbl1q_u8(tab, sh01h)), c1d = vqaddq_u8(Bh, vqtbl1q_u8(tab, sh11h));
+                p0 = vminq_u8(c0a, c1a);
+                p1 = vminq_u8(c0b, c1b);
+                p2 = vminq_u8(c0c, c1c);
+                p3 = vminq_u8(c0d, c1d);
+                // pick1 = c1 < c0（AVX2 版と同じ向きの不等号）。state ごと 1 ニブル × 16 state = 1 語
+                dec_.push_back(Nibbles(vcltq_u8(c1a, c0a)));
+                dec_.push_back(Nibbles(vcltq_u8(c1b, c0b)));
+                dec_.push_back(Nibbles(vcltq_u8(c1c, c0c)));
+                dec_.push_back(Nibbles(vcltq_u8(c1d, c0d)));
+                // 正規化は AVX2 版と同じ: 2 ステップごとに、1 ステップ前のコストの最小値を引く
+                ++since_norm;
+                if (since_norm == 1) {
+                    const uint8x16_t m = vminq_u8(vminq_u8(p0, p1), vminq_u8(p2, p3));
+                    norm_v = vdupq_n_u8(vminvq_u8(m));
+                } else {
+                    p0 = vqsubq_u8(p0, norm_v);
+                    p1 = vqsubq_u8(p1, norm_v);
+                    p2 = vqsubq_u8(p2, norm_v);
+                    p3 = vqsubq_u8(p3, norm_v);
+                    since_norm = 0;
+                }
+                if (dec_.size() >= kWordsPerStep * (kWindow + kTail)) {
+                    Store(p0, p1, p2, p3);
+                    Traceback(kWindow, out);
+                }
+            }
+        }
+        Store(p0, p1, p2, p3);
+        if (!dec_.empty()) Traceback(dec_.size() / kWordsPerStep, out);
+    }
+
+private:
+    // 16 レーンの 0x00 / 0xFF マスク → レーン n をニブル n に（vshrn で各 16bit レーンの中央 8bit を取る）
+    static inline uint64_t Nibbles(uint8x16_t m) {
+        return vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(m), 4)), 0);
+    }
+    void Store(uint8x16_t p0, uint8x16_t p1, uint8x16_t p2, uint8x16_t p3) {
+        vst1q_u8(&pm_[0], p0);
+        vst1q_u8(&pm_[16], p1);
+        vst1q_u8(&pm_[32], p2);
+        vst1q_u8(&pm_[48], p3);
+    }
+    void Traceback(size_t n_emit, std::vector<uint8_t>* out) {
+        const auto tt0 = std::chrono::steady_clock::now();
+        const size_t n = dec_.size() / kWordsPerStep;
+        int state = static_cast<int>(std::min_element(pm_, pm_ + kStates) - pm_);   // コスト最小
+        std::vector<uint8_t> bits(n);
+        for (size_t t = n; t-- > 0;) {
+            bits[t] = static_cast<uint8_t>(state >> 5);
+            const int b = static_cast<int>((dec_[t * kWordsPerStep + (state >> 4)] >> ((state & 15) * 4)) & 1);
+            state = ((state & 0x1F) << 1) | b;
+        }
+        out->insert(out->end(), bits.begin(), bits.begin() + n_emit);
+        dec_.erase(dec_.begin(), dec_.begin() + n_emit * kWordsPerStep);
+        t_tb += std::chrono::duration<double>(std::chrono::steady_clock::now() - tt0).count();
+    }
+
+    alignas(16) uint8_t pm_[kStates];
+    alignas(16) uint8_t shuf_[2][2][32];
+    uint32_t tab2d_[(2 * kQ + 1) * (2 * kQ + 1)];
+    std::vector<uint64_t> dec_;
+};
+
+}  // namespace
+#endif  // ISDBT_NEON
+
 std::vector<uint8_t> ViterbiDecodeQ(const int8_t* qs, size_t n, CodeRate rate) {
     const PuncturePattern* pat = FindPuncture(rate);
     assert(pat);
     (void)pat;
-#ifdef __AVX2__
+#ifdef ISDBT_VITERBI_U8
     std::vector<uint8_t> bits;
     ViterbiU8 dec;
     dec.RunQ(qs, n, pat, &bits);
@@ -430,7 +667,7 @@ std::vector<uint8_t> ViterbiDecodeSoft(const float* soft, size_t n, CodeRate rat
     const PuncturePattern* pat = FindPuncture(rate);
     assert(pat);
     (void)pat;
-#ifdef __AVX2__
+#ifdef ISDBT_VITERBI_U8
     std::vector<uint8_t> bits;
     ViterbiU8 dec;
     const auto tr0 = std::chrono::steady_clock::now();
@@ -588,10 +825,11 @@ int RsCorrectOne(uint8_t* c, int S[kRsNRoots]) {
     return r;
 }
 
-#ifdef __AVX2__
-// 32 TSP 同時のシンドローム計算。GF(256) の定数倍 x·α^i をニブル表 2 つの pshufb で求める
+#if defined(__AVX2__) || defined(ISDBT_NEON)
+// 32 TSP 同時のシンドローム計算。GF(256) の定数倍 x·α^i をニブル表 2 つのバイト表引き（pshufb / tbl）で求める
 // （x = hi·16 + lo → x·r = T_hi[hi] ⊕ T_lo[lo]）。誤りの無い TSP（大半）はこれだけで済み、
 // 非 0 の TSP だけスカラーの Berlekamp-Massey へ回す。ホーナー法: S_i = (…(c_0·r_i + c_1)·r_i + …)·r_i + c_203
+// 表は 16 バイトを 2 回繰り返した 32 バイト（AVX2 は 128bit レーンごとに引くため。NEON は前半 16 バイトだけ使う）
 struct RsSyndromeTables {
     alignas(32) uint8_t lo[kRsNRoots][32];
     alignas(32) uint8_t hi[kRsNRoots][32];
@@ -605,7 +843,9 @@ struct RsSyndromeTables {
         }
     }
 };
+#endif  // __AVX2__ || ISDBT_NEON
 
+#ifdef __AVX2__
 void RsDecodeAvx2(uint8_t* tsps, size_t n_tsp, int* nerr) {
     static const RsSyndromeTables tabs;
     const __m256i nib = _mm256_set1_epi8(0x0F);
@@ -651,11 +891,63 @@ void RsDecodeAvx2(uint8_t* tsps, size_t n_tsp, int* nerr) {
 }
 #endif  // __AVX2__
 
+#ifdef ISDBT_NEON
+// RsDecodeAvx2 と同じ構成（32 TSP の転置 → 16 根 × 204 バイトのホーナー法）を uint8x16 × 2 で
+void RsDecodeNeon(uint8_t* tsps, size_t n_tsp, int* nerr) {
+    static const RsSyndromeTables tabs;
+    const uint8x16_t nib = vdupq_n_u8(0x0F);
+    alignas(16) uint8_t col[kRsN][32];          // col[j][lane] = TSP(base + lane) のバイト j
+    alignas(16) uint8_t Sv[kRsNRoots][32];
+    alignas(16) uint8_t any[32];
+    for (size_t base = 0; base < n_tsp; base += 32) {
+        const size_t cnt = std::min<size_t>(32, n_tsp - base);
+        for (size_t l = 0; l < 32; ++l) {
+            if (l < cnt) {
+                const uint8_t* c = tsps + (base + l) * kRsN;
+                for (int j = 0; j < kRsN; ++j) col[j][l] = c[j];
+            } else {
+                for (int j = 0; j < kRsN; ++j) col[j][l] = 0;
+            }
+        }
+        uint8x16_t any0 = vdupq_n_u8(0), any1 = vdupq_n_u8(0);
+        for (int i = 0; i < kRsNRoots; ++i) {
+            const uint8x16_t tlo = vld1q_u8(tabs.lo[i]);
+            const uint8x16_t thi = vld1q_u8(tabs.hi[i]);
+            uint8x16_t acc0 = vld1q_u8(col[0]);
+            uint8x16_t acc1 = vld1q_u8(col[0] + 16);
+            for (int j = 1; j < kRsN; ++j) {
+                const uint8x16_t prod0 = veorq_u8(vqtbl1q_u8(tlo, vandq_u8(acc0, nib)), vqtbl1q_u8(thi, vshrq_n_u8(acc0, 4)));
+                const uint8x16_t prod1 = veorq_u8(vqtbl1q_u8(tlo, vandq_u8(acc1, nib)), vqtbl1q_u8(thi, vshrq_n_u8(acc1, 4)));
+                acc0 = veorq_u8(prod0, vld1q_u8(col[j]));
+                acc1 = veorq_u8(prod1, vld1q_u8(col[j] + 16));
+            }
+            vst1q_u8(Sv[i], acc0);
+            vst1q_u8(Sv[i] + 16, acc1);
+            any0 = vorrq_u8(any0, acc0);
+            any1 = vorrq_u8(any1, acc1);
+        }
+        vst1q_u8(any, any0);
+        vst1q_u8(any + 16, any1);
+        for (size_t l = 0; l < cnt; ++l) {
+            if (any[l] == 0) {
+                nerr[base + l] = 0;
+                continue;
+            }
+            int S[kRsNRoots];
+            for (int i = 0; i < kRsNRoots; ++i) S[i] = Sv[i][l];
+            nerr[base + l] = RsCorrectOne(tsps + (base + l) * kRsN, S);
+        }
+    }
+}
+#endif  // ISDBT_NEON
+
 }  // namespace
 
 void RsDecode(uint8_t* tsps, size_t n_tsp, int* nerr) {
-#ifdef __AVX2__
+#if defined(__AVX2__)
     RsDecodeAvx2(tsps, n_tsp, nerr);
+#elif defined(ISDBT_NEON)
+    RsDecodeNeon(tsps, n_tsp, nerr);
 #else
     for (size_t i = 0; i < n_tsp; ++i) {
         uint8_t* c = tsps + i * kRsN;

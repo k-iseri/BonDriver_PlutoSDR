@@ -2,6 +2,7 @@
 // 使い方: rt_test <vectors_dir>
 // 整数段（RS、PRBS、バイトデインターリーブ、TMCC、Viterbi 判定）はビット一致、
 // 浮動小数段（FFT、リサンプル、等化）は相対 RMS 誤差で判定する。
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <complex>
@@ -130,6 +131,38 @@ void TestViterbi() {
     size_t nerr = 0;
     for (size_t i = head; i + tail < n; ++i) nerr += bits[i] != want.as<uint8_t>()[i];
     Report(nerr == 0, "viterbi_decode", std::to_string(nerr) + " bit errors");
+}
+
+// 8bit 量子化ビタビ（ライブ経路、AVX2 / NEON）: 同じ軟値列を ViterbiDecodeSoft（量子化込み）と
+// ViterbiDecodeQ（量子化済み）で復号して情報ビットに一致すること。どちらも無いビルドでは float 版に落ちる
+void TestViterbiQ() {
+    NpyArray soft = NpyRead(Path("viterbi_soft.npy"));
+    NpyArray want = NpyRead(Path("viterbi_bits.npy"));
+    CodeRate rate{3, 4};
+    const size_t n = soft.elements();
+    const float* sp = soft.as<float>();
+    const size_t head = static_cast<size_t>(JNum("viterbi_skip_head", 96));
+    const size_t tail = static_cast<size_t>(JNum("viterbi_skip_tail", 64));
+    auto count_err = [&](const std::vector<uint8_t>& bits) {
+        const size_t m = std::min(bits.size(), want.elements());
+        size_t nerr = 0;
+        for (size_t i = head; i + tail < m; ++i) nerr += bits[i] != want.as<uint8_t>()[i];
+        return nerr;
+    };
+    const size_t e_soft = count_err(ViterbiDecodeSoft(sp, n, rate));
+    Report(e_soft == 0, "viterbi_decode_soft_q", std::to_string(e_soft) + " bit errors");
+    // 量子化済み版: ViterbiDecodeSoft と同じ尺度（平均振幅 12）で ±kViterbiSoftQ に丸める
+    double acc = 0.0;
+    for (size_t i = 0; i < n; ++i) acc += std::fabs(sp[i]);
+    const double scale = 12.0 * static_cast<double>(n) / acc;
+    std::vector<int8_t> qs(n);
+    for (size_t i = 0; i < n; ++i) {
+        long r = std::lround(sp[i] * scale);
+        r = std::max<long>(-kViterbiSoftQ, std::min<long>(kViterbiSoftQ, r));
+        qs[i] = static_cast<int8_t>(r);
+    }
+    const size_t e_q = count_err(ViterbiDecodeQ(qs.data(), n, rate));
+    Report(e_q == 0, "viterbi_decode_q", std::to_string(e_q) + " bit errors");
 }
 
 void TestByteDeinterleave() {
@@ -564,12 +597,79 @@ void TestIsdbcReal() {
     if (ok) std::printf("     (%s)\n", buf);
 }
 
+// --bench: FEC 段の速さ（ビルド・CPU ごとの比較用。AVX2 / NEON / スカラーの切り分けに使う）。
+// 入力は乱数でよい: ビタビの計算量はデータに依らず、RS は「誤り無し（シンドロームだけ）」が実運用の大半
+void Bench() {
+    auto now = [] { return std::chrono::steady_clock::now(); };
+    auto sec = [&](auto a) { return std::chrono::duration<double>(now() - a).count(); };
+    const CodeRate rate{3, 4};
+    // 64QAM 3/4 の 12 セグメント ≈ 1 フレーム（0.23 s）あたり 2.6 M 軟値。10 フレーム分
+    const size_t n_soft = 26'000'000;
+    std::vector<float> soft(n_soft);
+    uint32_t x = 12345;
+    for (float& v : soft) {
+        x = x * 1664525u + 1013904223u;
+        v = ((x >> 16) & 1 ? 1.0f : -1.0f) + (static_cast<float>(x & 0xFFFF) / 65536.0f - 0.5f) * 0.6f;
+    }
+    {
+        std::vector<float> pairs;
+        const size_t steps = Depuncture(soft.data(), n_soft, rate, &pairs);
+        const auto t0 = now();
+        std::vector<uint8_t> bits = ViterbiDecode(pairs.data(), steps);
+        const double t = sec(t0);
+        std::printf("viterbi float  : %7.3f s  %6.1f Msteps/s  (%zu steps)\n", t, steps / t / 1e6, steps);
+    }
+    {
+        const auto t0 = now();
+        std::vector<uint8_t> bits = ViterbiDecodeSoft(soft.data(), n_soft, rate);
+        const double t = sec(t0);
+        std::printf("viterbi u8     : %7.3f s  %6.1f Msteps/s  (%zu steps, 量子化込み)\n", t, bits.size() / t / 1e6, bits.size());
+    }
+    {
+        // FFT 8192: Mode 3 は 992 回/秒
+        Fft fft(8192);
+        std::vector<std::complex<float>> buf(8192);
+        for (size_t i = 0; i < buf.size(); ++i) buf[i] = {static_cast<float>(i % 7) - 3.0f, static_cast<float>(i % 5) - 2.0f};
+        const int reps = 4000;
+        const auto t0 = now();
+        for (int r = 0; r < reps; ++r) fft.Forward(buf.data());
+        const double t = sec(t0);
+        std::printf("fft 8192       : %7.3f s  %6.1f k FFT/s  (%d 回)\n", t, reps / t / 1e3, reps);
+    }
+    {
+        const size_t n_tsp = 200'000;      // 64QAM 3/4 の 12 セグメントで約 36 s 分
+        std::vector<uint8_t> tsps(n_tsp * kRsN, 0);      // 全 0 は符号語（誤り無し = シンドロームだけで終わる）
+        std::vector<int> nerr(n_tsp);
+        const auto t0 = now();
+        RsDecode(tsps.data(), n_tsp, nerr.data());
+        const double t = sec(t0);
+        std::printf("rs clean       : %7.3f s  %6.1f k TSP/s\n", t, n_tsp / t / 1e3);
+        // 1 TSP に 4 バイト誤り（Berlekamp-Massey まで回る）
+        for (size_t i = 0; i < n_tsp; ++i) {
+            for (int k = 0; k < 4; ++k) {
+                x = x * 1664525u + 1013904223u;
+                tsps[i * kRsN + (x >> 8) % kRsN] ^= static_cast<uint8_t>((x >> 24) | 1);
+            }
+        }
+        const auto t1 = now();
+        RsDecode(tsps.data(), n_tsp, nerr.data());
+        const double t2 = sec(t1);
+        size_t fixed = 0;
+        for (int e : nerr) fixed += (e >= 1 && e <= 4);
+        std::printf("rs 4 errors    : %7.3f s  %6.1f k TSP/s  (%zu/%zu corrected)\n", t2, n_tsp / t2 / 1e3, fixed, n_tsp);
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: rt_test <vectors_dir>\n");
+        std::fprintf(stderr, "usage: rt_test <vectors_dir> | rt_test --bench\n");
         return 2;
+    }
+    if (std::string(argv[1]) == "--bench") {
+        Bench();
+        return 0;
     }
     g_dir = argv[1];
     try {
@@ -584,6 +684,7 @@ int main(int argc, char** argv) {
         TestPrbs();
         TestRs();
         TestViterbi();
+        TestViterbiQ();
         TestByteDeinterleave();
         TestFft();
         TestFracResample();
