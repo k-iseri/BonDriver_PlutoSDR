@@ -72,6 +72,31 @@ CATV は 1 周波数に複数 TS が多重（TSMF）されている局がある�
 `--tsmf all` を足して全スロットを通す（どちらか一方で選ぶ）。VHF 1〜12ch は AD9363 の LO 範囲外で
 受信できない。
 
+## macOS で Mirakurun 本体を動かす（Docker / PM2 無し）
+
+Mirakurun 4.x は CLI と PM2 連携を廃止し Linux では Docker を推奨しているが、Docker Desktop の
+コンテナからは USB の Pluto に届かない。macOS では Node 22 / 24 で `lib/server.js` を直接起動し、
+設定と DB の場所を環境変数で指定する（既定は `/usr/local/etc/mirakurun` と `/usr/local/var/db/mirakurun`
+で root が要る）。グローバルインストールでなければ postinstall は何もしない:
+```
+mkdir -p ~/mirakurun && cd ~/mirakurun && npm init -y && npm install mirakurun
+mkdir -p config data/logo-data run log     # config/{server,tuners,channels}.yml を置く
+```
+```bash
+# ~/mirakurun/start.sh
+D="$HOME/mirakurun"
+export SERVER_CONFIG_PATH="$D/config/server.yml" TUNERS_CONFIG_PATH="$D/config/tuners.yml"
+export CHANNELS_CONFIG_PATH="$D/config/channels.yml" SERVICES_DB_PATH="$D/data/services.json"
+export PROGRAMS_DB_PATH="$D/data/programs.json" LOGO_DATA_DIR_PATH="$D/data/logo-data"
+cd "$D/node_modules/mirakurun" && exec node --max-semi-space-size=64 -r source-map-support/register lib/server.js
+```
+server.yml の `path`（UNIX ソケット）は `/var/run` ではなく書ける場所（例 `~/mirakurun/run/mirakurun.sock`）にする。
+止めるときは `pkill -f "Mirakurun: Server"`（process.title を変えるので `lib/server.js` では一致しない）。
+二重起動すると両方が Pluto を取りに行き、後発の isdbtd が `Unable to claim interface: Permission denied`
+で即終了して Mirakurun が 100 ms ごとに再起動を繰り返すので、起動前に必ず止める。
+チャンネルは `curl -X PUT "http://127.0.0.1:40772/api/config/channels/scan?type=GR&minCh=13&maxCh=52&refresh=true"`
+で走査して channels.yml に書かせ、再起動で反映する（1 チャンネル約 10 秒）。
+
 ## 既知の制約・未確認
 
 - 選局から TS が出るまで約 5 秒（FPGA 前段ありでも同程度）。Mirakurun の既定タイムアウトで足りるはず。
