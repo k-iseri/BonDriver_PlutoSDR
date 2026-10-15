@@ -98,6 +98,7 @@ void LiveSwitch::Start(System initial) {
                      p_.sdr.fs);
     }
     BuildFeed(initial, p_.sdr.freq_hz);
+    sdr_.EnableFpgaFrontEnd(false);         // 仮周波数（27ch）では同期できずタイムアウトするので、最初の選局まで raw
     SdrConfig sc = p_.sdr;
     sc.bw = BwFor(initial);
     freq_hz_ = sc.freq_hz;
@@ -159,6 +160,7 @@ void LiveSwitch::TuneSystem(System sys, bool has_ch, int ch, double freq) {
         }
     }
     if (a) {
+        if (sys != System::kIsdbc) sdr_.EnableFpgaFrontEnd(true);
         if (freq != freq_hz_) {
             sdr_.Retune(freq);
             freq_hz_ = freq;

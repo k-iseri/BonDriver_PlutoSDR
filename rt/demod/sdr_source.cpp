@@ -93,7 +93,7 @@ constexpr int kFeN = 8192;
 constexpr int kFeTotal = 5617;
 constexpr int kFeCenter = 2808;
 constexpr int kFeEqWords = (kFeTotal * 3 + 3) / 4;   // 4213
-constexpr int kFeSettleBlocks = 5;          // raw でソフト AGC を走らせる時間（≈ 0.65 秒。AGC は 4 ブロックごとに 1 段動く）
+constexpr int kFeSettleBlocks = 8;          // raw でソフト AGC を走らせる時間（≈ 0.65 秒。AGC は 4 ブロックごとに 1 段動く）
 constexpr int kFeCfoFrames = 16;            // 整数 CFO 推定に使う同期 FFT の窓数
 constexpr int kFeCfoTimeoutBlocks = 40;     // モード 3 で窓が来ないときの諦め（≈ 5 秒 → raw へ戻してやり直す）
 constexpr int kFeWarmupSymbols = 1024;       // モード 4 に入ってから捨てるシンボル数（時間軸の立ち上がり 256 シンボルで B 層が崩れる）
@@ -181,6 +181,8 @@ void SdrSource::Connect() {
         iio_context* ctx = iio_create_context(nullptr, cfg_.uri.c_str());
         CheckPtr(ctx, "iio_create_context");
         im.ctx = ctx;
+        // ブロック待ちの上限。モード 3/4 で同期が取れず窓が来ないときに早く raw へ戻すため短めに
+        (void)iio_context_set_timeout(ctx, 1500);
 
         iio_device* phy = iio_context_find_device(ctx, "ad9361-phy");
         iio_device* rxdev = iio_context_find_device(ctx, "cf-ad9361-lpc");
@@ -428,6 +430,15 @@ void SdrSource::Run() {
         const iio_block* blk = iio_stream_get_next_block(impl_->stream);
         if (iio_err(blk)) {
             if (stop_) break;
+            if (iio_err(blk) == -110 && fe != Fe::kRaw) {
+                // モード 3/4 では同期の取れた窓しか DMA に流れない。選局直後などで同期が取れないと
+                // ブロックが埋まらず libiio の待ちがタイムアウトする（−110）。ストリーム断ではないので
+                // raw（モード 0）に戻して AGC からやり直す（再接続すると 8 秒止まる。2026-10-15 スキャンで発覚）
+                std::fprintf(stderr, "sdr: no front-end frames (sync not locked?); back to raw\n");
+                fe_to_raw();
+                ++fe_timeouts_;
+                continue;
+            }
             std::fprintf(stderr, "sdr: stream error %d%s\n", iio_err(blk),
                          cfg_.reconnect ? "; reconnecting" : "");
             if (!cfg_.reconnect) break;

@@ -116,6 +116,7 @@ public:
     uint32_t fpga_sync_status() const { return fe_sync_status_; }
     uint32_t fpga_eq_status() const { return fe_eq_status_; }
     long long fpga_symbols() const { return fpga_symbols_; }
+    long long fpga_timeouts() const { return fe_timeouts_; }
     uint64_t fpga_last_start() const { return fpga_last_start_; }   // 直近のシンボルの窓開始（64bit に伸ばした後）
     uint32_t fpga_last_start_hi() const { return fpga_last_start_hi_; }   // ファームが出した上位 32bit そのまま（v2.0.1 以降は非 0 になる）
 
@@ -150,6 +151,7 @@ private:
     std::atomic<int> fpga_delta_{0};
     std::atomic<uint32_t> fe_sync_status_{0}, fe_eq_status_{0};
     std::atomic<long long> fpga_symbols_{0};
+    std::atomic<long long> fe_timeouts_{0};     // モード 3/4 で窓が来ずタイムアウトして raw に戻した回数
     std::atomic<uint64_t> fpga_last_start_{0};
     std::atomic<uint32_t> fpga_last_start_hi_{0};
     std::atomic<bool> fe_restart_{false};   // Retune: raw からやり直す（AGC → δ → モード 4）
