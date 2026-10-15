@@ -39,7 +39,8 @@ isdbtd の `--stdout` モードは recpt1 などと同じ「選局して TS を�
    isdbtd --sdr usb: --ch 24 --stdout > ch24.ts          # 地デジ UHF 24ch
    isdbtd --sdr usb: --system isdbc --ch 55 --stdout > catv.ts   # CATV トラモジ（BonDriver_BDA の通し番号 55 = 56ch）
    ```
-   `--quiet` を付けないと 10 秒ごとに status（JSON）が stderr に出る。
+   `--quiet` を付けないと 10 秒ごとに status（JSON）が stderr に出る。`--sigmf` / `--ts` の再生は `--loop` 無しなら
+   末尾まで出して終了する。
 
 ## tuners.yml / channels.yml（Mirakurun 4.0 以降）
 
@@ -70,7 +71,7 @@ Pluto は 1 台で 1 チャンネルなので、地デジと CATV を同じ 1 �
 
 ファーム pluto-fw-isdbt v2.0.1 以前では弱い入力で FPGA 前段の MER が raw より落ちる（相関器のオフセット。
 v2.0.2 で修正）ので、その場合は command に `--fpga-eq 0`（raw 経路で復調）を足す。
-CPU は Apple M5 で raw 約 1.8 コア、FPGA 前段で約 1 コア。
+CPU は Apple M5（NEON、2026-10-15）で FPGA 前段約 0.2 コア、raw 経路（`--fpga-eq 0`）約 0.5 コア（isdbtd を top で実測）。
 
 CATV は 1 周波数に複数 TS が多重（TSMF）されている局がある。isdbtd は既定で最小番号の TS を選んで
 188 バイト TS にして出す。Mirakurun 側の `tsmfRelTs`（1〜15）で選ばせたい場合は command に
@@ -106,7 +107,12 @@ server.yml の `path`（UNIX ソケット）は `/var/run` ではなく書ける
 
 - 選局から TS が出るまで約 5 秒（FPGA 前段ありでも同程度）。Mirakurun の既定タイムアウトで足りるはず。
 - CPU: x86-64 は AVX2 版（地デジ raw 約 2.7 コア、FPGA 前段で約 0.3 コア、CATV 約 0.35 コア）。
-  arm64 はスカラー版で、Apple M5 では地デジ raw 約 1.8 コア、FPGA 前段で約 1 コア。Raspberry Pi 4/5 で
-  実時間に足りるかは未測定で、足りなければビタビ・RS の NEON 化（SIMDe で AVX2 版を変換）が次の手。
+  arm64 は FEC（ビタビ・RS）と分数リサンプルが NEON 版（2026-10-15）で、Apple M5 の実機で raw 約 0.5 コア、
+  FPGA 前段約 0.2 コア（それ以前のスカラー版は raw 約 1.8 コア、FPGA 前段約 1 コア）。`rt_test --bench` で
+  スカラー比 float ビタビ 2.4 倍、8bit ビタビ 6 倍、RS 5.7 倍。raw 経路の内訳（60 秒で約 32 秒の CPU）は
+  ビタビ 7、リサンプル+CFO 5、FFT 2、チャネル推定 1.6、デインターリーブ 1.4、デマップ 1.9 秒ほど
+  （`ISDBT_PROFILE=1` の `[profile] symbols / eq / deint` 行と層ごとの FEC 行）。
+  Raspberry Pi 4/5 は未測定（`rt/build/rt-native/rt_test --bench` で FEC 段だけ先に測れる。raw 経路が足りなければ
+  FPGA 前段ファーム（pluto-fw-isdbt v2）を使うのが先で、ホスト側の次の候補は FFT・等化の NEON 化）。
 - FPGA 前段（pluto-fw-isdbt v2）は libiio 経由のレジスタアクセスなので OS を問わず使える（v2.0.2 以降を推奨）。
 - USB 2.0 帯域: 8bit ファームなら公称レート、純正ファームなら 7/8 レート（Windows と同じ）。

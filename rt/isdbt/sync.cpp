@@ -1,13 +1,16 @@
 #include "sync.h"
 
-
 #include <algorithm>
 #include <cassert>
 #include <cfenv>
+#include <chrono>
 #include <cmath>
 #include <complex>
+#include <cstdio>
+#include <cstdlib>
 
 #include "pilots.h"
+#include "simd.h"
 
 namespace isdbt {
 
@@ -149,6 +152,7 @@ constexpr int kFracTaps = 48;
 
 struct FracFilters {
     std::vector<float> h;   // (Q, taps)
+    std::vector<float> hd;  // (Q, 2*taps): 各タップを 2 回並べたもの（交互配置 (re, im) の列と 4 レーンで積和するため）
     FracFilters() {
         const double fc = 0.45, beta = 8.0;
         const int c = kFracTaps / 2 - 1;
@@ -179,6 +183,8 @@ struct FracFilters {
                 h[static_cast<size_t>(q) * kFracTaps + i] = static_cast<float>(row[i] / sum);
             }
         }
+        hd.resize(h.size() * 2);
+        for (size_t i = 0; i < h.size(); ++i) hd[2 * i] = hd[2 * i + 1] = h[i];
     }
 };
 
@@ -199,16 +205,40 @@ inline cfloat InterpOne(const std::vector<cfloat>& x, double t, const FracFilter
     n3 += q / kFracQ;
     q %= kFracQ;
     const float* hq = &ff.h[static_cast<size_t>(q) * kFracTaps];
-    cfloat acc(0.0f, 0.0f);
     const long long base = n3 - c;
     if (base >= 0 && base + kFracTaps <= n_in) {
-        const cfloat* xp = &x[static_cast<size_t>(base)];
-        for (int i = 0; i < kFracTaps; ++i) acc += xp[i] * hq[i];
-    } else {
-        for (int i = 0; i < kFracTaps; ++i) {
-            const long long idx = std::clamp(base + i, 0LL, n_in - 1);
-            acc += x[static_cast<size_t>(idx)] * hq[i];
+        // 内側（大半）: 複素列を float 列 (re, im, re, im, …) と見て、同じ係数を 2 回並べた hd と積和する。
+        // 4 本の累算器に分けて加算の依存連鎖を切る（和の順序が変わるだけで、ref/ との差は float の丸め程度）
+        const float* xp = reinterpret_cast<const float*>(&x[static_cast<size_t>(base)]);
+        const float* hdq = &ff.hd[static_cast<size_t>(q) * 2 * kFracTaps];
+#ifdef ISDBT_NEON
+        // 96 float = 24 ベクタを 8 本の累算器に（FMA のレイテンシ隠し）
+        float32x4_t a0 = vdupq_n_f32(0.0f), a1 = a0, a2 = a0, a3 = a0, a4 = a0, a5 = a0, a6 = a0, a7 = a0;
+        for (int i = 0; i < 2 * kFracTaps; i += 32) {
+            a0 = vfmaq_f32(a0, vld1q_f32(xp + i), vld1q_f32(hdq + i));
+            a1 = vfmaq_f32(a1, vld1q_f32(xp + i + 4), vld1q_f32(hdq + i + 4));
+            a2 = vfmaq_f32(a2, vld1q_f32(xp + i + 8), vld1q_f32(hdq + i + 8));
+            a3 = vfmaq_f32(a3, vld1q_f32(xp + i + 12), vld1q_f32(hdq + i + 12));
+            a4 = vfmaq_f32(a4, vld1q_f32(xp + i + 16), vld1q_f32(hdq + i + 16));
+            a5 = vfmaq_f32(a5, vld1q_f32(xp + i + 20), vld1q_f32(hdq + i + 20));
+            a6 = vfmaq_f32(a6, vld1q_f32(xp + i + 24), vld1q_f32(hdq + i + 24));
+            a7 = vfmaq_f32(a7, vld1q_f32(xp + i + 28), vld1q_f32(hdq + i + 28));
         }
+        const float32x4_t a = vaddq_f32(vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3)),
+                                        vaddq_f32(vaddq_f32(a4, a5), vaddq_f32(a6, a7)));
+        return cfloat(vgetq_lane_f32(a, 0) + vgetq_lane_f32(a, 2), vgetq_lane_f32(a, 1) + vgetq_lane_f32(a, 3));
+#else
+        float a[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        for (int i = 0; i < 2 * kFracTaps; i += 8) {
+            for (int k = 0; k < 8; ++k) a[k] += xp[i + k] * hdq[i + k];
+        }
+        return cfloat(a[0] + a[2] + a[4] + a[6], a[1] + a[3] + a[5] + a[7]);
+#endif
+    }
+    cfloat acc(0.0f, 0.0f);
+    for (int i = 0; i < kFracTaps; ++i) {
+        const long long idx = std::clamp(base + i, 0LL, n_in - 1);
+        acc += x[static_cast<size_t>(idx)] * hq[i];
     }
     return acc;
 }
@@ -453,9 +483,16 @@ std::vector<cfloat> CarrierSource::Samples(long long m0, long long m1) const {
         }
     }
     if (f_frac_ != 0.0) {
+        // 小数 CFO の打ち消し。回転子はサンプルごとに cos/sin を引かず、double の複素乗算で進める。
+        // 4096 サンプルごとに正確な位相から取り直すので、ref/（サンプルごとに exp）との差は double の丸め程度
+        constexpr size_t kReanchor = 4096;
+        const double dphi = -2.0 * kPi * f_frac_ / kSampleRateHz;
+        const std::complex<double> step = std::polar(1.0, dphi);
+        std::complex<double> rot;
         for (size_t k = 0; k < xs.size(); ++k) {
-            const double ph = -2.0 * kPi * f_frac_ * (m0 + static_cast<long long>(k)) / kSampleRateHz;
-            xs[k] *= cfloat(static_cast<float>(std::cos(ph)), static_cast<float>(std::sin(ph)));
+            if (k % kReanchor == 0) rot = std::polar(1.0, dphi * static_cast<double>(m0 + static_cast<long long>(k)));
+            xs[k] *= cfloat(static_cast<float>(rot.real()), static_cast<float>(rot.imag()));
+            rot *= step;
         }
     }
     return xs;
@@ -689,8 +726,11 @@ Mat<cfloat> CarrierSource::Symbols(int i0, int i1) {
     i1 = std::min(i1, n_sym_);
     if (i1 <= i0) return Mat<cfloat>(0, mp.total_carriers);
 
+    static const bool profile = std::getenv("ISDBT_PROFILE") != nullptr;
+    const auto t0 = std::chrono::steady_clock::now();
     const long long base = start0_ + static_cast<long long>(i0) * T_;
     std::vector<cfloat> xs = Samples(base, start0_ + static_cast<long long>(i1 - 1) * T_ + N_);
+    const auto t1 = std::chrono::steady_clock::now();
 
     std::vector<int> bins(mp.total_carriers);
     for (int k = 0; k < mp.total_carriers; ++k) {
@@ -710,6 +750,11 @@ Mat<cfloat> CarrierSource::Symbols(int i0, int i1) {
         const cfloat rot(static_cast<float>(std::cos(ph)), static_cast<float>(std::sin(ph)));
         cfloat* dst = Y[static_cast<size_t>(i - i0)];
         for (int k = 0; k < mp.total_carriers; ++k) dst[k] = buf[bins[k]] * rot;
+    }
+    if (profile) {
+        std::fprintf(stderr, "[profile] symbols %d rows: samples(resample+cfo) %.3f fft %.3f (ratio %.6f)\n", i1 - i0,
+                     std::chrono::duration<double>(t1 - t0).count(),
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count(), ratio_);
     }
     return Y;
 }

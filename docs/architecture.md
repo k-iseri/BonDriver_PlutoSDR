@@ -52,16 +52,34 @@ I/Q (任意 fs)
   （params / tables / fft / io / npy / fec / pilots / tmcc / deinterleave / equalize / sync / demod）。
   アルゴリズムは ref/ と同一で、`tools/gen_rt_vectors.py` + `rt/tests/rt_test.cpp` が段ごとに
   一致を検証する（検証方針は docs/decisions.md 2026-10-10 の行を参照）。
-- Viterbi は AVX2（8 状態 × 8 ベクトル、枝メトリックは ±X±Y）+ 窓付きトレースバック。
+- Viterbi は AVX2（8 状態 × 8 ベクトル、枝メトリックは ±X±Y。arm64 は NEON で 4 状態 × 16 ベクトル）+ 窓付きトレースバック。
   復調全体で 2.1 s の I/Q を 2.0 s（1 コア、Release /arch:AVX2）。実時間比 ~1 倍だったため、
   ライブ受信では重複ウィンドウをワーカースレッド（既定 3）で並列に復調して余裕を作っている
-  （下の「TVTest / EDCB 連携」「FPGA 前段経路」参照。raw 経路で約 2.7 コア、FPGA 前段で約 0.3 コア）。
+  （下の「TVTest / EDCB 連携」「FPGA 前段経路」参照。raw 経路で約 2.7 コア、FPGA 前段で約 0.3 コア。
+  2026-10-15 からライブ受信の raw 経路も 8bit ビタビ（`Demodulate(..., fast_fec=true)`、x86 は未再測定）。
+  `--sigmf` の一括復調は既定で float 版のまま、`isdbtd --fast-fec` で同じ 8bit 版にして比べられる）。
+- raw 経路の前段で重いのは分数リサンプル（48 タップ多相 sinc、`ResampleFractional`）と小数 CFO の回転。
+  リサンプルは複素列を float 列として 4 レーン × 4 累算器で積和（NEON、他は同じ構造のスカラー）、CFO 回転は
+  サンプルごとの cos/sin をやめて double の複素乗算で進め 4096 サンプルごとに位相を取り直す。Apple M5 の実機
+  raw 経路で 1.3 → 0.7 コア。`ISDBT_PROFILE=1` で `[profile] symbols`（リサンプル+CFO / FFT）、`[profile] eq`
+  （チャネル推定 / 等化 / デインターリーブ）、層ごとの FEC 行が出る。
+- 同日さらに: FFT を基数 4 の Stockham で実部・虚部を明示して書き（std::complex の乗算は NaN 回復の分岐で遅い、
+  23 µs / 8192 点）、等化の複素除算を y·conj(h)/|h|² に、チャネル推定のキャリアごとの cos/sin を漸化式に、ライブの
+  干渉キャリア検出を FPGA 経路と同じ 1 パス版に、ライブのブロック復号を DecodeRange と同じ範囲復号（前後に助走だけ、
+  前のウィンドウが出したフレームは FEC しない、末尾フレームも出す）にして raw 経路 0.7 → 約 0.5 コア、
+  選局後の遅延も 1 フレーム短い。float 経路（録音・rt_test）と 8bit 範囲復号の TS は先頭 11 TSP（両方とも訂正不能）
+  以外一致。
 - `rt/demod/isdbtd.exe` が docs/daemon-protocol.md v2 のデーモン。--ts / --sigmf の再生（demod_server.py と
   同機能）に加え、`--sdr` で実機（libiio）からのライブ受信と逐次復調（長時間再追従込み）を行う
   （docs/hw-setup.md「SDR ライブ受信」）。
 - ビルドは `make rt`（Windows: rt/build.ps1 → vswhere で CMake/MSVC を探す。出力は
   rt/build/rt-x64/Release/ の rt_test.exe / isdbtd.exe。Linux / macOS: CMake 直接、出力は rt/build/rt-native/）。
-  AVX2 版は x86-64 だけで、arm64 は `__AVX2__` 無しのスカラー版が同じ結果を出す（rt_test で確認）。
+  SIMD は x86-64 の AVX2 と arm64 の NEON（`rt/isdbt/simd.h`。float ビタビ・8bit ビタビ・RS シンドロームの 3 カーネル、
+  ISDB-C の積和はスカラーのまま）で、どちらも無いときのスカラー版と同じ結果を出す（rt_test、録音 10 秒の TS が md5 一致）。
+  `-DISDBT_NO_NEON=ON` でスカラー版に戻せ、`rt_test --bench` で FEC 段の速さを比べられる。Mac で x86-64 の AVX2 経路を
+  コンパイルだけ確かめるには `cmake -S rt -B rt/build/rt-x86 -DCMAKE_OSX_ARCHITECTURES=x86_64` → `--target rt_test`
+  （libiio が arm64 なので isdbtd はリンクできない）。Rosetta を入れれば `arch -x86_64 rt/build/rt-x86/rt_test testdata/rt_vectors`
+  で AVX2 経路のテストも回る（2026-10-15 に 44 件通過を確認。Rosetta 上の速度は実機の目安にならない）。
   OS 依存は isdbtd のソケット（Winsock / POSIX）と isdbc のサイクルカウンタだけで、復調コアは標準 C++17。
 
 ## FPGA 前段経路（pluto-fw-isdbt v2、2026-10-15 実装）
@@ -69,8 +87,8 @@ I/Q (任意 fs)
 Pluto SDR Nano（XC7Z010）: ADC → GI 相関同期 → CFO 回転 → FFT 8192 → SP 等化（CSI 付き）→ {I8, Q8, CSI8} × 5617 / シンボル
   ── USB 14.9 MB/s ──
 ホスト rt/: 32bit 詰めのまま 干渉検出 → 論理変換+セグメント間（1 gather）→ 時間デインターリーブ（必要行だけ）
-  → デマップ+ビットデインターリーブ+±31 量子化（1 パス、int8）→ ビタビ（8bit コスト × 32 レーン AVX2、デパンクチャ融合）
-  → バイトデインターリーブ → 逆拡散 → RS（32 TSP 同時 AVX2）→ TS
+  → デマップ+ビットデインターリーブ+±31 量子化（1 パス、int8）→ ビタビ（8bit コスト × 32 レーン AVX2 / 16 レーン × 4 NEON、デパンクチャ融合）
+  → バイトデインターリーブ → 逆拡散 → RS（32 TSP 同時 AVX2 / NEON）→ TS
 ```
 - `rt/demod/sdr_source` が CAPS bit3 で前段の有無を見て自動で使う（ini `[SDR] FpgaEq=auto`）。手順は raw でソフト
   AGC 約 1 秒 → モード 3（同期 FFT）の 16 窓から整数 CFO δ → モード 0 を 260 ms → EQ_CTRL / モード 4。モード 3/4 中は
