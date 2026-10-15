@@ -19,6 +19,13 @@ Mirakurun にはドライバ API が無く、「選局して TS を標準出力�
 
 ## 準備
 
+**ビルド済みバイナリ**: [GitHub Releases](https://github.com/k-iseri/BonDriver_PlutoSDR/releases) の
+`recpluto-<版>-linux-x86_64.tar.gz` / `-linux-arm64.tar.gz`（Raspberry Pi 4/5 の 64bit OS）/ `-macos-arm64.tar.gz`
+（Apple Silicon）に recpluto と isdbtd、同梱の libiio（lib/）、雛形が入っている（v1.5.1 以降）。展開してそのまま使える
+（Linux は `libusb-1.0-0` と `libxml2` が要る。通常は入っている。macOS は初回に
+`xattr -d com.apple.quarantine recpluto isdbtd lib/*.dylib`）。Windows 版の recpluto.exe は BonDriver の zip に同梱。
+自分でビルドする場合は以下。
+
 1. libiio 1.x（`--sdr` に必要）。Homebrew に formula は無く、apt の libiio-dev は 0.x 系で API が
    違うので使えない。macOS / Ubuntu / Raspberry Pi OS とも
    [libiio](https://github.com/analogdevicesinc/libiio) v1 をソースからビルドする（macOS の依存は

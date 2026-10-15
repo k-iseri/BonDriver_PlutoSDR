@@ -1,0 +1,91 @@
+# recpluto / isdbtd の配布バイナリ（Linux x86-64 / arm64、macOS arm64）をビルドして tar.gz にする。
+# libiio 1.x は apt / Homebrew に無いのでソースからビルドし、共有ライブラリのまま同梱する（tools/package_recpluto.sh）。
+# 単体では成果物を artifact に置くだけ。リリースへの添付は release.yml がこのワークフローを呼ぶ。
+name: recpluto
+
+on:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      tag:
+        description: "リリースタグ（gh release upload の対象。空なら添付しない）"
+        required: false
+        type: string
+        default: ""
+  push:
+    branches: ["recpluto-build"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            label: linux-x86_64
+          - os: ubuntu-22.04-arm
+            label: linux-arm64
+          - os: macos-14
+            label: macos-arm64
+    runs-on: ${{ matrix.os }}
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Install build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build pkg-config libusb-1.0-0-dev libxml2-dev libzstd-dev
+
+      - name: Install build dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install cmake ninja pkgconf libusb zstd
+
+      - name: Build libiio 1.x (shared, USB + network backends; zstd は必須)
+        run: |
+          git clone --depth 1 https://github.com/analogdevicesinc/libiio.git libiio-src
+          cmake -S libiio-src -B libiio-build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$PWD/iio-prefix" -DCMAKE_INSTALL_LIBDIR=lib \
+            -DOSX_FRAMEWORK=OFF -DWITH_USB_BACKEND=ON -DWITH_NETWORK_BACKEND=ON -DWITH_XML_BACKEND=ON \
+            -DWITH_SERIAL_BACKEND=OFF -DWITH_ZSTD=ON -DWITH_IIOD=OFF -DWITH_UTILS=OFF -DWITH_EXAMPLES=OFF \
+            -DWITH_TESTS=OFF -DHAVE_DNS_SD=OFF -DWITH_LOCAL_BACKEND=OFF -DWITH_HWMON=OFF -DWITH_LIBTINYIIOD=OFF \n            -DOSX_PACKAGE=OFF -DINSTALL_UDEV_RULE=OFF -DLIBIIO_COMPAT=OFF
+          cmake --build libiio-build
+          cmake --install libiio-build
+          ls iio-prefix/lib
+
+      - name: Build rt/ (recpluto, isdbtd) against the bundled libiio
+        run: |
+          export PKG_CONFIG_PATH="$PWD/iio-prefix/lib/pkgconfig"
+          cmake -S rt -B rt/build/rt-dist -G Ninja -DCMAKE_BUILD_TYPE=Release -DISDBT_BUNDLE_RPATH=ON
+          cmake --build rt/build/rt-dist
+          # 配布用 rpath（隣の lib/）なのでビルド場所では環境変数で libiio を指す
+          export LD_LIBRARY_PATH="$PWD/iio-prefix/lib" DYLD_LIBRARY_PATH="$PWD/iio-prefix/lib"
+          rt/build/rt-dist/recpluto --help
+          if rt/build/rt-dist/recpluto 99 - -; then echo "bad channel accepted"; exit 1; fi
+
+      - name: Package
+        run: |
+          VER="${TAG}"; case "$VER" in v*) ;; *) VER="dev-$(git rev-parse --short HEAD)";; esac
+          bash tools/package_recpluto.sh "$VER" "${{ matrix.label }}" rt/build/rt-dist "$PWD/iio-prefix"
+          # 展開先から（同梱の lib/ だけで）動くこと
+          D=$(ls -d dist/recpluto-*/ | head -1)
+          "$D/recpluto" --help
+          if "$D/recpluto" --quiet 27 1 -; then echo "should fail without a device"; exit 1; fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: recpluto-${{ matrix.label }}
+          path: dist/recpluto-*.tar.gz
+
+      - name: Attach to the release
+        if: inputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ inputs.tag }}" dist/recpluto-*.tar.gz --clobber

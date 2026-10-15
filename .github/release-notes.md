@@ -1,3 +1,17 @@
+## v1.5.1 の変更点（v1.5.0 から）
+
+- **XO（基準発振器）の周波数補正を自動化**。選局後に同期で測ったサンプルクロック偏差を AD9361 の `xo_correction` に
+  書き、LO のずれ（CFO）とサンプルレートのずれ（SFO）を同時に直します。FPGA 前段（pluto-fw-isdbt v2）では SFO が
+  帯域端の ICI になって B 層の MER が約 24 dB で頭打ちになっていましたが、raw 経路と同等（ch27 で 28〜29 dB）になりました。
+  raw 経路も分数リサンプルの残差が消えて 27 → 30 dB。ini の `[SDR] XoPpm=auto`（既定）。接続後の最初の選局だけ
+  測定に約 1.2 秒かかります（測った値を `XoPpm=-16.1` のように書けば省けます）。
+- 受信機の DC（LO リーク）が乗る中央付近のキャリア（±3 本）を消失扱いにし、MER の集計からも除きました（A 層 25 → 29 dB）。
+- **recpluto / isdbtd の配布バイナリ**を添付: Linux x86-64、Linux arm64（Raspberry Pi 4/5 の 64bit OS）、macOS
+  Apple Silicon の tar.gz（libiio 同梱）と、Windows 版の recpluto.exe / isdbtd.exe（この zip に同梱）。
+  Raspberry Pi の実機は未確認です。
+- isdbtd のリプレイ試験の競合（macOS で TS の順序が崩れる）を修正。
+- Windows の BonDriver は XO 補正と DC キャリアの消失扱い以外は v1.5.0 と同じです。
+
 ## v1.5.0 の変更点（v1.4.2 から）
 
 - **Linux / macOS（Apple Silicon 含む）でも復調コアと isdbtd がビルドできるようになりました**。CMake だけで

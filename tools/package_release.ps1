@@ -28,7 +28,13 @@ New-Item -ItemType Directory -Force $stage | Out-Null
 Copy-Item (Join-Path $bin "*.dll") $stage
 Copy-Item (Join-Path $bin "*.ini.sample") $stage
 Copy-Item (Join-Path $bin "bontest.exe") $stage
+# recpluto.exe / isdbtd.exe（rt\build.ps1 の成果物。あれば同梱。libiio の DLL は上で入っている）
+$rtbin = Join-Path $repo "rt\build\rt-$Arch\$Config"
+foreach ($exe in @("recpluto.exe", "isdbtd.exe")) {
+  if (Test-Path (Join-Path $rtbin $exe)) { Copy-Item (Join-Path $rtbin $exe) $stage } else { Write-Host "note: $exe not built; skipped" }
+}
 Copy-Item (Join-Path $repo "LICENSE") $stage
+Copy-Item (Join-Path $repo "docs\mirakurun.md") $stage
 Copy-Item (Join-Path $repo "docs\setup-tvtest.md") $stage
 
 # インストール手順（詳細は同梱の setup-tvtest.md / リポジトリの docs）
@@ -71,6 +77,10 @@ DLL は 2 種類入っている。どちらか片方だけをインストール�
 - TVTest 無しの動作確認:
     bontest.exe BonDriver_PlutoSDR_T.dll 27 5 out.ts      （地デジ物理 27ch を 5 秒）
     bontest.exe BonDriver_PlutoSDR_TC.dll 1/55 5 out.ts   （CATV 空間の番号 55 = 56ch を 5 秒）
+- recpluto.exe / isdbtd.exe は Mirakurun 用のチューナーコマンドと復調デーモン（Linux / macOS 版と同じもの。
+  libiio の DLL と同じフォルダに置いて使う。使い方は同梱の mirakurun.md）:
+    recpluto.exe 27 10 out.ts                              （地デジ 27ch を 10 秒録画）
+    recpluto.exe --scan gr:13-52                           （受信できる局を channels.yml の形で表示）
 - うまくいかないときの詳細手順は同梱の setup-tvtest.md、または
   https://github.com/k-iseri/BonDriver_PlutoSDR/blob/main/docs/setup-tvtest.md
 '@ | Set-Content (Join-Path $stage "INSTALL.txt") -Encoding UTF8
