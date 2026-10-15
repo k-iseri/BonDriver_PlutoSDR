@@ -26,7 +26,8 @@ python tools/demod_sigmf.py testdata/synthetic/std_mode3_gi8_clean.sigmf-meta --
 Python 3.11 以上。Windows ネイティブ環境を前提にしている。
 `make test`（ループバック・BER 曲線を含む slow テスト）は 10 分程度かかる。
 ref/ の復調は 6 フレーム単位のブロック処理で、速度は実時間の約 14 倍遅、メモリは録音データ
-（complex64、30 秒で約 2 GB）+ 数百 MB。C++ 版（`make rt` → isdbtd.exe）は実時間の約 1 倍。
+（complex64、30 秒で約 2 GB）+ 数百 MB。C++ 版（`make rt` → isdbtd.exe）はライブ受信で CPU 約 2.7 コア
+（raw I/Q、ホスト全段復調）。pluto-fw-isdbt v2 の FPGA 前段を使うと地デジ約 0.3 コア、CATV（ISDB-C）は raw のまま約 0.35 コア（i7-13700F）。
 
 長時間・ドリフト・瞬断のある録音は `--track`（`demod_sigmf.py` / `isdbtd`）で追従復調。
 受信品質の切り分けは `python tools/rx_report.py <録音>.sigmf-meta --plot out/r`
@@ -38,7 +39,8 @@ ref/ の復調は 6 フレーム単位のブロック処理で、速度は実時
 ビルド済みの配布 zip は [GitHub Releases](https://github.com/k-iseri/BonDriver_PlutoSDR/releases) にある
 （`v*` タグの push で GitHub Actions が自動ビルド・添付する。手順は `rt/bondriver/README.md`）。
 インストール方法は `docs/setup-tvtest.md`（zip の中身を TVTest の BonDriver フォルダへコピーして
-ini.sample をリネームするだけ）。自分でビルドする場合:
+ini.sample をリネームするだけ）。Pluto に [pluto-fw-isdbt](https://github.com/k-iseri/pluto-fw-isdbt) v2 を書いてあれば
+地デジの同期・FFT・等化を FPGA で行い（`[SDR] FpgaEq=auto` で自動判別）、PC 側は約 0.3 コアで済む。自分でビルドする場合:
 ```
 make bondriver                                   # または .\dev.ps1 bondriver（VS 2022 Build Tools が必要）
 make rt                                          # 復調デーモン isdbtd.exe と一致テスト rt_test.exe
