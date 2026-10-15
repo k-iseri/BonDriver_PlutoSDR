@@ -12,6 +12,7 @@ constexpr double kRetuneSkipSeconds = 0.65;    // SDR のブロックキュー�
 constexpr int kFirstWindowNewFrames = 6;        // 選局直後の最初のウィンドウの新規フレーム数（TS まで約 5 秒、
                                                 // 排出 5 フレーム ≈ 1.2 s で SDT の繰り返し周期 1 s を覆う）
 constexpr int kFirstWindowCtxFrames = 2;        // 同・文脈フレーム数（定常は ctx_frames_ = 4）
+constexpr int kFirstWindowNewFramesSym = 4;     // FPGA 等化モードの最初のウィンドウ（文脈 3 + 4 + 1 フレーム ≈ 1.9 s。TVTest のスキャンは選局 9 秒以内に PSI が要る）
 }
 
 LiveDemod::LiveDemod(SdrConfig cfg, Mode mode, Gi gi, int new_frames, int ctx_frames, int workers,
@@ -391,10 +392,12 @@ void LiveDemod::SchedLoop() {
             std::lock_guard<std::mutex> lock(mu_);
             if (!locked_ && mer_db_ == 0.0) mer_db_ = 10.0;     // 暫定レベル（FPGA が同期しているので信号はある）
         }
-        while (sym_mode_ && acc_sym.size() >= win_syms_for(cur_new, 0) && active_jobs() < workers_) {
-            const size_t win_syms = win_syms_for(cur_new, 0);
-            const int fec_frames = cur_new;
-            const size_t adv_syms = static_cast<size_t>(cur_new) * kSymbolsPerFrame;
+        auto sym_new = [&]() { return (cur_new == first_new) ? std::min(kFirstWindowNewFramesSym, cur_new) : cur_new; };
+        while (sym_mode_ && acc_sym.size() >= win_syms_for(sym_new(), 0) && active_jobs() < workers_) {
+            const int nf = sym_new();
+            const size_t win_syms = win_syms_for(nf, 0);
+            const int fec_frames = nf;
+            const size_t adv_syms = static_cast<size_t>(nf) * kSymbolsPerFrame;
             cur_new = new_frames_;
             const int total = ModeParamsOf(mode_).total_carriers;
             // {I8, Q8, CSI8} を 32bit に詰めたまま後段へ（cfloat/float に広げない）
