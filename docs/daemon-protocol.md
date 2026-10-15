@@ -84,7 +84,7 @@ TVTest / EDCB
   等化済みキャリアを受信中）、`fpga_delta`（整数 CFO [ビン]）、`fpga_symbols`（受けたシンボル数）、
   `fpga_symbol_gaps`（連番の途切れ）が付く（2026-10-15 追加。すべて省略可で、無いクライアントは無視してよい）。
   同日追加: `fpga_last_start`（直近の窓開始サンプル番号。ホストで 64bit に伸ばした値）、`fpga_start_hi`（ファームが出した
-  上位 32bit そのまま。v2.0.1 以降は周回ごとに増える）、`splice_resets`（TS 継ぎ合わせの安全弁が働いた回数）。
+  上位 32bit そのまま。v2.0.1 以降は周回ごとに増える）、`splice_resets`（TS 継ぎ合わせの安全弁が働いた回数）、`fpga_timeouts`（モード 3/4 で窓が来ずタイムアウトして raw に戻した回数）。
 - `dropped` はストリーム送信が実時間に追いつかず捨てた TSP 数。
 - ISDB-C（`"system": "isdbc"`）では `mode` / `gi` / `layers` の代わりに
   `"mer_db"`, `"acquired"`, `"byte_sync"`, `"inverted"`（スペクトル反転を検出した）, `"cfo_hz"`, `"clock_ppm"`,
