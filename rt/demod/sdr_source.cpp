@@ -196,7 +196,16 @@ void SdrSource::Connect() {
             std::lock_guard<std::mutex> lk(mu_);
             freq = cfg_.freq_hz;        // 切断中に Retune された周波数を拾う
         }
-        WriteAttr(im.phy_lo, "frequency", FormatLL(freq));
+        try {
+            WriteAttr(im.phy_lo, "frequency", FormatLL(freq));
+            muted_ = false;
+        } catch (const std::exception& e) {
+            // LO の範囲外（AD9363 は 325 MHz〜。CATV 空間の VHF 1〜12ch などは設定できない）。接続は続け、
+            // 有効な周波数が来るまで I/Q を止める（止めないと前の周波数の TS が出続け、スキャンで同じ局が並ぶ）
+            muted_ = true;
+            std::fprintf(stderr, "sdr: frequency %.3f MHz not accepted (%s); no I/Q until a valid frequency is set\n",
+                         freq / 1e6, e.what());
+        }
 
         iio_channel* v0 = iio_device_find_channel(rxdev, "voltage0", false);
         iio_channel* v1 = iio_device_find_channel(rxdev, "voltage1", false);
@@ -289,11 +298,16 @@ void SdrSource::Retune(double freq_hz) {
     if (!connected_ || !impl_->phy_lo) return;      // 再接続時に Connect() が適用する
     try {
         WriteAttr(impl_->phy_lo, "frequency", FormatLL(freq_hz));
+        muted_ = false;
         if (fpga_capable_) fe_restart_ = true;      // raw からやり直す（AGC → δ → モード 4）
     } catch (const std::exception& e) {
-        // デバイスが消えた直後など。ストリーム側もすぐエラーになり再接続が走るので、
-        // ここでは記録だけ（cfg_.freq_hz は更新済みなので再接続後に正しい周波数になる）
-        std::fprintf(stderr, "sdr: retune failed (%s); will apply after reconnect\n", e.what());
+        // LO の範囲外（AD9363 は 325 MHz〜。CATV 空間の VHF 1〜12ch は 93〜222 MHz で設定できない）か、
+        // デバイスが消えた直後。どちらも有効な周波数が設定できるまで I/Q を止める。止めないと前の周波数の
+        // TS が出続け、TVTest のチャンネルスキャンで同じ局が何度も見つかる（2026-10-15 CATV で発覚）。
+        // デバイス消失ならストリーム側もエラーになり再接続が走り、Connect() が cfg_.freq_hz を適用し直す
+        muted_ = true;
+        std::fprintf(stderr, "sdr: retune to %.3f MHz failed (%s); no I/Q until a valid frequency is set\n",
+                     freq_hz / 1e6, e.what());
     }
 }
 
@@ -446,6 +460,13 @@ void SdrSource::Run() {
             continue;
         }
         if (fe_restart_.exchange(false) && fe != Fe::kRaw) fe_to_raw();
+        if (muted_) {
+            // 周波数が設定できていない: 何も渡さない（復調側は無信号として扱う）。前段も止めておく
+            if (fe != Fe::kRaw) fe_to_raw();
+            fe_blocks = 0;
+            ++blocks_;
+            continue;
+        }
         if (fe != Fe::kRaw) {
             // ---- FPGA 前段のフレーム列（32bit ワード）----
             const uint8_t* p = static_cast<const uint8_t*>(iio_block_start(blk));

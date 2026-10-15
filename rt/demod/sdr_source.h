@@ -94,6 +94,8 @@ public:
     const std::string& desc() const { return desc_; }
     long long blocks() const { return blocks_; }
     bool connected() const { return connected_; }
+    // 要求された周波数が LO の範囲外などで設定できず、I/Q を止めている（無信号として扱われる）
+    bool muted() const { return muted_; }
     long long reconnects() const { return reconnects_; }
     // FPGA が報告したハード確定ドロップ（axi_ad9361 UI_STATUS の UI_OVF を約 1 秒周期で
     // 監視した検出回数）。純正ファームで動く。実機検証 2026-10-12（健全時 0、USB 飽和で検出）。
@@ -148,6 +150,7 @@ private:
     std::atomic<long long> fpga_symbols_{0};
     std::atomic<bool> fe_restart_{false};   // Retune: raw からやり直す（AGC → δ → モード 4）
     std::atomic<bool> fe_enabled_{true};    // EnableFpgaFrontEnd（false の間は raw のまま）
+    std::atomic<bool> muted_{false};        // 周波数設定の失敗中: ブロックもシンボルも渡さない
     volatile long long blocks_ = 0;
     std::string desc_;
 };

@@ -152,6 +152,7 @@ double LiveIsdbc::signal_db() {
 void LiveIsdbc::OnBlock(const cfloat* p, size_t n) {
     if (skip_samples_ > 0) {
         skip_samples_ -= static_cast<long long>(n);
+        rate_mon_.Reset();          // 選局直後の読み飛ばしをレート不足と誤計上しない（毎回「rx rate 7.5 MHz」が出ていた）
         return;
     }
     const double t = std::chrono::duration<double>(
@@ -191,19 +192,25 @@ void LiveIsdbc::OnSdrEvent(bool up) {
 void LiveIsdbc::WorkLoop() {
     while (!stop_) {
         std::vector<cfloat> blk;
+        bool have_blk = false;
         {
             std::unique_lock<std::mutex> lock(iq_mu_);
             iq_cv_.wait_for(lock, std::chrono::milliseconds(200), [&] { return !iq_q_.empty() || stop_; });
             if (stop_) break;
-            if (iq_q_.empty()) continue;
-            blk = std::move(iq_q_.front());
-            iq_q_.pop_front();
-            iq_total_ -= static_cast<long long>(blk.size());
+            if (!iq_q_.empty()) {
+                blk = std::move(iq_q_.front());
+                iq_q_.pop_front();
+                iq_total_ -= static_cast<long long>(blk.size());
+                have_blk = true;
+            }
         }
+        // 選局後のリセットは I/Q が来なくても行う（LO 範囲外で SDR が I/Q を止めているとき、前の局の
+        // locked / MER が status に残って TVTest のスキャンが信号ありと見る）
         if (reset_pending_.exchange(false)) {
             demod_->Reset();
             pending_.clear();
         }
+        if (!have_blk) continue;
         if (select_pending_.exchange(false)) {
             // TS 選択の変更は復調器を作り直さず Reset（TSMF の再同期は 53 パケットで済む）
             isdbc::IsdbcConfig dc;
