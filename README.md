@@ -10,7 +10,9 @@ PC 上のソフトウェアで復調して MPEG-2 TS を取り出すプロジェ
   ライブ受信（LiveDemod / LiveIsdbc / LiveSwitch）、`rt/bondriver/` は TVTest / EDCB 用 BonDriver
   （`_T` = 地デジのみ、`_TC` = 地デジ + CATV）、`rt/tests/` は ref/ との一致テスト
 - `hw/` — ボード固有の設定・録音スクリプト・将来の HDL 改変
-- `tools/` — 録音、I/Q 解析、受信品質レポート、TS 検査
+- `tools/` — 録音、I/Q 解析、受信品質レポート、TS 検査。`fe_*.py` は FPGA 前段（pluto-fw-isdbt v2）の実機検証
+  （fe_fft_test: FFT テストモード、fe_sync_test: 同期、fe_carrier_demod: 同期 FFT 出力 → ref/ 後段、
+  fe_eq_model: 等化器のアルゴリズムモデル、fe_eq_test: モード 4 の取り込みと ref/ 後段での MER / RS / TS 一致）
 - `docs/` — 仕様ノート、設計、判断記録
 - `testdata/` — 合成信号と実波録音（gitignore）
 

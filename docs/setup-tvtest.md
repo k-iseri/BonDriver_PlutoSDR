@@ -121,6 +121,9 @@ UHF/CATV 帯のチャンネルに載っている。`BonDriver_PlutoSDR_TC.dll` �
 2. TVTest のチャンネルスキャンでチューニング空間 **CATV** を選ぶ。チャンネル番号は VHF 1〜12ch、
    UHF 13〜62ch、C13〜C63 の通し番号（0〜112）。BS 再送信は局によって UHF 帯（例: 49〜56ch）や
    C40 台に置かれている。全部スキャンすると 113ch × 数秒かかるので、分かっていれば絞る。
+   **VHF 1〜12ch（93〜222 MHz）は AD9363 の LO 下限 325 MHz より低く受信できない**。この 12 ch は
+   周波数を設定できないので無信号として扱われ、スキャンでは「見つからない」で飛ばされる（v1.3.1 以降。
+   それ以前は直前の局の TS が出続け、スキャンで同じ局が何度も見つかった）。
 3. **BonDriver_BDA から乗り換える場合**: `BonDriver_BDA.ch2` の 2 列目（チューニング空間）を
    `0` から `1` に置き換えて `BonDriver_PlutoSDR_TC.ch2` として置けば、スキャンせずにそのまま使える
    （チャンネル番号の付け方が BonDriver_BDA の `ChannelSettingsAuto="TransModulation"` と同じ）。

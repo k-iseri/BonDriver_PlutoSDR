@@ -84,6 +84,10 @@ Pluto SDR Nano（XC7Z010）: ADC → GI 相関同期 → CFO 回転 → FFT 8192
   デインターリーブ 0.06 s / 1.8 s。`ISDBT_PROFILE=1` で段ごとの時間、`ISDBT_VITERBI_CHECK=1` で float 版ビタビとの突き合わせ。
 - 7010 で残る選択肢（デマップの FPGA 化、TMCC 復号）は数 % の効果。後段（ビタビ・RS）の FPGA 化は時間デインターリーブ
   （6.4 MB）が BRAM に入らず 7020 向け（pluto-fw-isdbt docs/design-v2.md）。
+- 検証ツール: `tools/fe_fft_test.py`（FFT テストモードのループバック）、`fe_sync_test.py`（同期モード）、
+  `fe_carrier_demod.py`（同期 FFT 出力 → ref/ 後段で TS 一致）、`fe_eq_model.py`（等化器の固定小数点モデル、
+  `--vectors` で RTL の検証ベクタ）、`fe_eq_test.py`（モード 4 の取り込み → ref/ 後段で MER / RS / TS 一致。
+  δ 推定・EQ_STATUS の読み出し付き）。デーモン側は `ISDBT_FE_DUMP=path` で前段フレーム列をそのまま書ける。
 - 落とし穴: ファーム v2.0.0 の窓開始サンプル番号は下位 32bit だけ（528 秒で一周）。ホストで周回を数え（v1.3.1）、
   ファーム v2.0.1 で 64bit 化。モード 3 → 4 を直接切り替えると時間軸がずれるのでモード 0 を挟む。
 

@@ -131,6 +131,8 @@ copy ..\..\..\bondriver\BonDriver_PlutoSDR.ini.sample BonDriver_PlutoSDR_T.ini  
 - 受信ゲインの既定はソフトウェア AGC（帯域内 −24 dBFS 目標、`[SDR] AgcTargetDbfs`）。AD936x 内蔵の
   slow_attack（`Gain=hw`）はケーブル端子のような強い全帯域入力で圧縮し MER が 20 dB に張り付く
   （docs/hw-setup.md「受信ゲイン」）。
+- 周波数が LO の範囲外（AD9363 は 325 MHz〜。CATV 空間の VHF 1〜12ch）で設定できないときは、有効な周波数が
+  来るまで I/Q を止めて無信号として報告する（TVTest のスキャンで直前の局が並ばないように）。
 - `_TC` 版の `[CATV] Ts=` で TSMF の相対 TS 番号を固定できる（既定は自動 = 有効 TS の最小番号、
   `all` で BonDriver_BDA 互換の全スロット通過）。
 - 32/64 bit は TVTest 本体に合わせる（違うと LoadLibrary で失敗する）。
