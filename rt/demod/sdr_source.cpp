@@ -521,6 +521,8 @@ void SdrSource::Run() {
                         fe_start_lo_ = lo;
                         fe_start_init_ = true;
                         sym.start = (fe_start_hi_ << 32) | lo;
+                        fpga_last_start_ = sym.start;
+                        fpga_last_start_hi_ = w[3];
                     }
                     sym.seq = w[4];
                     sym.delta_q = static_cast<int32_t>(w[5]);

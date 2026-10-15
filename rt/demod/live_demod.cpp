@@ -125,6 +125,8 @@ std::string LiveDemod::StatusJson() {
     s += ", \"fpga_delta\": " + std::to_string(sdr_->fpga_delta());
     s += ", \"fpga_symbols\": " + std::to_string(sdr_->fpga_symbols());
     s += ", \"fpga_symbol_gaps\": " + std::to_string(sym_gaps_.load());
+    s += ", \"fpga_last_start\": " + std::to_string(sdr_->fpga_last_start());
+    s += ", \"fpga_start_hi\": " + std::to_string(sdr_->fpga_last_start_hi());
     s += ", \"splice_resets\": " + std::to_string(splice_resets_);
     s += ", \"sdr_connected\": " + std::string(sdr_->connected() ? "true" : "false");
     s += ", \"sdr_reconnects\": " + std::to_string(sdr_->reconnects());
