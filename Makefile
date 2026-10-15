@@ -4,7 +4,8 @@ ifeq ($(OS),Windows_NT)
   BIN = $(VENV)/Scripts
   RM = powershell -NoProfile -Command Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 else
-  PY ?= python3          # macOS / Ubuntu は python3 だけで python が無い
+  # macOS / Ubuntu は python3 だけで python が無い
+  PY ?= python3
   BIN = $(VENV)/bin
   RM = rm -rf
 endif
