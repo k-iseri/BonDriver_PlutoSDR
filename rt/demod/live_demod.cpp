@@ -302,6 +302,9 @@ void LiveDemod::SchedLoop() {
     std::vector<cfloat> acc;
     long long acc_abs0 = 0, abs_in = 0;
     long long cur_gen = 0;
+    // XO 補正を書いた後、この入力サンプル番号より前に始まるウィンドウの clock_ppm は再提案に使わない
+    long long xo_valid_from = 0;
+    constexpr double kXoSettleSec = 0.5;    // 書き込みが取り込みに反映されるまでの余裕（USB バッファ 2〜4 ブロック分）
     std::deque<WindowJob> jobs;
     // FPGA 等化モード: シンボル単位のウィンドウ（連番が途切れたら組み直す）
     std::vector<EqSymbol> acc_sym;
@@ -355,9 +358,13 @@ void LiveDemod::SchedLoop() {
             while (!iq_q_.empty()) {
                 auto& blk = iq_q_.front();
                 abs_in += static_cast<long long>(blk.size());
-                if (acc.empty()) acc_abs0 = abs_in - static_cast<long long>(blk.size());
-                acc.insert(acc.end(), blk.begin(), blk.end());
                 iq_total_ -= static_cast<long long>(blk.size());
+                // XO 補正直後の過渡（PLL の引き込み + USB で流れてくる補正前の残り）はウィンドウに入れない。
+                // 入れると補正後の最初のウィンドウが sync failed になり、ロックが 1 ウィンドウ分遅れた（2026-10-16）
+                if (abs_in > xo_valid_from) {
+                    if (acc.empty()) acc_abs0 = abs_in - static_cast<long long>(blk.size());
+                    acc.insert(acc.end(), blk.begin(), blk.end());
+                }
                 iq_q_.pop_front();
             }
         }
@@ -486,19 +493,29 @@ void LiveDemod::SchedLoop() {
                 if (verbose_) std::fprintf(stderr, "window @%lld: sync failed\n", job.abs0);
                 continue;
             }
-            // raw 経路: 同期で測ったサンプルクロック偏差を SDR に伝える（XO 補正。接続ごとに 1 回だけ書かれる）
-            if (!sdr_->fpga_eq() && sdr_->SuggestClockPpm(res->sync.clock_ppm)) {
+            // raw 経路: 同期で測ったサンプルクロック偏差を SDR に伝える（XO 補正）。
+            // 書き込みで LO とサンプルレートが変わるので、仕掛かり中のウィンドウと蓄積済みの I/Q（補正前）は捨てて
+            // 選局直後と同じ形で組み直す。補正前のサンプルで測った同じ ppm を次のウィンドウがもう一度報告して
+            // 重ね書き（−16 → −32 → −48 ppm）になっていたので（純正 16bit ファームの TVTest 起動直後にドロップ多発、
+            // 2026-10-16）、書き込み後 kXoSettleSec 以降に始まるウィンドウだけが次の値を提案できる
+            if (!sdr_->fpga_eq() && job.abs0 >= xo_valid_from && sdr_->SuggestClockPpm(res->sync.clock_ppm)) {
                 if (verbose_) std::fprintf(stderr, "window @%lld: clock %+.2f ppm -> xo_correction applied; resyncing\n",
                                            job.abs0, res->sync.clock_ppm);
+                Emit(*res, job.abs0);           // このウィンドウは補正前のサンプルで一貫しているので出す
+                xo_valid_from = abs_in + static_cast<long long>(std::llround(cfg_.fs * kXoSettleSec));
+                acc.clear();
+                cur_new = first_new;
+                ResetSplice(&cur_gen, /*count_underrun=*/false);
+                break;                          // 旧世代の仕掛かりは次のループで捨てられる
             }
             Emit(*res, job.abs0);
         }
     }
 }
 
-void LiveDemod::ResetSplice(long long* cur_gen) {
+void LiveDemod::ResetSplice(long long* cur_gen, bool count_underrun) {
     std::lock_guard<std::mutex> lock(mu_);
-    ++underruns_;
+    if (count_underrun) ++underruns_;
     ++gen_;                 // 仕掛かり結果は無効化
     *cur_gen = gen_;
     anchored_ = false;
