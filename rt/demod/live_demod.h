@@ -109,7 +109,7 @@ private:
     };
 
     void SchedLoop();
-    void ResetSplice(long long* cur_gen);
+    void ResetSplice(long long* cur_gen, bool count_underrun = true);   // XO 補正の組み直しは underruns に数えない
     void Emit(const DemodResult& res, long long abs0);
     void PaceLoop();
 
