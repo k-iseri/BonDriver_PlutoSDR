@@ -16,3 +16,4 @@ dist/
 *.egg-info/
 
 rt/third_party/libiio/
+.DS_Store

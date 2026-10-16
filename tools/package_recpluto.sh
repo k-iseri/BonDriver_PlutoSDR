@@ -37,6 +37,9 @@ else
   (cd "$STAGE" && ldd recpluto | sed 's/^/  /') || true
 fi
 
+# Homebrew の dylib などは 0444 のまま入る。読み取り専用だと macOS の利用者が xattr -d で隔離属性を外せない
+chmod -R u+w "$STAGE"
+
 cat > "$STAGE/README.txt" <<EOF
 recpluto $VERSION ($LABEL) — Pluto SDR で地上デジタル放送（ISDB-T フルセグ）とケーブルテレビの BS/CS
 トランスモジュレーション（ISDB-C）を受信し、Mirakurun のチューナーコマンドとして TS を標準出力に流す。
@@ -49,10 +52,13 @@ isdbtd は同じ復調器の TCP デーモン版（録音ファイルの再生�
   tuners.yml: command: "recpluto --type=<type> --tsid=<tsid> <channel> - -"（mirakurun/ の雛形）
 
 必要なもの:
-  - Linux: libusb-1.0-0、libxml2、libzstd1（通常は入っている）。Pluto の USB を一般ユーザーに許可するには
-    mirakurun/99-plutosdr.rules を /etc/udev/rules.d/ にコピーして udevadm control --reload
-  - macOS: 初回は "xattr -d com.apple.quarantine recpluto isdbtd lib/*.dylib" で隔離属性を外す
-    （署名・公証していないため）
+  - Linux: glibc 2.35 以降（Ubuntu 22.04 / Debian 12 以降。古い OS では GLIBC_2.3x not found で起動しないので自前ビルド）、
+    libusb-1.0-0、libxml2、libzstd1（通常は入っている）。Pluto の USB を一般ユーザーに許可するには
+    mirakurun/99-plutosdr.rules を /etc/udev/rules.d/ にコピーして udevadm control --reload。
+    開けないときは tuners.yml の command を手で実行して stderr を見る（権限なら Permission denied / Bad URI usb:）
+  - macOS: 初回は展開したフォルダで "xattr -dr com.apple.quarantine ." を実行して隔離属性を外す（署名・公証して
+    いないため）。外さないと recpluto は起動時に同梱の dylib の読み込みを Gatekeeper に拒否されて SIGABRT で落ち、
+    Mirakurun からは「チューナーが開けない」ように見える（システム設定で recpluto 本体を許可しても dylib は別）
   - lib/ の libiio（LGPL-2.1+、https://github.com/analogdevicesinc/libiio）は共有ライブラリとして同梱。
     macOS は libusb（LGPL-2.1+、https://libusb.info）と zstd（BSD-3-Clause）も同梱。差し替え可能。
   - recpluto / isdbtd 本体は MIT（LICENSE）。ソース: https://github.com/k-iseri/BonDriver_PlutoSDR

@@ -23,7 +23,8 @@ Mirakurun にはドライバ API が無く、「選局して TS を標準出力�
 `recpluto-<版>-linux-x86_64.tar.gz` / `-linux-arm64.tar.gz`（Raspberry Pi 4/5 の 64bit OS）/ `-macos-arm64.tar.gz`
 （Apple Silicon）に recpluto と isdbtd、同梱の libiio（lib/）、雛形が入っている（v1.5.1 以降）。展開してそのまま使える
 （Linux は `libusb-1.0-0` と `libxml2` が要る。通常は入っている。macOS は初回に
-`xattr -d com.apple.quarantine recpluto isdbtd lib/*.dylib`）。Windows 版の recpluto.exe は BonDriver の zip に同梱。
+展開したフォルダで `xattr -dr com.apple.quarantine .`。本体だけ許可しても同梱 dylib の読み込みが Gatekeeper に
+拒否されて起動時に落ちる）。Windows 版の recpluto.exe は BonDriver の zip に同梱。
 自分でビルドする場合は以下。
 
 1. libiio 1.x（`--sdr` に必要）。Homebrew に formula は無く、apt の libiio-dev は 0.x 系で API が
@@ -182,6 +183,10 @@ cd "$D/node_modules/mirakurun" && exec node --max-semi-space-size=64 -r source-m
 ```
 server.yml の `path`（UNIX ソケット）は `/var/run` ではなく書ける場所（例 `~/mirakurun/run/mirakurun.sock`）にする。
 止めるときは `pkill -f "Mirakurun: Server"`（process.title を変えるので `lib/server.js` では一致しない）。
+Web UI の再起動ボタン（`PUT /api/restart`）は PM2 / Docker / winsw 配下でないと 500 を返して何もしないので、
+tuners.yml を変えた後や、チューナーが fault（ログに `RESTART REQUIRED`）になった後は pkill → start.sh で立て直す。
+チューナーコマンドが起動直後に落ちる（ログが `SIGABRT` の繰り返し）ときは `~/Library/Logs/DiagnosticReports/recpluto-*.ips`
+の termination を見る。`library load disallowed by system policy` なら同梱 dylib の隔離属性（上の `xattr -dr`）。
 二重起動すると両方が Pluto を取りに行き、後発の isdbtd が `Unable to claim interface: Permission denied`
 で即終了して Mirakurun が 100 ms ごとに再起動を繰り返すので、起動前に必ず止める。
 チャンネルは `curl -X PUT "http://127.0.0.1:40772/api/config/channels/scan?type=GR&minCh=13&maxCh=52&refresh=true"`
@@ -198,5 +203,12 @@ server.yml の `path`（UNIX ソケット）は `/var/run` ではなく書ける
   （`ISDBT_PROFILE=1` の `[profile] symbols / eq / deint` 行と層ごとの FEC 行）。
   Raspberry Pi 4/5 は未測定（`rt/build/rt-native/rt_test --bench` で FEC 段だけ先に測れる。raw 経路が足りなければ
   FPGA 前段ファーム（pluto-fw-isdbt v2）を使うのが先で、ホスト側の次の候補は FFT・等化の NEON 化）。
+- 配布バイナリの Linux 版は ubuntu-22.04 の runner でビルドしているので glibc 2.35 以降（Ubuntu 22.04 / Debian 12
+  bookworm 以降、Raspberry Pi OS は bookworm 以降）が要る。それより古い OS では `GLIBC_2.3x not found` で起動しない
+  ので自前ビルド（上の手順）。
+- Linux で Mirakurun からチューナーが開けない（recpluto が即終了して 100 ms ごとに respawn → fault）ときの原因は
+  macOS の隔離属性ではなく、USB の権限（udev ルール未設置や Mirakurun の実行ユーザー / コンテナから /dev/bus/usb が
+  見えない: `Unable to claim interface: Permission denied` か `Bad URI usb:`）か、OS のライブラリ不足（終了コード 127、
+  `error while loading shared libraries`）。tuners.yml の command をそのまま手で実行すれば stderr に出る。
 - FPGA 前段（pluto-fw-isdbt v2）は libiio 経由のレジスタアクセスなので OS を問わず使える（v2.0.2 以降を推奨）。
 - USB 2.0 帯域: 8bit ファームなら公称レート、純正ファームなら 7/8 レート（Windows と同じ）。

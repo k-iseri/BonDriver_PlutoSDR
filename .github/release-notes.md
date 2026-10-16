@@ -1,3 +1,16 @@
+## v1.5.3 の変更点（v1.5.2 から）
+
+- **macOS の recpluto 配布 tar.gz が、README の手順どおりに隔離属性を外せなかった問題を修正**。同梱の libusb / libzstd が
+  読み取り専用（0444）で `xattr -d` が Permission denied になり、Gatekeeper が dylib の読み込みを拒否して recpluto が起動直後に
+  SIGABRT で落ち、Mirakurun からはチューナーが開けないように見えていました（システム設定で recpluto 本体を許可しても
+  dylib は別）。配布物を書き込み可にし、手順を展開フォルダでの `xattr -dr com.apple.quarantine .` 1 回にしました。
+  v1.5.1 / v1.5.2 の tar.gz を使う場合は `chmod -R u+w .` してから同じコマンドを実行してください。
+- docs/mirakurun.md: macOS で直接起動した Mirakurun は Web UI の再起動が効かない（PM2 無しでは 500）ことと、
+  チューナーコマンドが起動できないときの切り分け（クラッシュレポートの termination）を追記。
+- Linux 版の tar.gz は変更ありませんが、必要な glibc（2.35 以降 = Ubuntu 22.04 / Debian 12 以降）と、チューナーが
+  開けないときの切り分け（USB の権限、ライブラリ不足）を README.txt と docs/mirakurun.md に追記しました。
+- 復調器・BonDriver・Windows 版に変更はありません。
+
 ## v1.5.2 の変更点（v1.5.1 から）
 
 - **純正ファーム（16bit、raw 経路）で TVTest 起動直後のチャンネルにドロップが多発する問題を修正**（選局し直すと直っていたもの）。
