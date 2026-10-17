@@ -86,7 +86,25 @@ cd rt\build\bondriver-x64\Release
 copy ..\..\..\bondriver\BonDriver_PlutoSDR.ini.sample BonDriver_PlutoSDR_T.ini   # 編集する
 .\bontest.exe BonDriver_PlutoSDR_T.dll 27 5 out.ts
 ```
-1 秒ごとに受信レート・信号レベル・同期バイト不整合数を表示する。終了コード 0 が正常。
+1 秒ごとに受信レート・信号レベル・同期バイト不整合数・継続カウンタ欠落（drop、TVTest の D 相当）・
+TEI（error、TVTest の E 相当）を表示する。終了コード 0 が正常（drop / error は終了コードに含めない）。
+
+### 長時間視聴試験
+
+TVTest と同じスタンドアロン経路を無人で長時間回し、TS 側（drop / error）と復調側（MER、RS 訂正不能、
+サンプル落ち、再接続）の両方を記録する。
+
+```
+# ini の [Debug] Log=1 にしておく（10 秒ごとに復調統計がログに残る）
+cd rt\build\bondriver-x64\Release
+.\bontest.exe --interval 10 BonDriver_PlutoSDR_T.dll 24 3600 > longrun.txt     # 24ch を 1 時間
+cd ..\..\..\..
+.venv\Scripts\python tools\bonlog_report.py rt\build\bondriver-x64\Release\BonDriver_PlutoSDR_T.log --bontest rt\build\bondriver-x64\Release\longrun.txt --every 6
+```
+`--interval N` は統計行の間隔（秒）。`bonlog_report.py` は最後の DLL ロード以降のセッションを集計し、
+区間ごとの表（累積カウンタは前行からの増分）と、ロック率・MER の min/median/max・増えたカウンタ・
+drop / error の起きた時刻を出す。合格の目安: drop 0・error 0・rs_uncorrectable が選局直後以外で増えない・
+sdr_reconnects 0・MER が時間とともに下がらない。出力 TS を残す必要は無い（1 時間で約 7.8 GB になる）。
 
 ## 実装メモ
 
