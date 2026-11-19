@@ -41,12 +41,14 @@ void LiveIsdbc::Stop() {
 std::shared_ptr<ClientQueue> LiveIsdbc::AddClient() {
     auto q = std::make_shared<ClientQueue>();
     std::lock_guard<std::mutex> lock(mu_);
+    q->AdvanceGeneration(stream_gen_.load(std::memory_order_relaxed));
     clients_.push_back(q);
     return q;
 }
 
 void LiveIsdbc::AttachClient(const std::shared_ptr<ClientQueue>& q) {
     std::lock_guard<std::mutex> lock(mu_);
+    q->AdvanceGeneration(stream_gen_.load(std::memory_order_relaxed));
     clients_.push_back(q);
 }
 
@@ -55,30 +57,31 @@ void LiveIsdbc::RemoveClient(const std::shared_ptr<ClientQueue>& q) {
     clients_.erase(std::remove(clients_.begin(), clients_.end(), q), clients_.end());
 }
 
-void LiveIsdbc::Tune(bool has_ch, int ch, double freq) {
+void LiveIsdbc::Tune(bool has_ch, int ch, double freq, TsGeneration generation) {
+    if (generation == 0) generation = NextTsGeneration();
+    bool same_freq;
     {
         std::lock_guard<std::mutex> lock(mu_);
-        if (has_freq_ && freq == freq_hz_) {
-            has_channel_ = has_ch;
-            channel_ = ch;
-            return;                     // 同一周波数: 復調を壊さない
-        }
+        if (generation <= stream_gen_.load(std::memory_order_relaxed)) return;
+        same_freq = has_freq_ && freq == freq_hz_;
+        stream_gen_.store(generation, std::memory_order_release);
         has_channel_ = has_ch;
         channel_ = ch;
         freq_hz_ = freq;
         has_freq_ = true;
-        for (auto& q : clients_) {
-            std::lock_guard<std::mutex> ql(q->mu);
-            q->chunks.clear();
-        }
+        for (auto& q : clients_) q->AdvanceGeneration(generation);
     }
-    if (!external_) sdr_->Retune(freq);
-    skip_samples_ = static_cast<long long>(kRetuneSkipSeconds * cfg_.fs);
+    if (!same_freq) {
+        if (!external_) sdr_->Retune(freq);
+        skip_samples_ = static_cast<long long>(kRetuneSkipSeconds * cfg_.fs);
+    }
     {
         std::lock_guard<std::mutex> lock(iq_mu_);
         iq_q_.clear();
         iq_total_ = 0;
     }
+    // Feed 中に選局された場合も、その呼び出しが出す TS は旧世代で拒否される。
+    // 次のブロック前に demodulator と未完了の小分け TS をリセットする。
     reset_pending_ = true;
     iq_cv_.notify_all();
 }
@@ -173,7 +176,7 @@ void LiveIsdbc::OnBlock(const cfloat* p, size_t n) {
         std::lock_guard<std::mutex> l2(mu_);
         ++underruns_;
     }
-    iq_q_.emplace_back(p, p + n);
+    iq_q_.push_back(IqBlock{std::vector<cfloat>(p, p + n), stream_gen_.load(std::memory_order_acquire)});
     iq_total_ += static_cast<long long>(n);
     iq_cv_.notify_one();
 }
@@ -191,16 +194,16 @@ void LiveIsdbc::OnSdrEvent(bool up) {
 
 void LiveIsdbc::WorkLoop() {
     while (!stop_) {
-        std::vector<cfloat> blk;
+        IqBlock block;
         bool have_blk = false;
         {
             std::unique_lock<std::mutex> lock(iq_mu_);
             iq_cv_.wait_for(lock, std::chrono::milliseconds(200), [&] { return !iq_q_.empty() || stop_; });
             if (stop_) break;
             if (!iq_q_.empty()) {
-                blk = std::move(iq_q_.front());
+                block = std::move(iq_q_.front());
                 iq_q_.pop_front();
-                iq_total_ -= static_cast<long long>(blk.size());
+                iq_total_ -= static_cast<long long>(block.samples.size());
                 have_blk = true;
             }
         }
@@ -221,7 +224,9 @@ void LiveIsdbc::WorkLoop() {
             }
             demod_ = std::make_unique<isdbc::IsdbcDemod>(dc, [this](const uint8_t* pk, size_t n) { OnPackets(pk, n); });
         }
-        demod_->Feed(blk.data(), blk.size());
+        feeding_gen_ = block.generation;
+        if (feeding_gen_ != stream_gen_.load(std::memory_order_acquire)) continue;
+        demod_->Feed(block.samples.data(), block.samples.size());
     }
 }
 
@@ -235,14 +240,12 @@ void LiveIsdbc::OnPackets(const uint8_t* pk, size_t n) {
     }
     std::vector<uint8_t> chunk;
     chunk.swap(pending_);
+    const TsChunk ts_chunk{std::move(chunk), feeding_gen_};
     for (auto& q : clients) {
-        std::lock_guard<std::mutex> ql(q->mu);
-        if (q->chunks.size() >= kQueueMaxChunks) {
+        const TsPushResult result = q->TryPush(ts_chunk, kQueueMaxChunks);
+        if (result == TsPushResult::kFull) {
             std::lock_guard<std::mutex> l2(mu_);
-            dropped_ += chunk.size() / kTsPacket;
-        } else {
-            q->chunks.push_back(chunk);
-            q->cv.notify_one();
+            dropped_ += ts_chunk.bytes.size() / kTsPacket;
         }
     }
 }

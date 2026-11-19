@@ -62,8 +62,9 @@ public:
     std::shared_ptr<ClientQueue> AddClient() override;
     void AttachClient(const std::shared_ptr<ClientQueue>& q) override;
     void RemoveClient(const std::shared_ptr<ClientQueue>& q) override;
-    void Tune(bool has_ch, int ch, double freq) override;          // 現在の方式で選局
-    void TuneSystem(System sys, bool has_ch, int ch, double freq);  // 方式を指定して選局（必要なら差し替え。即時復帰）
+    void Tune(bool has_ch, int ch, double freq, TsGeneration generation) override; // 現在の方式で選局
+    TsGeneration TuneSystem(System sys, bool has_ch, int ch, double freq, TsGeneration generation = 0);
+    // 方式を指定して選局（必要なら差し替え。即時復帰）。generation=0 なら内部採番。
     std::string StatusJson() override;
     const std::string& source_desc() const override;
 
@@ -80,6 +81,7 @@ private:
         bool has_ch;
         int ch;
         double freq;
+        TsGeneration generation;
     };
     double BwFor(System sys) const;
     void BuildFeed(System sys, double freq);     // 復調パイプラインを作って active に据える（ロック無しで呼ぶ）
@@ -102,6 +104,7 @@ private:
     LiveDemod* fwd_t_ = nullptr;        // 転送先（fwd_mu_ 下）
     LiveIsdbc* fwd_c_ = nullptr;
     std::vector<std::shared_ptr<ClientQueue>> clients_;
+    TsGeneration generation_ = 0;          // 最新の選局世代。clients_ と pending_ を守る mu_ 下
     std::string desc_;
     bool switching_ = false;
     bool has_pending_ = false;
