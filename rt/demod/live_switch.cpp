@@ -136,6 +136,7 @@ std::shared_ptr<ClientQueue> LiveSwitch::AddClient() {
 
 void LiveSwitch::AttachClient(const std::shared_ptr<ClientQueue>& q) {
     std::lock_guard<std::mutex> lk(mu_);
+    q->AdvanceGeneration(generation_);
     clients_.push_back(q);
     if (IFeed* a = ActiveLocked()) a->AttachClient(q);
 }
@@ -146,16 +147,24 @@ void LiveSwitch::RemoveClient(const std::shared_ptr<ClientQueue>& q) {
     if (IFeed* a = ActiveLocked()) a->RemoveClient(q);
 }
 
-void LiveSwitch::Tune(bool has_ch, int ch, double freq) { TuneSystem(system(), has_ch, ch, freq); }
+void LiveSwitch::Tune(bool has_ch, int ch, double freq, TsGeneration generation) {
+    TuneSystem(system(), has_ch, ch, freq, generation);
+}
 
-void LiveSwitch::TuneSystem(System sys, bool has_ch, int ch, double freq) {
+TsGeneration LiveSwitch::TuneSystem(System sys, bool has_ch, int ch, double freq, TsGeneration generation) {
+    if (generation == 0) generation = NextTsGeneration();
     IFeed* a = nullptr;
     {
         std::lock_guard<std::mutex> lk(mu_);
+        if (generation < generation_) return generation_;
+        // 上流キューを同期的に切り替える。以後、選局前に取り出されていたチャンクも
+        // generation 不一致で拒否される。後着した古い要求では世代は巻き戻らない。
+        for (auto& q : clients_) q->AdvanceGeneration(generation);
+        if (generation > generation_) generation_ = generation;
         if (!switching_ && !has_pending_ && sys == system_ && ActiveLocked()) {
             a = ActiveLocked();             // 同じ方式: その場で選局（速い）
         } else {
-            pending_ = Request{sys, has_ch, ch, freq};
+            pending_ = Request{sys, has_ch, ch, freq, generation};
             has_pending_ = true;
         }
     }
@@ -165,10 +174,11 @@ void LiveSwitch::TuneSystem(System sys, bool has_ch, int ch, double freq) {
             sdr_.Retune(freq);
             freq_hz_ = freq;
         }
-        a->Tune(has_ch, ch, freq);
-        return;
+        a->Tune(has_ch, ch, freq, generation);
+        return generation;
     }
     cv_.notify_all();
+    return generation;
 }
 
 // 差し替えスレッド: 要求を取り出し、旧パイプラインを止めて SDR の帯域・周波数を変え、新しい方を作る
@@ -208,7 +218,7 @@ void LiveSwitch::Worker() {
                 std::lock_guard<std::mutex> lk(mu_);
                 a = ActiveLocked();
             }
-            if (a) a->Tune(req.has_ch, req.ch, req.freq);
+            if (a) a->Tune(req.has_ch, req.ch, req.freq, req.generation);
         }
         std::lock_guard<std::mutex> lk(mu_);
         switching_ = false;

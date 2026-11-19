@@ -375,11 +375,13 @@ public:
     std::shared_ptr<ClientQueue> AddClient() override {
         auto q = std::make_shared<ClientQueue>();
         std::lock_guard<std::mutex> lock(mu_);
+        q->AdvanceGeneration(generation_);
         clients_.push_back(q);
         return q;
     }
     void AttachClient(const std::shared_ptr<ClientQueue>& q) override {
         std::lock_guard<std::mutex> lock(mu_);
+        q->AdvanceGeneration(generation_);
         clients_.push_back(q);
     }
     void RemoveClient(const std::shared_ptr<ClientQueue>& q) override {
@@ -387,18 +389,18 @@ public:
         clients_.erase(std::remove(clients_.begin(), clients_.end(), q), clients_.end());
     }
 
-    void Tune(bool has_ch, int ch, double freq) override {
+    void Tune(bool has_ch, int ch, double freq, TsGeneration generation) override {
+        if (generation == 0) generation = NextTsGeneration();
         std::lock_guard<std::mutex> lock(mu_);
+        if (generation <= generation_) return;
+        generation_ = generation;
         has_channel_ = has_ch;
         channel_ = ch;
         freq_hz_ = freq;
         has_freq_ = true;
         pos_ = 0;
         ended_ = false;
-        for (auto& q : clients_) {
-            std::lock_guard<std::mutex> ql(q->mu);
-            q->chunks.clear();
-        }
+        for (auto& q : clients_) q->AdvanceGeneration(generation);
     }
 
     std::string StatusJson() override {
@@ -454,12 +456,9 @@ private:
                     pos_ += n;
                     ts_packets_ += n / kTsPacket;
                     for (auto& q : clients_) {
-                        std::lock_guard<std::mutex> ql(q->mu);
-                        if (q->chunks.size() >= kQueueMaxChunks) {
+                        const TsPushResult result = q->TryPush(TsChunk{chunk, generation_}, kQueueMaxChunks);
+                        if (result == TsPushResult::kFull) {
                             dropped_ += n / kTsPacket;
-                        } else {
-                            q->chunks.push_back(chunk);
-                            q->cv.notify_one();
                         }
                     }
                 }
@@ -483,6 +482,7 @@ private:
     size_t pos_ = 0;
     bool ended_ = false;
     bool has_channel_ = false, has_freq_ = false;
+    TsGeneration generation_ = 0;
     int channel_ = 0;
     double freq_hz_ = 0.0;
     std::atomic<long long> ts_packets_{0};
@@ -612,7 +612,7 @@ private:
                     live_->SetSelect(s);
                 }
                 if (live_) live_->TuneSystem(sys, has_ch, ch, freq);
-                else rp_->Tune(has_ch, ch, freq);
+                else rp_->Tune(has_ch, ch, freq, NextTsGeneration());
                 Log("tune system=%s channel=%d freq=%.0f", SystemName(sys), has_ch ? ch : -1, freq);
                 SendLine(c, std::string("{\"ok\": true, \"system\": \"") + SystemName(sys) +
                              "\", \"channel\": " + (has_ch ? std::to_string(ch) : "null") +
@@ -645,16 +645,16 @@ private:
         int yes = 1;
         setsockopt(c, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&yes), sizeof(yes));
         while (!stopping_) {
-            std::vector<uint8_t> chunk;
+            TsChunk ts_chunk;
             {
                 std::unique_lock<std::mutex> lock(q->mu);
                 if (!q->cv.wait_for(lock, std::chrono::milliseconds(500), [&] { return !q->chunks.empty(); })) {
                     continue;
                 }
-                chunk = std::move(q->chunks.front());
+                ts_chunk = std::move(q->chunks.front());
                 q->chunks.pop_front();
             }
-            if (!SendAll(c, reinterpret_cast<const char*>(chunk.data()), chunk.size())) break;
+            if (!SendAll(c, reinterpret_cast<const char*>(ts_chunk.bytes.data()), ts_chunk.bytes.size())) break;
         }
         rp_->RemoveClient(q);
         Log("stream client disconnected");
@@ -688,16 +688,17 @@ int StreamToStdout(IFeed* feed, bool verbose) {
             std::fprintf(stderr, "%s\n", feed->StatusJson().c_str());
             last_status = now;
         }
-        std::vector<uint8_t> chunk;
+        TsChunk ts_chunk;
         {
             std::unique_lock<std::mutex> lock(q->mu);
             if (!q->cv.wait_for(lock, std::chrono::milliseconds(500), [&] { return !q->chunks.empty(); })) {
                 if (feed->Ended()) break;       // ファイル再生（--loop 無し）の末尾: 出し切ったら終わる
                 continue;
             }
-            chunk = std::move(q->chunks.front());
+            ts_chunk = std::move(q->chunks.front());
             q->chunks.pop_front();
         }
+        const std::vector<uint8_t>& chunk = ts_chunk.bytes;
         if (std::fwrite(chunk.data(), 1, chunk.size(), stdout) != chunk.size() || std::fflush(stdout) != 0) {
             if (verbose) std::fprintf(stderr, "stdout closed after %lld bytes\n", bytes);
             break;

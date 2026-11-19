@@ -50,12 +50,14 @@ void LiveDemod::Stop() {
 
 std::shared_ptr<ClientQueue> LiveDemod::AddClient() {
     auto q = std::make_shared<ClientQueue>();
+    q->AdvanceGeneration(stream_gen_.load(std::memory_order_relaxed));
     std::lock_guard<std::mutex> lock(mu_);
     clients_.push_back(q);
     return q;
 }
 
 void LiveDemod::AttachClient(const std::shared_ptr<ClientQueue>& q) {
+    q->AdvanceGeneration(stream_gen_.load(std::memory_order_relaxed));
     std::lock_guard<std::mutex> lock(mu_);
     clients_.push_back(q);
 }
@@ -65,38 +67,44 @@ void LiveDemod::RemoveClient(const std::shared_ptr<ClientQueue>& q) {
     clients_.erase(std::remove(clients_.begin(), clients_.end(), q), clients_.end());
 }
 
-void LiveDemod::Tune(bool has_ch, int ch, double freq) {
+void LiveDemod::Tune(bool has_ch, int ch, double freq, TsGeneration generation) {
+    if (generation == 0) generation = NextTsGeneration();
+    bool same_freq;
     {
-        // 同一周波数への tune（クライアントの再接続・選局し直し）ではパイプラインを
-        // 壊さない。リセットすると ~10 秒の再立ち上がりが毎回走ってしまう。
         std::lock_guard<std::mutex> lock(mu_);
-        if (has_freq_ && freq == freq_hz_) return;
+        if (generation <= stream_gen_.load(std::memory_order_relaxed)) return;
+        same_freq = has_freq_ && freq == freq_hz_;
     }
-    if (!external_) sdr_->Retune(freq);
-    skip_samples_ = static_cast<long long>(kRetuneSkipSeconds * cfg_.fs);
-    quick_level_pending_ = true;
+    // 同一周波数への再選局では復調状態を保ち、生成済みの古い TS だけを世代で無効化する。
+    if (!same_freq) {
+        if (!external_) sdr_->Retune(freq);
+        skip_samples_ = static_cast<long long>(kRetuneSkipSeconds * cfg_.fs);
+        quick_level_pending_ = true;
+    }
     {
         std::lock_guard<std::mutex> pl(pace_mu_);
         pace_q_.clear();
         pace_reset_ = true;
     }
-    std::lock_guard<std::mutex> iql(iq_mu_);
+    std::unique_lock<std::mutex> iql(iq_mu_, std::defer_lock);
+    if (!same_freq) iql.lock();
     std::lock_guard<std::mutex> lock(mu_);
-    ++gen_;                 // 仕掛かり中のウィンドウ結果は捨てる
-    iq_q_.clear();
-    sym_q_.clear();
-    sym_mode_ = false;
+    if (generation <= stream_gen_.load(std::memory_order_relaxed)) return;
+    stream_gen_.store(generation, std::memory_order_release);
+    if (!same_freq) {
+        ++gen_;                 // 仕掛かり中のウィンドウ結果は捨てる
+        iq_q_.clear();
+        sym_q_.clear();
+        sym_mode_ = false;
+        locked_ = false;
+        mer_db_ = 0.0;              // 前チャンネルの MER を信号レベルとして返し続けない
+        layers_.clear();
+    }
     has_channel_ = has_ch;
     channel_ = ch;
     freq_hz_ = freq;
     has_freq_ = true;
-    locked_ = false;
-    mer_db_ = 0.0;              // 前チャンネルの MER を信号レベルとして返し続けない
-    layers_.clear();
-    for (auto& q : clients_) {
-        std::lock_guard<std::mutex> ql(q->mu);
-        q->chunks.clear();
-    }
+    for (auto& q : clients_) q->AdvanceGeneration(generation);
 }
 
 std::string LiveDemod::StatusJson() {
@@ -421,6 +429,7 @@ void LiveDemod::SchedLoop() {
             }
             WindowJob job;
             job.gen = cur_gen;
+            job.stream_gen = stream_gen_.load(std::memory_order_acquire);
             // FPGA のサンプルカウンタは公称レート。Emit は入力サンプル単位で継ぐので換算しておく
             job.abs0 = static_cast<long long>(std::llround(static_cast<double>(acc_sym[0].start) * in_per_nominal_));
             job.fut = std::async(std::launch::async, [this, P, fec_frames]() -> std::shared_ptr<DemodResult> {
@@ -448,6 +457,7 @@ void LiveDemod::SchedLoop() {
             cur_new = new_frames_;
             WindowJob job;
             job.gen = cur_gen;
+            job.stream_gen = stream_gen_.load(std::memory_order_acquire);
             job.abs0 = acc_abs0;
             std::vector<cfloat> win(acc.begin(), acc.begin() + win_samples);
             // 文脈フレームは前のウィンドウが排出済み（範囲復号は末尾フレームまで出す）なので、1 フレームの
@@ -501,14 +511,14 @@ void LiveDemod::SchedLoop() {
             if (!sdr_->fpga_eq() && job.abs0 >= xo_valid_from && sdr_->SuggestClockPpm(res->sync.clock_ppm)) {
                 if (verbose_) std::fprintf(stderr, "window @%lld: clock %+.2f ppm -> xo_correction applied; resyncing\n",
                                            job.abs0, res->sync.clock_ppm);
-                Emit(*res, job.abs0);           // このウィンドウは補正前のサンプルで一貫しているので出す
+                Emit(*res, job.abs0, job.gen, job.stream_gen); // このウィンドウは補正前のサンプルで一貫しているので出す
                 xo_valid_from = abs_in + static_cast<long long>(std::llround(cfg_.fs * kXoSettleSec));
                 acc.clear();
                 cur_new = first_new;
                 ResetSplice(&cur_gen, /*count_underrun=*/false);
                 break;                          // 旧世代の仕掛かりは次のループで捨てられる
             }
-            Emit(*res, job.abs0);
+            Emit(*res, job.abs0, job.gen, job.stream_gen);
         }
     }
 }
@@ -522,7 +532,7 @@ void LiveDemod::ResetSplice(long long* cur_gen, bool count_underrun) {
     last_emitted_ = -1;     // 継ぎ目はフレーム番号が飛ぶ（frames_lost に出る）
 }
 
-void LiveDemod::Emit(const DemodResult& res, long long abs0) {
+void LiveDemod::Emit(const DemodResult& res, long long abs0, long long gen, TsGeneration stream_gen) {
     const long long T = SymbolSamples(mode_, gi_);
     const int f0 = res.fsi.frame_start;
     int reliable_from = 0;
@@ -531,11 +541,12 @@ void LiveDemod::Emit(const DemodResult& res, long long abs0) {
         if (it == res.layers.end()) continue;
         reliable_from = std::max(reliable_from, it->second.first_frame + 1);
     }
-    std::vector<std::vector<uint8_t>> frames_out;
+    std::vector<TsChunk> frames_out;
     long long first_F = -1, last_F = -1;
     long long uncorrectable = 0;
     {
         std::lock_guard<std::mutex> lock(mu_);
+        if (gen_ != gen || stream_gen_.load(std::memory_order_acquire) != stream_gen) return;
         // 最終フレームは排出しない: バイトデインターリーブの補遅延（11 TSP）の尻尾が
         // 未完成で、各呼び出しの末尾 11 TSP が必ず訂正不能になる。重複分（ctx_frames_）が
         // あるので次のウィンドウが完全な形で出し直す。
@@ -596,7 +607,7 @@ void LiveDemod::Emit(const DemodResult& res, long long abs0) {
             last_emitted_ = F;
             last_F = F;
             ts_packets_ += out.size() / kTsPacket;
-            frames_out.push_back(std::move(out));
+            frames_out.push_back(TsChunk{std::move(out), stream_gen});
         }
         rs_uncorrectable_ += uncorrectable;
         locked_ = res.fsi.tmcc_parity_ok;
@@ -735,19 +746,16 @@ std::vector<uint8_t> LiveDemod::RepeatPsi() {
     return out;
 }
 
-void LiveDemod::SendToClients(const std::vector<uint8_t>& chunk) {
+void LiveDemod::SendToClients(const TsChunk& chunk) {
     std::vector<std::shared_ptr<ClientQueue>> clients;
     {
         std::lock_guard<std::mutex> lock(mu_);
         clients = clients_;
     }
     for (auto& q : clients) {
-        std::lock_guard<std::mutex> ql(q->mu);
-        if (q->chunks.size() >= kQueueMaxChunks) {
-            dropped_ += chunk.size() / kTsPacket;
-        } else {
-            q->chunks.push_back(chunk);
-            q->cv.notify_one();
+        if (q->TryPush(chunk, kQueueMaxChunks) == TsPushResult::kFull) {
+            std::lock_guard<std::mutex> lock(mu_);
+            dropped_ += chunk.bytes.size() / kTsPacket;
         }
     }
 }
@@ -772,7 +780,7 @@ void LiveDemod::PaceLoop() {
     std::chrono::steady_clock::time_point hold_since{}, psi_last{};
     constexpr auto kPsiRepeatInterval = std::chrono::milliseconds(250);
     while (!stop_) {
-        std::vector<uint8_t> chunk;
+        TsChunk chunk;
         size_t backlog = 0;
         {
             std::unique_lock<std::mutex> lock(pace_mu_);
@@ -781,6 +789,7 @@ void LiveDemod::PaceLoop() {
                 pmt_pids_.clear();
                 psi_cache_.clear();
                 psi_cc_.clear();            // 次の RemapPsiCc で初期化し直す
+                psi_generation_ = 0;
             }
             if (!pace_cv_.wait_for(lock, std::chrono::milliseconds(200),
                                    [&] { return !pace_q_.empty() || stop_; })) {
@@ -794,7 +803,7 @@ void LiveDemod::PaceLoop() {
                     t_next - psi_last >= kPsiRepeatInterval) {
                     psi_last = t_next;
                     lock.unlock();
-                    SendToClients(RepeatPsi());
+                    SendToClients(TsChunk{RepeatPsi(), psi_generation_});
                 }
                 continue;
             }
@@ -820,7 +829,7 @@ void LiveDemod::PaceLoop() {
                     if (!first_hold_done && first_burst_ == FirstBurst::kPsi && !psi_cache_.empty() &&
                         now - psi_last >= kPsiRepeatInterval) {
                         psi_last = now;
-                        SendToClients(RepeatPsi());
+                        SendToClients(TsChunk{RepeatPsi(), psi_generation_});
                     }
                     std::this_thread::sleep_for(std::chrono::milliseconds(50));
                     continue;
@@ -833,13 +842,19 @@ void LiveDemod::PaceLoop() {
             pace_q_.pop_front();
             backlog = pace_q_.size();
             emitted = true;
+            if (psi_generation_ != chunk.generation) {
+                pmt_pids_.clear();
+                psi_cache_.clear();
+                psi_cc_.clear();
+                psi_generation_ = chunk.generation;
+            }
             // 最初のバースト（連続分が揃う前）は既定で PSI/SI だけ通す。PSI/SI の CC は出力側で振り直す
             if (first_burst_ == FirstBurst::kPsi) {
-                if (!first_hold_done) chunk = FilterPsi(chunk);
-                RemapPsiCc(&chunk);
+                if (!first_hold_done) chunk.bytes = FilterPsi(chunk.bytes);
+                RemapPsiCc(&chunk.bytes);
             }
         }
-        if (chunk.empty()) continue;
+        if (chunk.bytes.empty()) continue;
         SendToClients(chunk);
         if (backlog > kPaceCatchupFrames) continue;     // 溜まりすぎ: 間隔なしで追いつく
         t_next += frame_dt;

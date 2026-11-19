@@ -65,6 +65,7 @@ set(BON_SOURCES
   ${RT_DIR}/demod/live_isdbc.cpp
   ${RT_DIR}/demod/live_switch.h
   ${RT_DIR}/demod/live_switch.cpp
+  ${RT_DIR}/demod/ts_queue.h
   ${RT_DIR}/demod/sdr_source.h
   ${RT_DIR}/demod/sdr_source.cpp
   ${RT_DIR}/demod/rate_monitor.h

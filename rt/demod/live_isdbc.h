@@ -33,7 +33,7 @@ public:
     void AttachClient(const std::shared_ptr<ClientQueue>& q) override;
     void RemoveClient(const std::shared_ptr<ClientQueue>& q) override;
     // ch は CATV チャンネル番号（BonDriver_BDA 互換の通し番号。docs/isdbc-spec-notes.md 1 章）
-    void Tune(bool has_ch, int ch, double freq) override;
+    void Tune(bool has_ch, int ch, double freq, TsGeneration generation) override;
     std::string StatusJson() override;
     const std::string& source_desc() const override { return desc_; }
 
@@ -71,7 +71,8 @@ private:
 
     std::mutex iq_mu_;
     std::condition_variable iq_cv_;
-    std::deque<std::vector<cfloat>> iq_q_;
+    struct IqBlock { std::vector<cfloat> samples; TsGeneration generation = 0; };
+    std::deque<IqBlock> iq_q_;
     long long iq_total_ = 0;
 
     std::mutex mu_;
@@ -79,6 +80,8 @@ private:
     bool has_channel_ = false, has_freq_ = false;
     int channel_ = 0;
     double freq_hz_ = 0.0;
+    std::atomic<TsGeneration> stream_gen_{0};
+    TsGeneration feeding_gen_ = 0;      // WorkLoop 専用。Feed 中に選局されても元の世代を保つ
     long long dropped_ = 0, underruns_ = 0;
     std::vector<uint8_t> pending_;      // クライアントへ渡す前の小分けバッファ
 };

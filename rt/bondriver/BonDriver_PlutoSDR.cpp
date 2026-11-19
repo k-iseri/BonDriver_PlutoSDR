@@ -62,6 +62,11 @@ constexpr const wchar_t *kDefaultTunerName = L"ISDB-T SDR";
 constexpr DWORD kControlTimeoutMs = 2000;                // 制御コマンドの応答待ち
 constexpr ULONGLONG kSignalCacheMs = 500;                // GetSignalLevel の status 問い合わせ間隔
 
+struct DriverTsChunk {
+	std::vector<BYTE> bytes;
+	isdbt::TsGeneration generation = 0;
+};
+
 HMODULE g_hModule = nullptr;
 
 struct Config {
@@ -361,7 +366,8 @@ private:
 	void StopDaemon();
 	bool OpenStream();
 	void ReaderThread();
-	void PushChunk(std::vector<BYTE> &&chunk);
+	void PushChunk(std::vector<BYTE> &&chunk, isdbt::TsGeneration generation = 0);
+	void SetStreamGeneration(isdbt::TsGeneration generation);
 	BOOL OpenTunerSdr();
 	void PullerThread();
 
@@ -376,9 +382,11 @@ private:
 	std::atomic<bool> m_stop{false};
 
 	std::mutex m_qMutex;
-	std::deque<std::vector<BYTE>> m_queue;
+	std::deque<DriverTsChunk> m_queue;
 	size_t m_queueBytes = 0;
 	size_t m_droppedBytes = 0;
+	isdbt::TsGeneration m_expectedGeneration = 0; // m_qMutex 下
+	bool m_generationAware = false;               // スタンドアロン LiveSwitch 経路のみ
 	std::vector<BYTE> m_current;      // 直近に GetTsStream で返したバッファ（次の呼び出しまで有効）
 	HANDLE m_event = nullptr;         // 手動リセット。キューにデータがある間シグナル
 
@@ -534,18 +542,30 @@ bool CBonDriverPlutoSDR::OpenStream()
 	return true;
 }
 
-void CBonDriverPlutoSDR::PushChunk(std::vector<BYTE> &&chunk)
+void CBonDriverPlutoSDR::PushChunk(std::vector<BYTE> &&chunk, isdbt::TsGeneration generation)
 {
 	std::lock_guard<std::mutex> lk(m_qMutex);
+	if (m_generationAware && generation != m_expectedGeneration) return;
 	while (!m_queue.empty() && m_queueBytes + chunk.size() > kMaxQueueBytes) {
-		m_queueBytes -= m_queue.front().size();
-		m_droppedBytes += m_queue.front().size();
+		m_queueBytes -= m_queue.front().bytes.size();
+		m_droppedBytes += m_queue.front().bytes.size();
 		m_queue.pop_front();
 		if ((m_droppedBytes / kChunkBytes) % 64 == 1) Log("receive queue full; dropped %zu bytes so far", m_droppedBytes);
 	}
 	m_queueBytes += chunk.size();
-	m_queue.push_back(std::move(chunk));
+	m_queue.push_back(DriverTsChunk{std::move(chunk), generation});
 	SetEvent(m_event);
+}
+
+void CBonDriverPlutoSDR::SetStreamGeneration(isdbt::TsGeneration generation)
+{
+	std::lock_guard<std::mutex> lk(m_qMutex);
+	if (generation <= m_expectedGeneration) return;
+	m_expectedGeneration = generation;
+	m_generationAware = true;
+	m_queue.clear();
+	m_queueBytes = 0;
+	ResetEvent(m_event);
 }
 
 void CBonDriverPlutoSDR::ReaderThread()
@@ -629,6 +649,13 @@ BOOL CBonDriverPlutoSDR::OpenTunerSdr()
 	m_liveQ = m_live->AddClient();
 	m_stop = false;
 	m_droppedBytes = 0;
+	{
+		std::lock_guard<std::mutex> lk(m_qMutex);
+		m_generationAware = true;
+		m_expectedGeneration = 0;
+		m_queue.clear();
+		m_queueBytes = 0;
+	}
 	ResetEvent(m_event);
 	m_reader = std::thread(&CBonDriverPlutoSDR::PullerThread, this);
 	m_open = true;
@@ -655,20 +682,20 @@ void CBonDriverPlutoSDR::PullerThread()
 				Log("live: %s", m_live->StatusJson().c_str());
 			}
 		}
-		std::vector<BYTE> chunk;
+		isdbt::TsChunk tsChunk;
 		{
 			std::unique_lock<std::mutex> lk(m_liveQ->mu);
 			if (!m_liveQ->cv.wait_for(lk, std::chrono::milliseconds(200),
 			                          [&] { return !m_liveQ->chunks.empty(); })) {
 				continue;
 			}
-			chunk = std::move(m_liveQ->chunks.front());
+			tsChunk = std::move(m_liveQ->chunks.front());
 			m_liveQ->chunks.pop_front();
 		}
 		size_t off = 0;
-		while (off < chunk.size()) {
-			size_t len = (chunk.size() - off > kChunkBytes) ? kChunkBytes : (chunk.size() - off);
-			PushChunk(std::vector<BYTE>(chunk.begin() + off, chunk.begin() + off + len));
+		while (off < tsChunk.bytes.size()) {
+			size_t len = (tsChunk.bytes.size() - off > kChunkBytes) ? kChunkBytes : (tsChunk.bytes.size() - off);
+			PushChunk(std::vector<BYTE>(tsChunk.bytes.begin() + off, tsChunk.bytes.begin() + off + len), tsChunk.generation);
 			off += len;
 		}
 	}
@@ -713,6 +740,10 @@ const BOOL CBonDriverPlutoSDR::OpenTuner(void)
 		closesocket(m_ctrl);
 		m_ctrl = INVALID_SOCKET;
 		return FALSE;
+	}
+	{
+		std::lock_guard<std::mutex> ql(m_qMutex);
+		m_generationAware = false;
 	}
 	m_stop = false;
 	m_droppedBytes = 0;
@@ -799,9 +830,22 @@ const DWORD CBonDriverPlutoSDR::GetReadyCount(void)
 
 const BOOL CBonDriverPlutoSDR::GetTsStream(BYTE *pDst, DWORD *pdwSize, DWORD *pdwRemain)
 {
-	BYTE *src = nullptr;
-	if (!GetTsStream(&src, pdwSize, pdwRemain)) return FALSE;
-	if (pDst && src && *pdwSize) std::memcpy(pDst, src, *pdwSize);
+	// copy overload は m_qMutex をコピー完了まで保持する。pointer overload を呼んでから
+	// コピーすると、その間に SetChannel が完了し、旧 TS のコピーだけが後着しうる。
+	std::lock_guard<std::mutex> lk(m_qMutex);
+	if (m_queue.empty()) {
+		if (pdwSize) *pdwSize = 0;
+		if (pdwRemain) *pdwRemain = 0;
+		ResetEvent(m_event);
+		return FALSE;
+	}
+	m_current.swap(m_queue.front().bytes);
+	m_queue.pop_front();
+	m_queueBytes -= m_current.size();
+	if (pDst && !m_current.empty()) std::memcpy(pDst, m_current.data(), m_current.size());
+	if (pdwSize) *pdwSize = static_cast<DWORD>(m_current.size());
+	if (pdwRemain) *pdwRemain = static_cast<DWORD>(m_queue.size());
+	if (m_queue.empty()) ResetEvent(m_event);
 	return TRUE;
 }
 
@@ -814,7 +858,7 @@ const BOOL CBonDriverPlutoSDR::GetTsStream(BYTE **ppDst, DWORD *pdwSize, DWORD *
 		ResetEvent(m_event);
 		return FALSE;
 	}
-	m_current.swap(m_queue.front());
+	m_current.swap(m_queue.front().bytes);
 	m_queue.pop_front();
 	m_queueBytes -= m_current.size();
 	if (ppDst) *ppDst = m_current.data();
@@ -899,11 +943,12 @@ const BOOL CBonDriverPlutoSDR::SetChannel(const DWORD dwSpace, const DWORD dwCha
 		return FALSE;
 	}
 	if (m_live) {
-		m_live->TuneSystem(sys, true, chArg, freq);     // 方式が変わればパイプラインごと差し替える（約 1 秒）
+		const isdbt::TsGeneration generation = isdbt::NextTsGeneration();
+		SetStreamGeneration(generation);             // 出力キューを先に閉じ、取り出し済み旧 TS も拒否する
+		m_live->TuneSystem(sys, true, chArg, freq, generation); // 上流へ同じ世代を渡してから出力させる
 		Log("tune %s %s %.3f MHz (standalone)", isdbt::SystemName(sys), name.c_str(), freq / 1e6);
 		m_curSpace = dwSpace;
 		m_curChannel = dwChannel;
-		PurgeTsStream();
 		m_levelTick = 0;
 		return TRUE;
 	}

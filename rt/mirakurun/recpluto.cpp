@@ -127,13 +127,14 @@ int Record(LiveSwitch* live, System sys, int ch, double freq, double rectime, co
             std::fprintf(stderr, "%s\n", live->StatusJson().c_str());
             last_status = now;
         }
-        std::vector<uint8_t> chunk;
+        isdbt::TsChunk ts_chunk;
         {
             std::unique_lock<std::mutex> lock(q->mu);
             if (!q->cv.wait_for(lock, std::chrono::milliseconds(500), [&] { return !q->chunks.empty(); })) continue;
-            chunk = std::move(q->chunks.front());
+            ts_chunk = std::move(q->chunks.front());
             q->chunks.pop_front();
         }
+        const std::vector<uint8_t>& chunk = ts_chunk.bytes;
         if (std::fwrite(chunk.data(), 1, chunk.size(), out) != chunk.size() || std::fflush(out) != 0) {
             if (verbose) std::fprintf(stderr, "output closed after %lld bytes\n", bytes);
             break;

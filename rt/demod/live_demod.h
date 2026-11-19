@@ -26,6 +26,7 @@
 #include "../isdbt/params.h"
 #include "rate_monitor.h"
 #include "sdr_source.h"
+#include "ts_queue.h"
 
 namespace isdbt {
 
@@ -46,12 +47,6 @@ struct LayerDesc {
     int I = 0, segments = 0;
 };
 
-struct ClientQueue {
-    std::deque<std::vector<uint8_t>> chunks;
-    std::mutex mu;
-    std::condition_variable cv;
-};
-
 // 配信元の共通インターフェース（録画再生 Replayer / 実機ライブ LiveDemod）
 class IFeed {
 public:
@@ -60,7 +55,7 @@ public:
     // 既存のキューを登録する（LiveSwitch がパイプラインを差し替えるときにクライアントを引き継ぐ）
     virtual void AttachClient(const std::shared_ptr<ClientQueue>& q) = 0;
     virtual void RemoveClient(const std::shared_ptr<ClientQueue>& q) = 0;
-    virtual void Tune(bool has_ch, int ch, double freq) = 0;
+    virtual void Tune(bool has_ch, int ch, double freq, TsGeneration generation) = 0;
     virtual std::string StatusJson() = 0;
     virtual const std::string& source_desc() const = 0;
     // 供給が終わった（ファイル再生が --loop 無しで末尾まで来た）。ライブ受信は終わらない
@@ -87,7 +82,7 @@ public:
     std::shared_ptr<ClientQueue> AddClient() override;
     void AttachClient(const std::shared_ptr<ClientQueue>& q) override;
     void RemoveClient(const std::shared_ptr<ClientQueue>& q) override;
-    void Tune(bool has_ch, int ch, double freq) override;
+    void Tune(bool has_ch, int ch, double freq, TsGeneration generation) override;
     std::string StatusJson() override;
     const std::string& source_desc() const override { return desc_; }
 
@@ -104,13 +99,14 @@ public:
 private:
     struct WindowJob {
         long long gen = 0;
+        TsGeneration stream_gen = 0;
         long long abs0 = 0;             // ウィンドウ先頭の絶対サンプル番号
         std::future<std::shared_ptr<DemodResult>> fut;   // 失敗は nullptr
     };
 
     void SchedLoop();
     void ResetSplice(long long* cur_gen, bool count_underrun = true);   // XO 補正の組み直しは underruns に数えない
-    void Emit(const DemodResult& res, long long abs0);
+    void Emit(const DemodResult& res, long long abs0, long long gen, TsGeneration stream_gen);
     void PaceLoop();
 
     static constexpr long long kIqBoundSamples = 40LL * 8'126'984;   // 取り込み待ち上限 ~40 s
@@ -138,7 +134,7 @@ private:
 
     std::mutex pace_mu_;
     std::condition_variable pace_cv_;
-    std::deque<std::vector<uint8_t>> pace_q_;
+    std::deque<TsChunk> pace_q_;
     std::atomic<bool> pace_reset_{false};   // 選局でペーサーの再開待ち状態を初期化する
     std::atomic<long long> pace_starved_{0};   // 定常中に送出キューが空になった回数（復調の遅れの指標）
     FirstBurst first_burst_ = FirstBurst::kPsi;
@@ -150,7 +146,7 @@ private:
     std::vector<uint8_t> RepeatPsi();       // psi_cache_ のコピーを CC を進めて返す
     void RemapPsiCc(std::vector<uint8_t>* chunk);   // PSI/SI の CC を出力側の連番に振り直す（繰り返し分と本流をつなぐ）
     bool IsPsiPid(int pid) const;
-    void SendToClients(const std::vector<uint8_t>& chunk);
+    void SendToClients(const TsChunk& chunk);
 
     std::mutex iq_mu_;
     std::condition_variable iq_cv_;
@@ -178,6 +174,7 @@ private:
     std::mutex mu_;
     std::vector<std::shared_ptr<ClientQueue>> clients_;
     long long gen_ = 0;
+    std::atomic<TsGeneration> stream_gen_{0};
     bool locked_ = false;
     bool anchored_ = false;
     double anchor_t_ = 0.0;
@@ -192,6 +189,7 @@ private:
     long long dropped_ = 0, underruns_ = 0;
     long long windows_done_ = 0, windows_failed_ = 0;
     bool verbose_ = false;
+    TsGeneration psi_generation_ = 0;        // pace_q_ と psi_cache_ の世代（ペーサースレッド専用）
     FILE* dump_ = nullptr;
     long long dump_written_ = 0;
 };

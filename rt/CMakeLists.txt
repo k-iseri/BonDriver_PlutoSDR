@@ -63,6 +63,10 @@ target_link_libraries(isdbt_core PUBLIC Threads::Threads)
 add_executable(rt_test tests/rt_test.cpp)
 target_link_libraries(rt_test PRIVATE isdbt_core)
 
+# 選局世代のキュー境界（旧TSがTune後に再投入されないこと）の競合テスト
+add_executable(ts_generation_test tests/ts_generation_test.cpp)
+target_link_libraries(ts_generation_test PRIVATE Threads::Threads)
+
 # 実時間復調デーモン
 add_executable(isdbtd demod/isdbtd.cpp demod/sdr_source.h demod/sdr_source.cpp
   demod/live_demod.h demod/live_demod.cpp demod/live_isdbc.h demod/live_isdbc.cpp
